@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Minimal platform theme. All real styling lives in Compose
+        (ui/theme/Theme.kt) — this exists only to give the Activity a sane
+        pre-Compose window background and to remove the legacy action bar.
+    -->
+    <style name="Theme.DPS" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

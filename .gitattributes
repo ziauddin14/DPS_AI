@@ -1,0 +1,33 @@
+# Project Falcon — DPS Android Client
+#
+# Line-ending policy.
+#
+# Git on Windows converts LF to CRLF on checkout by default. For `gradlew` that
+# is not cosmetic: it is a POSIX shell script, and CRLF line endings make the
+# shebang unparseable, producing "bad interpreter: /bin/sh^M" on Linux and macOS
+# and on any CI runner. Forcing LF here keeps the wrapper executable everywhere.
+#
+# `gradlew.bat` is the opposite case and is pinned to CRLF for cmd.exe.
+
+* text=auto
+
+# Build scripts and sources — normalised to LF in the repository
+*.kt      text eol=lf
+*.kts     text eol=lf
+*.java    text eol=lf
+*.xml     text eol=lf
+*.toml    text eol=lf
+*.pro     text eol=lf
+*.md      text eol=lf
+*.properties text eol=lf
+
+# Wrapper scripts — platform-specific, non-negotiable
+gradlew      text eol=lf
+gradlew.bat  text eol=crlf
+
+# Binary — never touched
+*.jar     binary
+*.gguf    binary
+*.so      binary
+*.png     binary
+*.apk     binary

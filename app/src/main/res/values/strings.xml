@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DPS</string>
+
+    <!-- Chat surface -->
+    <string name="chat_title">DPS</string>
+    <string name="chat_input_hint">Message DPS</string>
+    <string name="chat_send">Send</string>
+    <string name="chat_stop">Stop</string>
+    <string name="chat_new_session">New session</string>
+
+    <!-- AI lifecycle states. Wording deliberately avoids exposing internal
+         architecture or tool names (AI Rule 1 and 2, ai_architecture.md). -->
+    <string name="ai_state_idle">Ready when you are</string>
+    <string name="ai_state_checking_model">Checking…</string>
+    <string name="ai_state_model_missing">Setup required</string>
+    <string name="ai_state_preparing">Preparing…</string>
+    <string name="ai_state_loading">Waking up…</string>
+    <string name="ai_state_ready">Ready</string>
+    <string name="ai_state_unavailable">Unavailable</string>
+
+    <string name="error_generic">Something went wrong.</string>
+    <string name="error_retry">Try again</string>
+</resources>

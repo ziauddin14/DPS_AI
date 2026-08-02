@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Debug-only manifest overlay.
+
+    The Ollama development runtime is reached over plain HTTP on the developer's
+    machine (ADR-001). Cleartext is therefore permitted in debug builds ONLY,
+    and only for loopback/host addresses declared in network_security_config.
+
+    Release builds inherit none of this: cleartext stays disabled, and
+    OLLAMA_BASE_URL is compiled to an empty string so the network runtime
+    reports itself unavailable. Offline First is enforced by the build, not by
+    developer discipline.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:replace="android:networkSecurityConfig" />
+
+</manifest>

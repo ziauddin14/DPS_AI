@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Privacy First (Development Rule 7).
+
+    Nothing this app stores may leave the device — not via cloud backup, not via
+    device-to-device transfer. Conversations, model files and AI memory are
+    excluded unconditionally.
+
+    This pairs with android:allowBackup="false" in the main manifest. Both are
+    set because the two mechanisms are governed by different OS versions, and a
+    silent default here would quietly violate the product's core promise.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>

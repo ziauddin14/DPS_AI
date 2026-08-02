@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Project Falcon — DPS Android Client
+
+    Permission posture is deliberately minimal. Development Rule 7 (Privacy
+    First) and the Permission Manager layer in system_architecture.md require
+    that a permission is requested only when the feature that needs it exists.
+
+    Day 02 needs exactly one permission: INTERNET, used solely for the one-time
+    model download (ADR-003) and for the Ollama development runtime. After the
+    model is on device, the app never needs the network again for core AI.
+
+    Deliberately NOT declared today — these arrive with the day that uses them:
+      CALENDAR, CONTACTS, RECORD_AUDIO, POST_NOTIFICATIONS,
+      SCHEDULE_EXACT_ALARM, FOREGROUND_SERVICE, RECEIVE_BOOT_COMPLETED
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+        A 1.5B parameter model needs meaningful headroom. Declaring the
+        requirement lets Play filter devices that cannot run the product
+        rather than shipping them a guaranteed OOM.
+    -->
+    <uses-feature
+        android:name="android.hardware.ram.low"
+        android:required="false" />
+
+    <application
+        android:name=".DpsApplication"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.DPS"
+        android:largeHeap="true">
+
+        <!--
+            largeHeap: the JVM-side buffers around token streaming and model
+            download benefit from headroom. Native model memory is allocated
+            outside the JVM heap and is unaffected by this flag — see ADR-002.
+
+            allowBackup=false and fullBackupContent=false: conversations and
+            model data must never leave the device via cloud backup.
+            Privacy First is not a default we can accept; it is one we set.
+        -->
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.DPS">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>

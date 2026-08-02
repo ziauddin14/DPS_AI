@@ -1,0 +1,28 @@
+# Project Falcon — DPS Android Client
+
+# Build output
+*.iml
+.gradle/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+
+# IDE
+.idea/
+*.hprof
+
+# Signing — never commit
+*.jks
+*.keystore
+keystore.properties
+
+# Native artifacts: llama.cpp shared objects are produced by the NDK build,
+# never committed. See ADR-004.
+app/src/main/jniLibs/
+
+# GGUF model weights are ~1.5 GB and are downloaded at runtime (ADR-006).
+# They must never enter version control.
+*.gguf
+*.gguf.part
