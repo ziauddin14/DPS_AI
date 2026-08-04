@@ -9,6 +9,10 @@ captures/
 .cxx/
 local.properties
 
+# Kotlin compiler session artifacts. A `.salive` file was committed in error on
+# Day 02; it is per-machine, per-build scratch state and never belongs in git.
+.kotlin/
+
 # IDE
 .idea/
 *.hprof
@@ -21,6 +25,19 @@ keystore.properties
 # Native artifacts: llama.cpp shared objects are produced by the NDK build,
 # never committed. See ADR-004.
 app/src/main/jniLibs/
+
+# llama.cpp sources (Day 03).
+#
+# Consumed as a pinned source checkout at android/third_party/llama.cpp rather
+# than vendored into this repository: the tree is ~600 MB and belongs to
+# upstream. A git submodule would be the better answer, but .gitmodules lives at
+# the repository root and Day 03 is scoped to android/ only — flagged for the
+# Product Owner.
+#
+# Fetch with:
+#   git clone --depth 1 --branch b10246 \
+#     https://github.com/ggml-org/llama.cpp.git android/third_party/llama.cpp
+third_party/
 
 # GGUF model weights are ~1.5 GB and are downloaded at runtime (ADR-006).
 # They must never enter version control.

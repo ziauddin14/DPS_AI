@@ -1,0 +1,54 @@
+/*
+ * Project Falcon — DPS Android Client
+ * Linker version script for libdps_llama.so
+ *
+ * ## Purpose
+ * Restricts the dynamic symbol table to the JNI entry points and nothing else.
+ *
+ * ## Why this is needed despite -fvisibility=hidden
+ * That flag governs symbols compiled from *our* sources. llama.cpp and ggml are
+ * statically linked in, and their objects were compiled with their own
+ * visibility settings, so every `llama_*`, `ggml_*` and `gguf_*` symbol was
+ * being re-exported through our library — 7,751 dynamic symbols in total for a
+ * library with a five-function public surface.
+ *
+ * Three concrete costs of that:
+ *
+ *  1. Symbol collision. Android loads all native libraries into one process
+ *     namespace. Any other library exporting `llama_*` — a plausible future
+ *     dependency — would bind against ours or ours against theirs, producing
+ *     failures that look like memory corruption rather than a linkage problem.
+ *  2. Load time. `dlopen` must process the dynamic symbol table on every app
+ *     start, which is charged directly against the < 7 second cold-start KPI.
+ *  3. Size. The .dynsym and its string table are dead weight in the APK.
+ *
+ * ## Maintenance
+ * Adding a new `external fun` to LlamaCppBridge requires no change here: the
+ * wildcard covers every JNI entry point for this class. Adding a *different*
+ * JNI class needs its pattern added.
+ *
+ * Only symbols that actually exist may be named explicitly. AGP links with
+ * `-Wl,--no-undefined-version`, which turns a reference to an undefined symbol
+ * into a hard link error rather than a warning. That is why JNI_OnLoad and
+ * JNI_OnUnload are absent here: they are not defined today, and listing them
+ * pre-emptively fails the build. Add them here at the same time as defining
+ * them, not before.
+ */
+
+/*
+ * The version node is deliberately ANONYMOUS (no name before the brace).
+ *
+ * A named node such as `LIBDPS_LLAMA { ... }` tags every exported symbol with
+ * `@@LIBDPS_LLAMA`. Those still resolve through `dlsym` because `@@` marks the
+ * default version, but it makes JNI lookup depend on the dynamic linker's
+ * default-version handling for no benefit — we ship one library and version
+ * nothing. An anonymous node applies exactly the same export restriction and
+ * leaves the symbols unversioned.
+ */
+{
+    global:
+        Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_*;
+
+    local:
+        *;
+};

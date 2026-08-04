@@ -27,6 +27,12 @@ android {
     namespace = "com.softwaremine.dps"
     compileSdk = 35
 
+    // Pinned. NDK r27d is the revision AGP 8.7.x aligns with and is within
+    // llama.cpp's tested matrix; r29/r30 are newer than llama.cpp validates
+    // against. Leaving this unset lets AGP pick whatever is installed, which
+    // makes native builds non-reproducible across machines.
+    ndkVersion = "27.3.13750724"
+
     // Pinned explicitly. Left unset, AGP silently downloads whichever version
     // its default happens to be — during the first build it fetched 34.0.0
     // unprompted, which is both 136 MB of unrequested disk and a source of
@@ -49,12 +55,42 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Only 64-bit ABIs. 32-bit devices cannot address the working set a
-        // 1.5B parameter model requires, so shipping armeabi-v7a would produce
-        // installs that are guaranteed to OOM. Excluding it is a correctness
-        // decision, not a size optimisation.
+        // arm64-v8a only.
+        //
+        // Day 02 shipped arm64-v8a + x86_64; Day 03 narrows this to arm64-v8a
+        // alone, per the Day 03 brief. Two consequences worth stating:
+        //
+        //  - armeabi-v7a stays excluded because 32-bit devices cannot address
+        //    the working set a 1.5B model needs — those installs would be
+        //    guaranteed OOM, so this is correctness, not size optimisation.
+        //  - dropping x86_64 means the app no longer runs on x86 emulators.
+        //    That is consistent with the physical-device-only test policy
+        //    (ADR-009), and it roughly halves native build time, which matters
+        //    on a 4-core machine compiling llama.cpp.
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += listOf("arm64-v8a")
+        }
+
+        externalNativeBuild {
+            cmake {
+                // c++_static: exactly one shared library is produced
+                // (libdps_llama.so), so the STL is linked into it rather than
+                // shipping a separate libc++_shared.so. Two .so files sharing a
+                // dynamically-linked STL is the case c++_shared exists for; we
+                // do not have it.
+                arguments += listOf(
+                    "-DANDROID_STL=c++_static",
+                    "-DCMAKE_BUILD_TYPE=Release",
+                )
+                cppFlags += "-std=c++17"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.31.5"
         }
     }
 
@@ -149,5 +185,9 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.test.junit)
+    // Supplies AndroidJUnitRunner, named in defaultConfig.testInstrumentationRunner.
+    // androidx.test.ext:junit does not pull it in transitively.
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(platform(libs.androidx.compose.bom))
 }
