@@ -37,6 +37,7 @@
 #include <jni.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -129,6 +130,26 @@ struct Session {
 
 Session * as_session(jlong handle) {
     return reinterpret_cast<Session *>(handle);
+}
+
+/**
+ * Abort hook handed to llama.cpp so `llama_decode` can be interrupted.
+ *
+ * ## Why this exists
+ * The cancellation flag is otherwise only examined between tokens, which means
+ * a cancel cannot take effect during prompt ingestion — and on this hardware
+ * ingestion is the *dominant* cost. Profiling caught a generation that sat
+ * inside `llama_decode` for 13 seconds after being cancelled, producing zero
+ * tokens and holding the inference thread, which in turn stalled the
+ * subsequent unload for 10 seconds.
+ *
+ * ggml calls this between graph nodes, so it must be cheap and must not block.
+ * Reading one relaxed atomic satisfies both. Returning `true` aborts the decode.
+ */
+bool abort_if_cancelled(void * data) {
+    auto * session = static_cast<Session *>(data);
+    return session != nullptr &&
+           session->cancel_requested.load(std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +359,56 @@ std::string token_to_text(const llama_vocab * vocab, llama_token token) {
     return std::string(heap_buf.data(), static_cast<size_t>(n));
 }
 
+// ---------------------------------------------------------------------------
+// Profiling
+//
+// Separates model computation from everything around it. Without this split a
+// slow generation is indistinguishable from a fast one being throttled by
+// synchronisation, and optimising the wrong half is the usual outcome.
+//
+// `callback_us` is the important one: it covers the JNI upcall and the channel
+// send, i.e. every microsecond the native loop spends waiting on the Kotlin
+// side rather than computing.
+// ---------------------------------------------------------------------------
+
+using clock_type = std::chrono::steady_clock;
+
+inline int64_t now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               clock_type::now().time_since_epoch())
+        .count();
+}
+
+struct GenerationProfile {
+    int64_t tokenize_us      = 0;  // prompt -> token ids
+    int64_t prompt_decode_us = 0;  // prompt ingestion (KV cache fill)
+    int64_t sample_us        = 0;  // logits -> token id, cumulative
+    int64_t detokenize_us    = 0;  // token id -> text, cumulative
+    int64_t callback_us      = 0;  // JNI upcall + channel send, cumulative
+    int64_t decode_us        = 0;  // per-token forward pass, cumulative
+    int64_t first_token_us   = 0;  // entry -> first token handed to Kotlin
+    int64_t total_us         = 0;
+    int32_t tokens           = 0;
+
+    void log() const {
+        const int64_t accounted =
+            tokenize_us + prompt_decode_us + sample_us + detokenize_us + callback_us + decode_us;
+        LOGI("PROFILE tokenize=%.1fms prompt_decode=%.1fms decode=%.1fms "
+             "sample=%.1fms detokenize=%.1fms callback=%.1fms "
+             "first_token=%.1fms total=%.1fms unaccounted=%.1fms tokens=%d",
+             tokenize_us / 1000.0, prompt_decode_us / 1000.0, decode_us / 1000.0,
+             sample_us / 1000.0, detokenize_us / 1000.0, callback_us / 1000.0,
+             first_token_us / 1000.0, total_us / 1000.0,
+             (total_us - accounted) / 1000.0, tokens);
+        if (tokens > 0) {
+            LOGI("PROFILE per_token decode=%.1fms callback=%.1fms sample=%.1fms",
+                 decode_us / 1000.0 / tokens,
+                 callback_us / 1000.0 / tokens,
+                 sample_us / 1000.0 / tokens);
+        }
+    }
+};
+
 /** True when `text` ends with any entry in `stops`. */
 bool ends_with_any(const std::string & text, const std::vector<std::string> & stops) {
     for (const auto & stop : stops) {
@@ -399,7 +470,10 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_loadModel(
     // enum; LLAMA_LOAD_MODE_MMAP is mmap-only, MMAP_MLOCK would be both.
     model_params.load_mode = LLAMA_LOAD_MODE_MMAP;
 
+    const int64_t model_load_start = now_us();
     session->model = llama_model_load_from_file(path.c_str(), model_params);
+    const int64_t model_load_us = now_us() - model_load_start;
+
     if (session->model == nullptr) {
         LOGE("loadModel: llama_model_load_from_file failed");
         return 0;
@@ -419,13 +493,21 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_loadModel(
     // scratch memory than a phone can spare.
     ctx_params.n_batch         = 512;
 
+    // Context creation is where the KV cache is allocated — sized by n_ctx.
+    const int64_t ctx_init_start = now_us();
     session->ctx = llama_init_from_model(session->model, ctx_params);
+    const int64_t ctx_init_us = now_us() - ctx_init_start;
+
     if (session->ctx == nullptr) {
         LOGE("loadModel: llama_init_from_model failed");
         return 0;   // unique_ptr frees the model
     }
 
-    LOGI("loadModel: ok (n_ctx=%d threads=%d gpu_layers=%d)",
+    // Makes llama_decode interruptible, including during prompt ingestion.
+    llama_set_abort_callback(session->ctx, abort_if_cancelled, session.get());
+
+    LOGI("PROFILE load model_mmap=%.1fms kv_context_init=%.1fms n_ctx=%d threads=%d gpu_layers=%d",
+         model_load_us / 1000.0, ctx_init_us / 1000.0,
          context_length, thread_count, gpu_layers);
 
     // Ownership transfers to the Kotlin side, which must call freeModel.
@@ -516,9 +598,15 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
         }
     }
 
+    GenerationProfile profile;
+    const int64_t generate_entry_us = now_us();
+
     const std::string prompt_text = from_jstring(env, prompt);
+
+    const int64_t tokenize_start = now_us();
     std::vector<llama_token> prompt_tokens =
         tokenize(session->vocab, prompt_text, /*add_special=*/true);
+    profile.tokenize_us = now_us() - tokenize_start;
     if (prompt_tokens.empty()) {
         LOGE("generate: tokenisation produced no tokens");
         return kFinishError;
@@ -549,11 +637,24 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
         ~SamplerGuard() { if (s != nullptr) llama_sampler_free(s); }
     } sampler_guard{sampler};
 
-    // --- ingest the prompt ---
+    // --- ingest the prompt (fills the KV cache) ---
+    const int64_t prompt_decode_start = now_us();
     llama_batch batch = llama_batch_get_one(prompt_tokens.data(),
                                             static_cast<int32_t>(prompt_tokens.size()));
-    if (llama_decode(session->ctx, batch) != 0) {
-        LOGE("generate: prompt decode failed");
+    const int prompt_rc = llama_decode(session->ctx, batch);
+    profile.prompt_decode_us = now_us() - prompt_decode_start;
+
+    if (prompt_rc != 0) {
+        // A non-zero return here is ambiguous: it means either a genuine
+        // failure or that the abort callback fired. The cancellation flag
+        // disambiguates, and reporting the difference matters — a cancel is a
+        // normal user action, an error is not.
+        if (session->cancel_requested.load(std::memory_order_relaxed)) {
+            LOGI("generate: cancelled during prompt ingestion after %.1fms",
+                 profile.prompt_decode_us / 1000.0);
+            return kFinishCancelled;
+        }
+        LOGE("generate: prompt decode failed (rc=%d)", prompt_rc);
         return kFinishError;
     }
 
@@ -570,14 +671,18 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
 
         // Samples *and accepts* — llama_sampler_sample does both, so calling
         // llama_sampler_accept here as well would corrupt penalty state.
+        const int64_t sample_start = now_us();
         const llama_token token = llama_sampler_sample(sampler, session->ctx, -1);
+        profile.sample_us += now_us() - sample_start;
 
         if (llama_vocab_is_eog(session->vocab, token)) {
             finish_reason = kFinishEndOfTurn;
             break;
         }
 
+        const int64_t detok_start = now_us();
         pending_bytes += token_to_text(session->vocab, token);
+        profile.detokenize_us += now_us() - detok_start;
 
         // Emit only complete UTF-8; hold back a split character's tail.
         const size_t tail = incomplete_tail_length(pending_bytes);
@@ -587,11 +692,22 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
         if (!emit.empty()) {
             generated += emit;
 
+            // Everything between these two timestamps is time the native loop
+            // spends waiting on Kotlin — the JNI upcall plus the channel send.
+            // If this dominates, the bottleneck is synchronisation, not the model.
+            const int64_t callback_start = now_us();
+
             jstring piece = to_jstring(env, emit);
             if (piece == nullptr) { finish_reason = kFinishError; break; }
 
             const jboolean keep_going = env->CallBooleanMethod(callback, on_token, piece);
             env->DeleteLocalRef(piece);
+
+            profile.callback_us += now_us() - callback_start;
+            profile.tokens++;
+            if (profile.first_token_us == 0) {
+                profile.first_token_us = now_us() - generate_entry_us;
+            }
 
             // A Kotlin-side exception must abort rather than be swallowed:
             // continuing with a pending exception is undefined behaviour.
@@ -613,14 +729,26 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
         }
 
         // Feed the sampled token back in for the next position.
+        // This is the actual per-token forward pass — the model computation.
+        const int64_t decode_start = now_us();
         llama_token next = token;
         llama_batch step = llama_batch_get_one(&next, 1);
-        if (llama_decode(session->ctx, step) != 0) {
-            LOGE("generate: decode failed at token %d", produced);
-            finish_reason = kFinishError;
+        const int decode_rc = llama_decode(session->ctx, step);
+        profile.decode_us += now_us() - decode_start;
+
+        if (decode_rc != 0) {
+            if (session->cancel_requested.load(std::memory_order_relaxed)) {
+                finish_reason = kFinishCancelled;
+            } else {
+                LOGE("generate: decode failed at token %d", produced);
+                finish_reason = kFinishError;
+            }
             break;
         }
     }
+
+    profile.total_us = now_us() - generate_entry_us;
+    profile.log();
 
     LOGI("generate: finished reason=%d chars=%zu", finish_reason, generated.size());
     return finish_reason;

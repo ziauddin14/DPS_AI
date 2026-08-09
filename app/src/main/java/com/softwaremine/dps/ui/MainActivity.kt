@@ -10,6 +10,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.ViewModelProvider
 import com.softwaremine.dps.DpsApplication
+import com.softwaremine.dps.data.android.permission.ActivityPermissionRequestHost
 import com.softwaremine.dps.ui.chat.ChatScreen
 import com.softwaremine.dps.ui.chat.ChatViewModel
 import com.softwaremine.dps.ui.theme.DpsTheme
@@ -39,9 +40,16 @@ class MainActivity : ComponentActivity() {
 
         val container = (application as DpsApplication).container
 
+        // Must be constructed here, before onStart(): registerForActivityResult
+        // requires it (developer.android.com/training/permissions/requesting).
+        // Without this, AndroidPermissionManager.request() has no host attached
+        // and every permission dialog silently never appears (Day 05 Phase E).
+        val permissionHost = ActivityPermissionRequestHost(this, container.logger)
+        container.permissionManager.attachHost(permissionHost)
+
         val viewModel = ViewModelProvider(
             owner = this,
-            factory = ChatViewModel.Factory(container.sessionManager),
+            factory = ChatViewModel.Factory(container.sessionManager, container.voiceModeController),
         )[ChatViewModel::class.java]
 
         setContent {
@@ -54,5 +62,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        val container = (application as DpsApplication).container
+        container.permissionManager.detachHost()
+        super.onDestroy()
     }
 }

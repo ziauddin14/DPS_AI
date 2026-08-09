@@ -170,6 +170,26 @@ sealed class DpsError {
             override val message: String =
                 "Context overflow: prompt needs $requiredTokens tokens, limit is $maxTokens."
         }
+
+        /**
+         * Generation stalled — no token arrived within the allowed interval.
+         *
+         * Distinct from a cancellation and from a general failure because the
+         * recovery differs: a stall means the runtime is wedged, so the model
+         * should be reloaded rather than the request simply retried.
+         *
+         * Note this measures *inactivity between tokens*, not total duration. A
+         * cap on total time would abort long-but-healthy generations, which on
+         * a phone are entirely normal; silence is the real symptom of a wedged
+         * runtime.
+         */
+        data class Timeout(
+            val idleMillis: Long,
+            val limitMillis: Long,
+        ) : Runtime() {
+            override val message: String =
+                "Generation stalled: no token for ${idleMillis}ms (limit ${limitMillis}ms)."
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -192,6 +212,19 @@ sealed class DpsError {
         /** A generation was requested while one was already in flight. */
         data object GenerationInProgress : Session() {
             override val message: String = "A response is already being generated."
+        }
+
+        /**
+         * A turn was cut off by [com.softwaremine.dps.ai.session.AiSessionManager.releaseMemory]
+         * — Android reclaiming memory mid-turn (Day 07). Distinct from
+         * [com.softwaremine.dps.core.error.DpsError.Runtime.Timeout]: nothing
+         * was wedged, the system asked for memory back and DPS gave it back,
+         * exactly as designed. Named so the user is told the truth rather
+         * than being shown a generic stall message for a deliberate,
+         * recoverable pause.
+         */
+        data object Interrupted : Session() {
+            override val message: String = "Turn interrupted: memory was reclaimed by the system."
         }
     }
 

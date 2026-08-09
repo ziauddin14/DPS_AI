@@ -1,0 +1,27 @@
+<!--
+    Notification small icon.
+
+    NotificationCompat.Builder.setSmallIcon() is mandatory; a notification
+    without one is rejected by the system.
+
+    Constraints this shape obeys:
+      - Android renders the small icon as a silhouette: only the alpha channel
+        is used and all colour is discarded. It is drawn white-on-transparent
+        for that reason, and any gradient or hue here would be thrown away.
+      - Detail disappears at status-bar size, so the mark is a single bold
+        glyph rather than anything intricate.
+
+    A stylised "D" in a rounded square — legible at 24dp and unmistakable in a
+    crowded status bar.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFFFF">
+
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4,3h9c4.42,0 8,3.58 8,9s-3.58,9 -8,9H4V3zM8,7v10h4.6c2.65,0 4.4,-1.9 4.4,-5s-1.75,-5 -4.4,-5H8z" />
+</vector>

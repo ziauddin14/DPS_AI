@@ -2,7 +2,8 @@ package com.softwaremine.dps.core.concurrency
 
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.asCoroutineDispatcher
+import java.util.concurrent.Executors
 
 /**
  * Supplies the coroutine dispatchers used across the app.
@@ -71,16 +72,42 @@ class DefaultDispatcherProvider : DispatcherProvider {
     override val default: CoroutineDispatcher get() = Dispatchers.Default
     override val io: CoroutineDispatcher get() = Dispatchers.IO
 
-    @OptIn(ExperimentalCoroutinesApi::class)
     override val inference: CoroutineDispatcher = INFERENCE
 
     private companion object {
         /**
-         * Held as a singleton, not a getter: `limitedParallelism` returns a new
-         * view on each call, and a fresh view per call would defeat the whole
-         * point by permitting concurrent generations.
+         * A **dedicated thread**, not a view of [Dispatchers.Default].
+         *
+         * ## Why this changed (Day 04 deadlock fix)
+         * This was originally `Dispatchers.Default.limitedParallelism(1)`. That
+         * is the right shape for CPU-bound *suspending* work and the wrong one
+         * here, because llama.cpp's `generate` is a **blocking** native call.
+         *
+         * A blocking call on a `limitedParallelism(1)` view occupies the single
+         * permit for the entire generation. Anything else needing that
+         * dispatcher — including the coroutine consuming the token stream —
+         * simply never runs. With `callbackFlow`'s 64-item buffer that produced
+         * two distinct bugs from one cause: generations under 64 tokens
+         * appeared to work but delivered every token at the end rather than
+         * streaming, and generations over 64 tokens blocked forever in
+         * `trySendBlocking` against a consumer that could not be scheduled,
+         * permanently wedging model load and unload behind them.
+         *
+         * A dedicated thread can be blocked indefinitely without starving
+         * anything else, which is exactly the property blocking work requires.
+         * Serialisation — one generation at a time — is preserved because the
+         * executor has exactly one thread.
+         *
+         * Never route a *consumer* of native output through this dispatcher.
          */
-        @OptIn(ExperimentalCoroutinesApi::class)
-        val INFERENCE: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1)
+        val INFERENCE: CoroutineDispatcher =
+            Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "dps-inference").apply {
+                    isDaemon = true
+                    // Below default so token generation cannot outrank UI work;
+                    // a janky interface during inference reads as a broken app.
+                    priority = Thread.NORM_PRIORITY - 1
+                }
+            }.asCoroutineDispatcher()
     }
 }

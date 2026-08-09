@@ -20,7 +20,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -94,6 +93,26 @@ class DefaultAiEngine(
      * why that separation protects cold-start time.
      */
     override suspend fun initialize(): DpsResult<Unit> = lifecycleMutex.withLock {
+        // Re-initialising while a model is already resident must not tear down
+        // the Ready state.
+        //
+        // Found on Day 04 by the on-device pipeline test. Without this guard the
+        // method fell through and set AiState.Idle unconditionally, so an engine
+        // holding a perfectly good loaded model reported Idle — and
+        // AiSessionManager.sendMessage, which gates on Ready, then refused with
+        // NotLoaded. Any second call to startSession() hit it: resuming from
+        // SessionState.Suspended, or simply reopening the chat surface.
+        //
+        // Returning early also skips a redundant full-file checksum pass, which
+        // measured 3.3 s for the 1 GB artifact (see TD-004).
+        val residentModel = loadedModel
+        val activeRuntime = selectedRuntime
+        if (residentModel != null && activeRuntime != null) {
+            _state.value = AiState.Ready(residentModel.id, activeRuntime.id)
+            logger.i(TAG, "Already initialised with '${residentModel.id}'; reusing.")
+            return@withLock DpsResult.Ok
+        }
+
         _state.value = AiState.CheckingModel
 
         val runtime = selectRuntime()
@@ -208,31 +227,51 @@ class DefaultAiEngine(
             return@flow
         }
         runtime.generate(request).collect { chunk -> emit(chunk) }
-    }.flowOn(dispatchers.inference)
+    }
+    // Deliberately NOT `.flowOn(dispatchers.inference)`.
+    //
+    // That was the other half of the Day 04 deadlock. The runtime provider
+    // already dispatches its own blocking native work onto `inference`; pinning
+    // the *consumer* there too meant producer and consumer contended for one
+    // execution slot the producer held for the whole generation.
+    //
+    // The consumer now runs in the collector's own context, so tokens are
+    // delivered as they are produced rather than accumulating in the channel
+    // buffer until the producer finishes.
 
-    override suspend fun generateOnce(request: CompletionRequest): DpsResult<AiCompletion> =
-        withContext(dispatchers.inference) {
-            var failure: DpsError? = null
-            var completion: AiCompletion? = null
+    override suspend fun generateOnce(request: CompletionRequest): DpsResult<AiCompletion> {
+        // Deliberately NOT `withContext(dispatchers.inference)` here — see the
+        // comment on `generate()` above. `LlamaCppRuntimeProvider.generate()`
+        // already launches its blocking native worker on `dispatchers.inference`
+        // and holds that single thread for the whole generation; pinning this
+        // method's `collect` to the same dispatcher would contend with the
+        // worker for the one execution slot it holds, exactly reproducing the
+        // Day 04 deadlock this method never got tested against on real
+        // hardware (Phase D's tests all scripted `AiEngine`). Running `collect`
+        // in the caller's own context — the same principle `generate()`'s own
+        // callers already rely on — is what lets the worker's token callbacks
+        // actually be received.
+        var failure: DpsError? = null
+        var completion: AiCompletion? = null
 
-            generate(request).collect { chunk ->
-                when (chunk) {
-                    is CompletionChunk.Token -> Unit // Accumulated by the runtime.
-                    is CompletionChunk.Completed -> completion = chunk.completion
-                    is CompletionChunk.Failed -> failure = chunk.error
-                }
-            }
-
-            val error = failure
-            val result = completion
-            when {
-                error != null -> DpsResult.Failure(error)
-                result != null -> DpsResult.Success(result)
-                else -> DpsResult.Failure(
-                    DpsError.Runtime.GenerationFailed("Stream ended without a terminal chunk."),
-                )
+        generate(request).collect { chunk ->
+            when (chunk) {
+                is CompletionChunk.Token -> Unit // Accumulated by the runtime.
+                is CompletionChunk.Completed -> completion = chunk.completion
+                is CompletionChunk.Failed -> failure = chunk.error
             }
         }
+
+        val error = failure
+        val result = completion
+        return when {
+            error != null -> DpsResult.Failure(error)
+            result != null -> DpsResult.Success(result)
+            else -> DpsResult.Failure(
+                DpsError.Runtime.GenerationFailed("Stream ended without a terminal chunk."),
+            )
+        }
+    }
 
     override suspend fun tokenCount(text: String): DpsResult<Int> {
         val runtime = selectedRuntime ?: return DpsResult.Failure(DpsError.Runtime.NotLoaded)

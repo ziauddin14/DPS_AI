@@ -5,9 +5,11 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.softwaremine.dps.ai.session.AiSessionManager
 import com.softwaremine.dps.ai.session.SessionState
+import com.softwaremine.dps.ai.voice.VoiceModeController
 import com.softwaremine.dps.core.error.DpsError
 import com.softwaremine.dps.domain.ai.AiState
 import com.softwaremine.dps.domain.conversation.ConversationState
+import com.softwaremine.dps.domain.voice.VoiceMode
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
@@ -42,6 +44,7 @@ import kotlinx.coroutines.launch
  */
 class ChatViewModel(
     private val sessionManager: AiSessionManager,
+    private val voiceModeController: VoiceModeController,
 ) : ViewModel() {
 
     /**
@@ -55,11 +58,13 @@ class ChatViewModel(
         sessionManager.conversation,
         sessionManager.aiState,
         sessionManager.sessionState,
-    ) { conversation, aiState, sessionState ->
+        voiceModeController.mode,
+    ) { conversation, aiState, sessionState, voiceMode ->
         ChatUiState(
             conversation = conversation,
             aiState = aiState,
             sessionState = sessionState,
+            voiceMode = voiceMode,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -92,6 +97,16 @@ class ChatViewModel(
         sessionManager.resetConversation()
     }
 
+    /** Starts one tap-to-talk voice turn (Day 07). Progress is observed through [uiState]. */
+    fun startVoiceTurn() {
+        voiceModeController.startListening()
+    }
+
+    /** Cancels the in-progress voice turn — stops listening or stops speaking. */
+    fun cancelVoiceTurn() {
+        voiceModeController.cancel()
+    }
+
     /**
      * Factory.
      *
@@ -100,13 +115,14 @@ class ChatViewModel(
      */
     class Factory(
         private val sessionManager: AiSessionManager,
+        private val voiceModeController: VoiceModeController,
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             require(modelClass.isAssignableFrom(ChatViewModel::class.java)) {
                 "Unknown ViewModel class: ${modelClass.name}"
             }
-            return ChatViewModel(sessionManager) as T
+            return ChatViewModel(sessionManager, voiceModeController) as T
         }
     }
 
@@ -126,10 +142,39 @@ data class ChatUiState(
     val conversation: ConversationState = ConversationState.empty("initial"),
     val aiState: AiState = AiState.Idle,
     val sessionState: SessionState = SessionState.Inactive,
+    val voiceMode: VoiceMode = VoiceMode.Idle,
 ) {
     /** `true` when the composer should accept input. */
     val canSend: Boolean
         get() = aiState is AiState.Ready && !conversation.isGenerating
+
+    /**
+     * `true` while a voice turn genuinely occupies the microphone or the
+     * speaker — [VoiceMode.Error] is deliberately excluded: an error has
+     * already ended the turn, so the mic control should immediately offer a
+     * retry rather than keep showing "stop" for a turn that is over (found
+     * via real-device testing — Day 07).
+     */
+    val isVoiceBusy: Boolean
+        get() = voiceMode == VoiceMode.Listening || voiceMode == VoiceMode.Processing || voiceMode == VoiceMode.Speaking
+
+    /** `true` when the microphone control should be tappable to *start* a turn. */
+    val canStartVoice: Boolean
+        get() = aiState is AiState.Ready && !conversation.isGenerating && !isVoiceBusy
+
+    /**
+     * A short line describing the current voice state, or `null` when voice
+     * mode is idle — "the user should not have to guess whether DPS heard
+     * them" (Day 07 Phase 3).
+     */
+    val voiceStatusLabel: String?
+        get() = when (val mode = voiceMode) {
+            VoiceMode.Idle -> null
+            VoiceMode.Listening -> "Listening…"
+            VoiceMode.Processing -> "Thinking…"
+            VoiceMode.Speaking -> "Speaking…"
+            is VoiceMode.Error -> mode.message
+        }
 
     /** `true` while a response is streaming. */
     val isGenerating: Boolean get() = conversation.isGenerating

@@ -20,6 +20,85 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!--
+        Day 05 Phase B. Each of these backs a tool that is now implemented, in
+        keeping with the rule above: a permission is declared when the feature
+        needing it exists.
+    -->
+
+    <!-- Notifications. Runtime permission from API 33; below that the
+         declaration is harmless and the platform imposes no gate. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Calendar. READ is needed to find a writable calendar, WRITE to insert. -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+
+    <!--
+        Exact alarms.
+
+        SCHEDULE_EXACT_ALARM is special access and is NOT auto-granted; the user
+        grants it in system settings. DPS therefore treats exact timing as an
+        enhancement rather than a requirement — reminders are still scheduled
+        inexactly without it (see ReminderScheduler).
+
+        USE_EXACT_ALARM is deliberately NOT declared. It is auto-granted but
+        gated by Google Play policy to apps whose core purpose is alarms or
+        calendars. Claiming it for a general assistant would be a policy
+        violation, and the graceful fallback removes any need for it.
+    -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!-- Day 05 Phase C. Contacts lookup backs the messaging confirmation flows. -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+
+    <!--
+        Day 07. Voice input. Dangerous/runtime at every supported API level —
+        gated the same way as calendar/contacts, requested only when the user
+        taps the microphone control, never at app start.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!--
+        Microphone hardware is a soft requirement: DPS is fully usable by text
+        alone, so a device without a microphone should still be installable
+        rather than filtered out of the Play listing.
+    -->
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" />
+
+    <!--
+        Package visibility (Android 11 / API 30+).
+
+        From API 30 the system filters what other apps an app can see.
+        `queryIntentActivities` and `resolveActivity` return nothing for
+        undeclared apps, so with targetSdk 35 a perfectly installed WhatsApp or
+        Gmail would resolve to null and DPS would report it as "not installed".
+
+        Declared narrowly — the specific packages and the two intent signatures
+        actually used. QUERY_ALL_PACKAGES is deliberately NOT requested: it
+        requires Google Play justification and would let DPS enumerate the
+        user's entire app list, which a privacy-first product has no business
+        doing to open a chat.
+    -->
+    <queries>
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
+
+        <!-- WhatsApp deep links arrive as https, matching WhatsAppIntentBuilder. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+
+        <!-- Email composers, matching EmailIntentBuilder's mailto: intent. -->
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="mailto" />
+        </intent>
+    </queries>
+
+    <!--
         A 1.5B parameter model needs meaningful headroom. Declaring the
         requirement lets Play filter devices that cannot run the product
         rather than shipping them a guaranteed OOM.
@@ -59,6 +138,22 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            Delivers fired reminder alarms.
+
+            exported="false" because only AlarmManager, acting on a PendingIntent
+            this app created, ever targets it. An exported receiver would let any
+            app on the device fabricate reminders.
+
+            No intent-filter: the PendingIntent names this component explicitly.
+            Implicit broadcasts to manifest receivers are restricted from API 26
+            and would not arrive.
+        -->
+        <receiver
+            android:name=".data.android.reminder.ReminderReceiver"
+            android:exported="false"
+            android:enabled="true" />
 
     </application>
 

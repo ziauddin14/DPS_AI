@@ -36,10 +36,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.softwaremine.dps.core.error.DpsError
 import com.softwaremine.dps.domain.ai.AiState
 import com.softwaremine.dps.domain.conversation.ChatMessage
 import com.softwaremine.dps.domain.conversation.MessageRole
 import com.softwaremine.dps.domain.conversation.MessageStatus
+import com.softwaremine.dps.domain.voice.VoiceMode
 
 /**
  * The chat surface.
@@ -132,6 +134,27 @@ fun ChatScreen(
                 )
             }
 
+            // "The user should not have to guess whether DPS heard them" —
+            // Day 07 Phase 3. Shown as its own banner rather than folded into
+            // the top bar's status line, since it needs to be visible while
+            // looking at the transcript, not just at the top of the screen.
+            uiState.voiceStatusLabel?.let { status ->
+                val isError = uiState.voiceMode is VoiceMode.Error
+                Text(
+                    text = "${voiceStatusIcon(uiState.voiceMode)} $status",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (isError) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
+
             LazyColumn(
                 state = listState,
                 modifier = Modifier
@@ -152,12 +175,21 @@ fun ChatScreen(
                 draft = draft,
                 onDraftChange = { draft = it },
                 canSend = uiState.canSend && draft.isNotBlank(),
+                canStartVoice = uiState.canStartVoice,
                 isGenerating = uiState.isGenerating,
+                isVoiceActive = uiState.isVoiceBusy,
                 onSend = {
                     viewModel.sendMessage(draft)
                     draft = ""
                 },
                 onCancel = viewModel::cancelGeneration,
+                onMicTap = {
+                    if (uiState.isVoiceBusy) {
+                        viewModel.cancelVoiceTurn()
+                    } else {
+                        viewModel.startVoiceTurn()
+                    }
+                },
             )
         }
     }
@@ -222,9 +254,10 @@ private fun MessageBubble(message: ChatMessage) {
                     text = message.content.ifEmpty { if (message.isStreaming) "…" else "" },
                     style = MaterialTheme.typography.bodyMedium,
                 )
-                if (failed) {
+                val failureStatus = message.status as? MessageStatus.Failed
+                if (failureStatus != null) {
                     Text(
-                        text = "Response incomplete",
+                        text = failureReason(failureStatus.error),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onErrorContainer,
                         modifier = Modifier.padding(top = 4.dp),
@@ -235,15 +268,18 @@ private fun MessageBubble(message: ChatMessage) {
     }
 }
 
-/** Input field plus send/stop control. */
+/** Input field plus mic/send/stop controls. */
 @Composable
 private fun Composer(
     draft: String,
     onDraftChange: (String) -> Unit,
     canSend: Boolean,
+    canStartVoice: Boolean,
     isGenerating: Boolean,
+    isVoiceActive: Boolean,
     onSend: () -> Unit,
     onCancel: () -> Unit,
+    onMicTap: () -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -259,16 +295,50 @@ private fun Composer(
             modifier = Modifier.weight(1f),
             placeholder = { Text("Message DPS") },
             maxLines = 5,
+            // Voice mode owns the microphone and any in-flight turn while
+            // it is active; typing is disabled rather than left to race a
+            // voice turn that could deliver its own message at the same time.
+            enabled = !isVoiceActive,
             keyboardActions = KeyboardActions(onSend = { if (canSend) onSend() }),
         )
+
+        // A tap always does something sensible: start listening when idle,
+        // or cancel the in-progress turn (listening, thinking or speaking)
+        // otherwise — no dead control, per Phase 9.
+        Button(onClick = onMicTap, enabled = canStartVoice || isVoiceActive) {
+            Text(if (isVoiceActive) "◼" else "🎤")
+        }
 
         // Send becomes Stop during generation rather than sitting disabled
         // beside a separate control: on-device responses are slow enough that
         // cancelling is a routine action, not an edge case.
         if (isGenerating) {
-            Button(onClick = onCancel) { Text("Stop") }
+            Button(onClick = onCancel, enabled = !isVoiceActive) { Text("Stop") }
         } else {
-            Button(onClick = onSend, enabled = canSend) { Text("Send") }
+            Button(onClick = onSend, enabled = canSend && !isVoiceActive) { Text("Send") }
         }
     }
+}
+
+/**
+ * User-facing reason a turn did not complete.
+ *
+ * [DpsError.message] is a developer diagnostic (see [com.softwaremine.dps.ui.chat.toUserMessage]'s
+ * own doc) and must never be shown directly — Phase 8's honest-recovery
+ * requirement means each case here names something specific rather than
+ * falling back to one generic string for every failure.
+ */
+private fun failureReason(error: DpsError): String = when (error) {
+    is DpsError.Session.Interrupted -> "Paused to free up memory. Please try again."
+    is DpsError.Runtime.Timeout -> "DPS took too long to respond. Please try again."
+    else -> "Response incomplete."
+}
+
+/** The emoji the Day 07 brief itself uses for each voice state. */
+private fun voiceStatusIcon(mode: VoiceMode): String = when (mode) {
+    VoiceMode.Idle -> ""
+    VoiceMode.Listening -> "🎙"
+    VoiceMode.Processing -> "🧠"
+    VoiceMode.Speaking -> "🔊"
+    is VoiceMode.Error -> "⚠️"
 }

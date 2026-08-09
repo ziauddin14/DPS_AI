@@ -1,8 +1,10 @@
 package com.softwaremine.dps.ai.session
 
 import com.softwaremine.dps.ai.conversation.ConversationManager
+import com.softwaremine.dps.ai.intent.ToolOrchestrator
 import com.softwaremine.dps.ai.parser.ResponseParser
 import com.softwaremine.dps.ai.prompt.PromptManager
+import com.softwaremine.dps.ai.secretary.SecretaryOrchestrator
 import com.softwaremine.dps.core.concurrency.DispatcherProvider
 import com.softwaremine.dps.core.error.DpsError
 import com.softwaremine.dps.core.logging.DpsLogger
@@ -12,11 +14,15 @@ import com.softwaremine.dps.domain.ai.AiEngine
 import com.softwaremine.dps.domain.ai.AiState
 import com.softwaremine.dps.domain.ai.CompletionChunk
 import com.softwaremine.dps.domain.ai.TokenCounter
+import com.softwaremine.dps.domain.conversation.MessageRole
+import com.softwaremine.dps.domain.conversation.MessageStatus
 import com.softwaremine.dps.domain.model.ModelConfig
 import com.softwaremine.dps.domain.model.ModelManager
+import com.softwaremine.dps.domain.permission.PermissionManager
 import com.softwaremine.dps.domain.runtime.RuntimeStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -55,20 +61,35 @@ import kotlinx.coroutines.launch
  * - Report runtime health.
  * - Run generation as a cancellable stream.
  *
+ * ## Routing (Day 05 Phase E)
+ * Every message is offered to [SecretaryOrchestrator] first. A tool outcome —
+ * an action taken, a clarifying question, a permission request — is appended
+ * to the conversation directly, without a model generation pass at all
+ * (Phase D's "one inference pass" decision extends unchanged: classification
+ * *is* that one pass). Only when the orchestrator decides a message is
+ * ordinary conversation does [runGeneration] run, exactly as it always has —
+ * Day 02–04's streaming chat pipeline is untouched below this routing point.
+ *
+ * A [ToolOrchestrator.Outcome.NeedsPermission] additionally drives a real,
+ * live permission request through [permissionManager] before the reply is
+ * shown to have been resolved one way or the other — see [deliver].
+ *
  * ## Explicit non-responsibilities
- * No secretary logic, no tools, no memory. It moves data between stages and
- * manages a lifecycle. When Day 03 adds tool calling, the loop below gains a
- * branch after parsing — nothing else in the pipeline changes shape.
+ * No intent classification, no tool selection, no memory of its own — all of
+ * that is [SecretaryOrchestrator]'s. This class only decides *whether* to ask
+ * it, and what to do with what it returns.
  *
  * ## Concurrency
- * One generation at a time, tracked by [generationJob]. A second [sendMessage]
- * while one is in flight is rejected rather than queued: two concurrent
- * generations would interleave tokens into the same conversation, and queueing
- * would let a user stack up minutes of work they can no longer see or cancel.
+ * One generation (or tool turn) at a time, tracked by [generationJob]. A
+ * second [sendMessage] while one is in flight is rejected rather than queued:
+ * two concurrent turns would interleave into the same conversation, and
+ * queueing would let a user stack up minutes of work they can no longer see or
+ * cancel.
  *
  * ## Dependencies
  * [AiEngine], [ConversationManager], [PromptManager], [ResponseParser],
- * [DispatcherProvider], [DpsLogger]. No Android framework.
+ * [SecretaryOrchestrator], [PermissionManager], [DispatcherProvider],
+ * [DpsLogger]. No Android framework.
  */
 class AiSessionManager(
     private val engine: AiEngine,
@@ -76,10 +97,17 @@ class AiSessionManager(
     private val conversationManager: ConversationManager,
     private val promptManager: PromptManager,
     private val responseParser: ResponseParser,
+    private val secretaryOrchestrator: SecretaryOrchestrator,
+    private val permissionManager: PermissionManager,
     private val dispatchers: DispatcherProvider,
     private val logger: DpsLogger,
     private val scope: CoroutineScope,
     private val config: ModelConfig = ModelConfig.SECRETARY,
+    /**
+     * Inactivity limit before a generation is treated as stalled (Phase E).
+     * Injectable so tests can drive the timeout path without waiting a minute.
+     */
+    private val stallTimeoutMillis: Long = DEFAULT_STALL_TIMEOUT_MILLIS,
 ) {
 
     private val _sessionState = MutableStateFlow<SessionState>(SessionState.Inactive)
@@ -178,6 +206,7 @@ class AiSessionManager(
     fun resetConversation() {
         cancelGeneration()
         conversationManager.reset()
+        secretaryOrchestrator.reset()
         logger.i(TAG, "Conversation reset.")
     }
 
@@ -188,13 +217,47 @@ class AiSessionManager(
      * rather than [SessionState.Inactive] so the UI can distinguish "the system
      * reclaimed memory, tap to resume" from "no session was started" — the
      * former is recoverable with one tap and no lost context.
+     *
+     * ## Why an in-flight turn gets a visible trace (Day 07)
+     * Day 06's on-device verification found that a turn cut off here left
+     * *nothing* on screen: no error, no stuck bubble the user could point
+     * to, just a message that was sent and never answered. That reads as a
+     * frozen or dead app, not the deliberate, one-tap-recoverable pause this
+     * actually is — Phase 7's "the user should not encounter... a dead
+     * session" requirement. [notifyInterruptedTurn] is the fix: it runs only
+     * when a generation was genuinely in flight, so an idle app backgrounding
+     * normally is unaffected.
      */
     suspend fun releaseMemory() {
+        val wasGenerating = generationJob?.isActive == true
         cancelGeneration()
         engine.unloadModel()
         val active = _sessionState.value as? SessionState.Active
         _sessionState.value = SessionState.Suspended(active?.modelId)
         logger.i(TAG, "Memory released; session suspended.")
+        if (wasGenerating) notifyInterruptedTurn()
+    }
+
+    /**
+     * Leaves a visible trace of a turn [releaseMemory] cut off mid-flight.
+     *
+     * A streaming assistant bubble is marked failed in place, exactly like a
+     * stall timeout already does. A turn interrupted *before* any bubble
+     * existed — cancelled during classification, which posts nothing until
+     * it has an outcome — instead gets a short assistant note, so the user's
+     * message is never left silently unanswered.
+     */
+    private fun notifyInterruptedTurn() {
+        val lastMessage = conversationManager.current.messages.lastOrNull() ?: return
+        when {
+            lastMessage.role == MessageRole.ASSISTANT && lastMessage.status is MessageStatus.Streaming ->
+                conversationManager.failAssistantMessage(lastMessage.id, DpsError.Session.Interrupted)
+
+            lastMessage.role == MessageRole.USER ->
+                postAssistantMessage("Paused to free up memory before answering. Please try again.")
+
+            else -> Unit
+        }
     }
 
     /** Reports whether the AI is currently able to answer. */
@@ -236,8 +299,61 @@ class AiSessionManager(
         }
 
         conversationManager.appendUserMessage(trimmed)
-        generationJob = scope.launch(dispatchers.default) { runGeneration() }
+        generationJob = scope.launch(dispatchers.default) { routeMessage(trimmed) }
         return DpsResult.Ok
+    }
+
+    /**
+     * Offers [text] to [secretaryOrchestrator] first; falls back to the
+     * ordinary streaming chat pipeline only when it decides the message is not
+     * an action.
+     */
+    private suspend fun routeMessage(text: String) {
+        when (val outcome = secretaryOrchestrator.handle(text)) {
+            is ToolOrchestrator.Outcome.Conversational -> runGeneration()
+            else -> deliver(outcome)
+        }
+    }
+
+    /**
+     * Appends a tool outcome's reply as a complete (non-streamed) assistant
+     * message, then — for exactly one round — actually asks the OS for a
+     * needed permission and shows whatever resuming produces.
+     *
+     * @param allowPermissionRequest bounds the recursion to one retry. A
+     *   second [ToolOrchestrator.Outcome.NeedsPermission] means the permission
+     *   is still denied after the live dialog resolved (or was permanently
+     *   denied and the OS showed nothing at all) — repeating the request
+     *   automatically at that point would loop forever without the user
+     *   having asked again, so it is shown instead and left there.
+     */
+    private suspend fun deliver(
+        outcome: ToolOrchestrator.Outcome,
+        allowPermissionRequest: Boolean = true,
+    ) {
+        val reply = replyText(outcome) ?: return
+        postAssistantMessage(reply)
+
+        if (outcome is ToolOrchestrator.Outcome.NeedsPermission && allowPermissionRequest) {
+            permissionManager.request(outcome.result.permissions.toSet())
+            val resumed = secretaryOrchestrator.onPermissionResult() ?: return
+            deliver(resumed, allowPermissionRequest = false)
+        }
+    }
+
+    private fun replyText(outcome: ToolOrchestrator.Outcome): String? = when (outcome) {
+        is ToolOrchestrator.Outcome.Handled -> outcome.reply
+        is ToolOrchestrator.Outcome.Clarify -> outcome.question
+        is ToolOrchestrator.Outcome.NeedsPermission -> outcome.reply
+        // Never reached: routeMessage only calls deliver() for a non-Conversational
+        // outcome, but the branch must exist for this `when` to be exhaustive.
+        is ToolOrchestrator.Outcome.Conversational -> null
+    }
+
+    /** Posts [text] as a complete assistant turn — no streaming, the text is already final. */
+    private fun postAssistantMessage(text: String) {
+        val message = conversationManager.beginAssistantMessage()
+        conversationManager.completeAssistantMessage(message.id, text)
     }
 
     /**
@@ -284,7 +400,36 @@ class AiSessionManager(
         val raw = StringBuilder()
         var terminated = false
 
-        engine.generate(completionRequest).collect { chunk ->
+        // --- stall watchdog (Day 04, Phase E) ---
+        //
+        // Measures inactivity *between* tokens rather than total duration. A
+        // total cap is the obvious design and the wrong one: on-device
+        // generation of a long answer legitimately takes tens of seconds, so a
+        // duration limit aborts healthy work. What actually indicates a wedged
+        // native runtime is silence.
+        //
+        // The watchdog cancels the enclosing scope, which propagates into the
+        // flow and through awaitClose to LlamaCppBridge.cancel, stopping native
+        // work rather than leaving it running behind a dead collector.
+        var lastChunkAtMillis = System.currentTimeMillis()
+        var stalled = false
+
+        try {
+            kotlinx.coroutines.coroutineScope {
+                val watchdog = launch {
+                    while (true) {
+                        kotlinx.coroutines.delay(STALL_POLL_INTERVAL_MILLIS)
+                        val idle = System.currentTimeMillis() - lastChunkAtMillis
+                        if (idle > stallTimeoutMillis) {
+                            stalled = true
+                            logger.e(TAG, "Generation stalled for ${idle}ms; cancelling.")
+                            this@coroutineScope.cancel()
+                        }
+                    }
+                }
+
+                engine.generate(completionRequest).collect { chunk ->
+                    lastChunkAtMillis = System.currentTimeMillis()
             when (chunk) {
                 is CompletionChunk.Token -> {
                     raw.append(chunk.text)
@@ -330,6 +475,33 @@ class AiSessionManager(
                     }
                 }
             }
+                }
+
+                // Generation finished on its own; stand the watchdog down so it
+                // does not hold the scope open.
+                watchdog.cancel()
+            }
+        } catch (cancellation: kotlin.coroutines.cancellation.CancellationException) {
+            if (!stalled) {
+                // A genuine cancellation — the user pressed Stop, or the scope
+                // was torn down. Propagate so structured concurrency behaves.
+                throw cancellation
+            }
+
+            val idle = System.currentTimeMillis() - lastChunkAtMillis
+            terminated = true
+            val error = DpsError.Runtime.Timeout(
+                idleMillis = idle,
+                limitMillis = stallTimeoutMillis,
+            )
+            if (raw.isEmpty()) {
+                conversationManager.removeMessage(assistantMessage.id)
+                conversationManager.clearGenerating()
+            } else {
+                // Partial text is kept. A stall after 200 of 300 tokens still
+                // leaves the user something they have already read.
+                conversationManager.failAssistantMessage(assistantMessage.id, error)
+            }
         }
 
         // Defensive: a runtime that ends its stream without a terminal chunk
@@ -344,6 +516,25 @@ class AiSessionManager(
 
     private companion object {
         const val TAG = "AiSessionManager"
+
+        /**
+         * How often the watchdog checks for silence.
+         *
+         * Cheap enough to poll frequently, coarse enough not to wake the CPU
+         * needlessly during a healthy generation.
+         */
+        const val STALL_POLL_INTERVAL_MILLIS = 1_000L
+
+        /**
+         * Default inactivity limit before a generation is declared stalled.
+         *
+         * Sized against measured device behaviour rather than guessed: on the
+         * reference hardware the *slowest* legitimate gap between tokens is the
+         * first one, which includes prompt ingestion. 60 s leaves generous room
+         * above that while still catching a wedged runtime long before a user
+         * would give up and kill the app.
+         */
+        const val DEFAULT_STALL_TIMEOUT_MILLIS = 60_000L
     }
 }
 

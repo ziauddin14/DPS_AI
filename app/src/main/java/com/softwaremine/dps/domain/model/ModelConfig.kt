@@ -52,13 +52,11 @@ data class ModelConfig(
     val repeatPenalty: Float = DEFAULT_REPEAT_PENALTY,
 
     /**
-     * CPU threads for inference.
+     * CPU threads for inference. Defaults to a device-derived value.
      *
-     * More is not better. Exceeding the count of *performance* cores drags
-     * work onto efficiency cores and can make generation slower while draining
-     * more battery. Resolved per-device at construction, never hardcoded.
+     * See [recommendedThreadCount] for the benchmark this is based on.
      */
-    val threadCount: Int = DEFAULT_THREAD_COUNT,
+    val threadCount: Int = recommendedThreadCount(),
 
     /**
      * Layers offloaded to GPU.
@@ -91,7 +89,47 @@ data class ModelConfig(
         const val DEFAULT_TOP_P: Float = 0.9f
         const val DEFAULT_TOP_K: Int = 40
         const val DEFAULT_REPEAT_PENALTY: Float = 1.1f
-        const val DEFAULT_THREAD_COUNT: Int = 4
+
+        /** Floor for [recommendedThreadCount] on very small devices. */
+        const val MIN_THREAD_COUNT: Int = 2
+
+        /**
+         * Upper bound, to stop a many-core device dedicating everything to
+         * inference. Throughput has flattened well before this point on every
+         * configuration measured.
+         */
+        const val MAX_THREAD_COUNT: Int = 8
+
+        /**
+         * Threads to use for inference, derived from the device.
+         *
+         * ## Why this is computed rather than a constant
+         * It was previously hardcoded to 4, which on the 8-core reference
+         * handset left roughly half the available throughput unused. Measured
+         * on that device (see `docs/PERFORMANCE-DAY-04.md`):
+         *
+         * | Threads | TTFT | Tokens/sec | CPU time |
+         * |---:|---:|---:|---:|
+         * | 4 | 7,644 ms | 1.45 | 80,500 ms |
+         * | 6 | 5,325 ms | 2.44 | 76,990 ms |
+         * | 8 | **4,340 ms** | **2.69** | 90,180 ms |
+         *
+         * 8 threads gave the best latency and was selected on that basis. It is
+         * not free — 8 costs 17% more CPU than 6 for a 10% throughput gain,
+         * so energy per token is worse. The trade was accepted because the
+         * product KPI is latency and this hardware has no headroom to spare.
+         *
+         * Throughput scales sub-linearly (2× threads → 1.86× throughput) and is
+         * flattening, which indicates a memory-bandwidth limit rather than a
+         * shortage of cores. More threads is therefore not a lever worth
+         * pushing further; a smaller model is.
+         *
+         * A constant would be wrong for any device but the one it was measured
+         * on, which is exactly how the original 4 came to be wrong here.
+         */
+        fun recommendedThreadCount(): Int =
+            Runtime.getRuntime().availableProcessors()
+                .coerceIn(MIN_THREAD_COUNT, MAX_THREAD_COUNT)
 
         /**
          * The default configuration for the executive-secretary role.
