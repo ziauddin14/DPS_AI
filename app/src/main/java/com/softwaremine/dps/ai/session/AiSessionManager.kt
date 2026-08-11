@@ -306,12 +306,51 @@ class AiSessionManager(
     /**
      * Offers [text] to [secretaryOrchestrator] first; falls back to the
      * ordinary streaming chat pipeline only when it decides the message is not
-     * an action.
+     * an action, and even then only when that same classification pass did
+     * not already produce a usable reply (Day 08-B).
      */
     private suspend fun routeMessage(text: String) {
-        when (val outcome = secretaryOrchestrator.handle(text)) {
-            is ToolOrchestrator.Outcome.Conversational -> runGeneration()
+        when (val outcome = secretaryOrchestrator.handle(text, recentContext())) {
+            is ToolOrchestrator.Outcome.Conversational -> {
+                val reply = outcome.replyText
+                if (reply != null) {
+                    // The classification pass already answered — this is the
+                    // whole point of Day 08-B: skip the second, streaming
+                    // generation pass entirely rather than discard a working
+                    // answer and redo the work from scratch.
+                    postAssistantMessage(reply)
+                } else {
+                    runGeneration()
+                }
+            }
             else -> deliver(outcome)
+        }
+    }
+
+    /**
+     * The last exchange, rendered as plain text for the classification prompt
+     * (Day 08-B — see [com.softwaremine.dps.ai.intent.IntentPromptBuilder.build]).
+     *
+     * Deliberately small — the last user/assistant pair, not the full history
+     * budget [PromptManager] uses for real generation. This exists only to
+     * give a same-pass conversational reply enough context for an immediate
+     * follow-up to make sense; it is not a replacement for the full pipeline,
+     * which still runs whenever the classification pass does not produce a
+     * reply itself.
+     */
+    private fun recentContext(): String? {
+        // The current user turn was already appended by sendMessage() before
+        // this coroutine was launched, so it is always the last entry here —
+        // drop it to leave only what came *before* this message.
+        val prior = conversationManager.current.messages.dropLast(1)
+            .filter { it.role != MessageRole.SYSTEM && it.isPromptEligible }
+        if (prior.isEmpty()) return null
+
+        return buildString {
+            for (message in prior.takeLast(RECENT_CONTEXT_TURNS)) {
+                val label = if (message.role == MessageRole.USER) "User" else "DPS"
+                append(label).append(": ").append(message.content).append('\n')
+            }
         }
     }
 
@@ -516,6 +555,16 @@ class AiSessionManager(
 
     private companion object {
         const val TAG = "AiSessionManager"
+
+        /**
+         * Messages kept in [recentContext] — one exchange (Day 08-B).
+         *
+         * Deliberately small: this rides along on *every* classification
+         * call, tool requests included, so it must stay cheap. See
+         * [recentContext]'s own doc for why a short window is an acceptable
+         * trade rather than a compromise.
+         */
+        const val RECENT_CONTEXT_TURNS = 2
 
         /**
          * How often the watchdog checks for silence.

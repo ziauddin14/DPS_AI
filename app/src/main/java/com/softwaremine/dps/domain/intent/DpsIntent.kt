@@ -171,6 +171,24 @@ data class IntentParameters(
      * than a guess this class needs to avoid.
      */
     val period: String? = null,
+
+    /**
+     * DPS's own answer, when [type][DpsIntent.type] is [IntentType.CONVERSATION]
+     * (Day 08-B).
+     *
+     * Deliberately a field of its own rather than reusing [message]. An early
+     * on-device measurement did exactly that and the model echoed the user's
+     * own text back instead of answering — [message] already means "body
+     * text to send someone" everywhere else in this schema (WhatsApp, email,
+     * a notification), and asking the same key to *also* mean "your reply to
+     * the user" measurably confused a model this size. A distinct key with
+     * an unambiguous rule removed the collision.
+     *
+     * Not part of [IntentField]/[value] — those name facts the model
+     * extracts *about* a request; this is DPS's own output, never something
+     * a clarification question would ask for.
+     */
+    val reply: String? = null,
 ) {
 
     /** Non-blank value for [field], or `null`. */

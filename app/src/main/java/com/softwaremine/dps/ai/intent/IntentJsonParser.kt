@@ -185,6 +185,9 @@ class IntentJsonParser(
         priority = stringOrNull("priority"),
         duration = stringOrNull("duration"),
         period = stringOrNull("period"),
+        // Day 08-B. A distinct key from "message" on purpose — see
+        // IntentParameters.reply's doc for why the two must not collide.
+        reply = stringOrNull("reply"),
     )
 
     /**

@@ -78,6 +78,9 @@ class SecretaryOrchestratorTest {
         private val replies = replies.toList()
         var index = 0
 
+        /** Every prompt this engine was asked to classify, in order (Day 08-B). */
+        val capturedPrompts = mutableListOf<String>()
+
         override val state: StateFlow<AiState> = MutableStateFlow(AiState.Idle)
         override val activeModel: ModelDescriptor? = null
 
@@ -91,6 +94,7 @@ class SecretaryOrchestratorTest {
         override fun generate(request: CompletionRequest): Flow<CompletionChunk> = emptyFlow()
 
         override suspend fun generateOnce(request: CompletionRequest): DpsResult<AiCompletion> {
+            capturedPrompts += request.prompt
             val reply = replies.getOrElse(index) { replies.last() }
             index++
             return when (reply) {
@@ -404,6 +408,14 @@ class SecretaryOrchestratorTest {
         // immediately after it succeeds (Stage 2) — see the dedicated test
         // for that behavior.
         assertEquals(SecretaryState.WAITING_CONFIRMATION, orchestrator.state.value)
+        // Day 08-C: unlike a confirmation or contact-selection reply, an
+        // answer to a clarification question is open-ended natural language
+        // ("at 4pm", "call it standup") with no closed, deterministically
+        // parseable answer space this codebase has an extractor for — see
+        // the Day 08-C completion notes for why no Fast Path was built for
+        // this case. It must keep reaching the model, not be silently
+        // short-circuited.
+        assertEquals(2, engine.index)
     }
 
     // -----------------------------------------------------------------
@@ -553,6 +565,125 @@ class SecretaryOrchestratorTest {
 
         assertTrue(outcome is ToolOrchestrator.Outcome.Conversational)
         assertEquals(SecretaryState.IDLE, orchestrator.state.value)
+    }
+
+    // -----------------------------------------------------------------
+    // Day 08-B — a same-pass conversational reply, with a safe fallback
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `a conversation intent carrying a message is surfaced as a ready reply`() = runTest {
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"conversation","parameters":{"reply":"Wa alaikum assalam! Sab theek hai."}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(reminderTool())).handle("Salam DPS, kya haal hai?")
+
+        val conversational = outcome as? ToolOrchestrator.Outcome.Conversational
+        assertTrue("Expected Conversational, got $outcome", conversational != null)
+        assertEquals("Wa alaikum assalam! Sab theek hai.", conversational!!.replyText)
+        // Still exactly one inference call — the reply rode along on the
+        // classification pass rather than costing a second one.
+        assertEquals(1, engine.index)
+    }
+
+    @Test
+    fun `a bare conversation intent with no message leaves replyText null so the caller falls back`() = runTest {
+        // No message field at all — the always-safe case: AiSessionManager
+        // must fall back to its own second, streaming generation pass,
+        // exactly as it did before this field existed.
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"conversation"}"""))
+
+        val outcome = secretary(engine, listOf(reminderTool())).handle("tell me something interesting")
+
+        val conversational = outcome as? ToolOrchestrator.Outcome.Conversational
+        assertTrue("Expected Conversational, got $outcome", conversational != null)
+        assertNull(conversational!!.replyText)
+    }
+
+    @Test
+    fun `a blank reply is treated the same as no reply`() = runTest {
+        // A model that emits "reply":"" (or whitespace) must not produce a
+        // blank assistant bubble; SecretaryOrchestrator trims and nulls this
+        // out itself, since IntentParameters.reply is outside the value()
+        // helper that does this for the other fields.
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"conversation","parameters":{"reply":"   "}}"""))
+
+        val outcome = secretary(engine, listOf(reminderTool())).handle("hmm")
+
+        val conversational = outcome as? ToolOrchestrator.Outcome.Conversational
+        assertTrue("Expected Conversational, got $outcome", conversational != null)
+        assertNull(conversational!!.replyText)
+    }
+
+    @Test
+    fun `a reply that only echoes the user's own message is discarded`() = runTest {
+        // The one real failure mode on-device measurement found (Day 08-B):
+        // a model that restates the question instead of answering it. This
+        // must fall back to the streaming pass exactly like an empty reply.
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"conversation","parameters":{"reply":"Salam DPS, kya haal hai?"}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(reminderTool())).handle("Salam DPS, kya haal hai?")
+
+        val conversational = outcome as? ToolOrchestrator.Outcome.Conversational
+        assertTrue("Expected Conversational, got $outcome", conversational != null)
+        assertNull(conversational!!.replyText)
+    }
+
+    @Test
+    fun `an echo differing only by punctuation and case is still discarded`() = runTest {
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"conversation","parameters":{"reply":"tell me something interesting"}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(reminderTool())).handle("Tell me something interesting!")
+
+        val conversational = outcome as? ToolOrchestrator.Outcome.Conversational
+        assertTrue("Expected Conversational, got $outcome", conversational != null)
+        assertNull(conversational!!.replyText)
+    }
+
+    @Test
+    fun `a genuine tool request is unaffected by the reply shortcut`() = runTest {
+        // The schema addition must not change tool-routing behaviour at all:
+        // no reply field is expected or read for a real action.
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","time":"16:00"}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(reminderTool())).handle("remind me to call the bank at 4")
+
+        val handled = outcome as? ToolOrchestrator.Outcome.Handled
+        assertTrue("Expected Handled, got $outcome", handled != null)
+        // startsWith rather than equality: a successful reminder creation may
+        // carry a trailing follow-up suggestion (Day 05 Phase E Stage 2),
+        // unrelated to this test's concern.
+        assertTrue(handled!!.reply.startsWith("Reminder set."))
+        assertEquals(1, engine.index)
+    }
+
+    @Test
+    fun `recent context is included in the classification prompt when there is any`() = runTest {
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"conversation","parameters":{"reply":"Sure."}}"""))
+
+        secretary(engine, listOf(reminderTool()))
+            .handle("and after that?", recentContext = "User: What's on today?\nDPS: Three meetings.\n")
+
+        assertTrue(
+            "Expected the recent-context block in the prompt, got: ${engine.capturedPrompts.single()}",
+            engine.capturedPrompts.single().contains("User: What's on today?\nDPS: Three meetings.\n"),
+        )
+    }
+
+    @Test
+    fun `no recent context block appears when there is none to give`() = runTest {
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"conversation","parameters":{"reply":"Hi."}}"""))
+
+        secretary(engine, listOf(reminderTool())).handle("hi", recentContext = null)
+
+        assertTrue(!engine.capturedPrompts.single().contains("Recent conversation:"))
     }
 
     // -----------------------------------------------------------------
@@ -810,10 +941,20 @@ class SecretaryOrchestratorTest {
         secretary.handle("standup tomorrow at 9")
         calendar.calls.clear()
         secretary.handle("us meeting ko delete kar do")
+        val callsBeforeDecline = engine.index
         val declined = secretary.handle("nahi")
 
         assertTrue("Expected Handled, got $declined", declined is ToolOrchestrator.Outcome.Handled)
         assertTrue("Declining must not delete anything", calendar.calls.isEmpty())
+        // Day 08-C: closes the one gap in this file's existing inference-count
+        // proofs (accept and contact-selection were already covered) —
+        // ConfirmationParser.parse("nahi") answers this deterministically,
+        // exactly like YES already does two tests above.
+        assertEquals(
+            "Declining a confirmation must not cost another inference pass.",
+            callsBeforeDecline,
+            engine.index,
+        )
     }
 
     // -----------------------------------------------------------------

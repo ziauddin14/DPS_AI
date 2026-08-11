@@ -36,6 +36,7 @@
 
 #include <jni.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -106,6 +107,21 @@ struct Session {
     llama_model *       model = nullptr;
     llama_context *     ctx   = nullptr;
     const llama_vocab * vocab = nullptr;
+
+    /**
+     * Tokens currently resident in the KV cache, in order, for sequence 0.
+     *
+     * Day 08-A. The Kotlin layer rebuilds the whole prompt string every call
+     * (system + trimmed history + newest turn), but consecutive calls in a
+     * growing conversation share a long prefix with each other. Tracking what
+     * is already decoded lets `generate()` reuse that prefix instead of
+     * re-ingesting it — see `generate()`'s own comment for the reuse strategy.
+     *
+     * Empty for a freshly loaded session, which is what makes model reload a
+     * correct cache reset for free: a new `Session` starts with an empty
+     * vector, so the first call on it always falls back to a full decode.
+     */
+    std::vector<llama_token> cached_tokens;
 
     /**
      * Set from another thread by cancel(); read by the generation loop.
@@ -389,17 +405,21 @@ struct GenerationProfile {
     int64_t first_token_us   = 0;  // entry -> first token handed to Kotlin
     int64_t total_us         = 0;
     int32_t tokens           = 0;
+    int32_t reused_tokens    = 0;  // prompt tokens served from the KV cache (Day 08-A)
+    int32_t new_prompt_tokens = 0; // prompt tokens actually decoded this call
 
     void log() const {
         const int64_t accounted =
             tokenize_us + prompt_decode_us + sample_us + detokenize_us + callback_us + decode_us;
         LOGI("PROFILE tokenize=%.1fms prompt_decode=%.1fms decode=%.1fms "
              "sample=%.1fms detokenize=%.1fms callback=%.1fms "
-             "first_token=%.1fms total=%.1fms unaccounted=%.1fms tokens=%d",
+             "first_token=%.1fms total=%.1fms unaccounted=%.1fms tokens=%d "
+             "cache_reused=%d cache_new=%d",
              tokenize_us / 1000.0, prompt_decode_us / 1000.0, decode_us / 1000.0,
              sample_us / 1000.0, detokenize_us / 1000.0, callback_us / 1000.0,
              first_token_us / 1000.0, total_us / 1000.0,
-             (total_us - accounted) / 1000.0, tokens);
+             (total_us - accounted) / 1000.0, tokens,
+             reused_tokens, new_prompt_tokens);
         if (tokens > 0) {
             LOGI("PROFILE per_token decode=%.1fms callback=%.1fms sample=%.1fms",
                  decode_us / 1000.0 / tokens,
@@ -408,6 +428,58 @@ struct GenerationProfile {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// KV cache reuse (Day 08-A)
+//
+// The KV cache holds one attention entry per ingested token, in order. Two
+// prompts that share a prefix — the common case turn to turn in a growing
+// conversation — need only the *new* suffix decoded; the shared prefix's
+// cache entries are still valid, because attention over an unchanged prefix
+// produces an unchanged result regardless of what conversation it came from.
+//
+// Comparing actual token ids (never the source text) is what makes this safe
+// across every scenario the token stream can throw at it: a retokenised
+// history turn that happens to split differently than it did mid-generation,
+// a trimmed-down history window, a changed system prompt, a reset
+// conversation, or a message that just happens to start the same way as the
+// last one. Any of those diverges the token arrays at the point they actually
+// differ, and the prefix comparison below stops there — no case-by-case
+// handling needed.
+// ---------------------------------------------------------------------------
+
+/** Length of the longest shared prefix between two token sequences. */
+size_t common_prefix_length(const std::vector<llama_token> & a,
+                            const std::vector<llama_token> & b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) ++i;
+    return i;
+}
+
+/**
+ * Truncates `candidate` to what the KV cache actually holds and stores it as
+ * the session's new cache record.
+ *
+ * `candidate` is the *optimistic* token list — everything this call submitted
+ * for decoding, appended to the reused prefix. It is only correct when every
+ * submitted token was actually committed, which is not guaranteed: a decode
+ * can be aborted mid-batch by cancellation, per `llama_decode`'s own
+ * documented contract ("processed ubatches will remain in the memory
+ * state"). Rather than infer how much survived from the return code, this
+ * asks the cache directly — `llama_memory_seq_pos_max` is the ground truth,
+ * and trusting it instead of the call's outcome is what rules out a
+ * cache/reality mismatch on every exit path, including cancellation and
+ * error, not just success.
+ */
+void reconcile_cache(Session * session, std::vector<llama_token> candidate) {
+    const llama_pos max_pos = llama_memory_seq_pos_max(llama_get_memory(session->ctx), 0);
+    const size_t committed = max_pos < 0 ? 0 : static_cast<size_t>(max_pos) + 1;
+    if (committed < candidate.size()) {
+        candidate.resize(committed);
+    }
+    session->cached_tokens = std::move(candidate);
+}
 
 /** True when `text` ends with any entry in `stops`. */
 bool ends_with_any(const std::string & text, const std::vector<std::string> & stops) {
@@ -622,11 +694,9 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
         return kFinishError;
     }
 
-    // Fresh conversation state per call. The Kotlin layer rebuilds the whole
-    // prompt each turn, so carrying KV cache across calls would double-count
-    // history. KV reuse is a deliberate future optimisation, not an oversight.
-    llama_memory_clear(llama_get_memory(session->ctx), /*data=*/true);
-
+    // Built before anything below touches the KV cache: if this fails, the
+    // function returns having mutated nothing, so cached_tokens stays in
+    // step with the cache's real contents.
     llama_sampler * sampler = build_sampler(temperature, top_p, top_k, repeat_penalty,
                                             static_cast<uint32_t>(seed));
     if (sampler == nullptr) return kFinishError;
@@ -637,10 +707,36 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
         ~SamplerGuard() { if (s != nullptr) llama_sampler_free(s); }
     } sampler_guard{sampler};
 
-    // --- ingest the prompt (fills the KV cache) ---
+    // Reuse whatever prefix this call's prompt shares with what is already in
+    // the KV cache (Day 08-A). See the "KV cache reuse" comment above
+    // common_prefix_length() for why comparing token ids is always safe here.
+    size_t reused_len = common_prefix_length(session->cached_tokens, prompt_tokens);
+    if (reused_len >= prompt_tokens.size()) {
+        // The whole new prompt is already cached (e.g. an exact resend).
+        // Still decode the final token fresh so its logits are available to
+        // sample from, matching what a full decode always guaranteed.
+        reused_len = prompt_tokens.size() - 1;
+    }
+
+    llama_memory_t memory = llama_get_memory(session->ctx);
+    if (reused_len == 0) {
+        llama_memory_clear(memory, /*data=*/true);
+    } else if (!llama_memory_seq_rm(memory, /*seq_id=*/0, static_cast<llama_pos>(reused_len), /*p1=*/-1)) {
+        // Not every memory type supports removing a partial range (the header
+        // documents this as a possible outcome). A full clear is always a
+        // safe fallback — it just gives up this call's reuse rather than
+        // risking stale entries the new suffix would otherwise attend over.
+        llama_memory_clear(memory, /*data=*/true);
+        reused_len = 0;
+    }
+
+    // --- ingest only the new suffix (the reused prefix is already in the KV cache) ---
+    profile.reused_tokens = static_cast<int32_t>(reused_len);
+    profile.new_prompt_tokens = static_cast<int32_t>(prompt_tokens.size() - reused_len);
+
     const int64_t prompt_decode_start = now_us();
-    llama_batch batch = llama_batch_get_one(prompt_tokens.data(),
-                                            static_cast<int32_t>(prompt_tokens.size()));
+    llama_batch batch = llama_batch_get_one(prompt_tokens.data() + reused_len,
+                                            profile.new_prompt_tokens);
     const int prompt_rc = llama_decode(session->ctx, batch);
     profile.prompt_decode_us = now_us() - prompt_decode_start;
 
@@ -649,6 +745,12 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
         // failure or that the abort callback fired. The cancellation flag
         // disambiguates, and reporting the difference matters — a cancel is a
         // normal user action, an error is not.
+        //
+        // Either way, some of the submitted suffix may have partially
+        // committed (`llama_decode`'s own documented contract). Reconciling
+        // against the cache's actual position — rather than assuming "none of
+        // it landed" — is what keeps the next call's prefix match honest.
+        reconcile_cache(session, prompt_tokens);
         if (session->cancel_requested.load(std::memory_order_relaxed)) {
             LOGI("generate: cancelled during prompt ingestion after %.1fms",
                  profile.prompt_decode_us / 1000.0);
@@ -662,6 +764,13 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
     jint finish_reason = kFinishMaxTokens;
     std::string generated;      // full text, for stop-sequence matching
     std::string pending_bytes;  // incomplete UTF-8 held back between tokens
+
+    // Tokens actually fed back into the KV cache during this loop (a token
+    // that ends the turn — EOG, a stop sequence, or a cancellation — is
+    // sampled but never fed back, so it never reaches this list; see the
+    // per-iteration comment below). Combined with `prompt_tokens`, this is
+    // the candidate cache record reconcile_cache() verifies before storing.
+    std::vector<llama_token> generated_tokens;
 
     for (jint produced = 0; produced < max_tokens; ++produced) {
         if (session->cancel_requested.load(std::memory_order_relaxed)) {
@@ -736,6 +845,11 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
         const int decode_rc = llama_decode(session->ctx, step);
         profile.decode_us += now_us() - decode_start;
 
+        // Optimistic: recorded regardless of decode_rc. reconcile_cache()
+        // below trims this back to whatever the cache actually committed, so
+        // an aborted or failed decode here cannot leave a wrong record.
+        generated_tokens.push_back(next);
+
         if (decode_rc != 0) {
             if (session->cancel_requested.load(std::memory_order_relaxed)) {
                 finish_reason = kFinishCancelled;
@@ -746,6 +860,12 @@ Java_com_softwaremine_dps_data_runtime_llamacpp_LlamaCppBridge_generate(
             break;
         }
     }
+
+    // prompt_tokens is not read again after this point, so it can be moved
+    // from rather than copied.
+    std::vector<llama_token> cache_candidate = std::move(prompt_tokens);
+    cache_candidate.insert(cache_candidate.end(), generated_tokens.begin(), generated_tokens.end());
+    reconcile_cache(session, std::move(cache_candidate));
 
     profile.total_us = now_us() - generate_entry_us;
     profile.log();

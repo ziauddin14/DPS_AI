@@ -67,8 +67,16 @@ class ToolOrchestrator(
 
     /** What the orchestrator produced for one user message. */
     sealed interface Outcome {
-        /** Not an action. The normal chat pipeline should answer. */
-        data class Conversational(val reason: String) : Outcome
+        /**
+         * Not an action.
+         *
+         * @param replyText the model's own answer, when the same classification
+         *   pass that determined this was conversation also produced one
+         *   (Day 08-B — see [IntentPromptBuilder]'s class doc). `null` means
+         *   the normal chat pipeline (a second, streaming generation pass)
+         *   should answer instead, exactly as it always has.
+         */
+        data class Conversational(val reason: String, val replyText: String? = null) : Outcome
 
         /** An action ran. [reply] is ready to show. */
         data class Handled(
@@ -253,8 +261,12 @@ class ToolOrchestrator(
      * [ai.memory.ActionDetector]-free baseline — rather than re-implementing
      * classification. See [executeIntent] for the matching rationale.
      */
-    internal suspend fun classify(userMessage: String, pendingQuestion: String?): DpsIntent? =
-        generateClassification(userMessage, pendingQuestion)?.let(parser::parse)
+    internal suspend fun classify(
+        userMessage: String,
+        pendingQuestion: String?,
+        recentContext: String? = null,
+    ): DpsIntent? =
+        generateClassification(userMessage, pendingQuestion, recentContext = recentContext)?.let(parser::parse)
 
     /**
      * Runs the same classification pass as [classify], parsed as a **plan**
@@ -266,16 +278,26 @@ class ToolOrchestrator(
      * `internal` for the same reason as [classify]:
      * [com.softwaremine.dps.ai.secretary.SecretaryOrchestrator] needs this
      * exact prompt and parsing, not a reimplementation of either.
+     *
+     * @param recentContext see [IntentPromptBuilder.build] — threaded through
+     *   unchanged so a conversational reply the model produces here (Day
+     *   08-B) has at least the last exchange to work from.
      */
-    internal suspend fun classifyPlan(userMessage: String, pendingQuestion: String?): List<DpsIntent>? =
-        generateClassification(userMessage, pendingQuestion, MAX_PLAN_CLASSIFICATION_TOKENS)?.let(parser::parsePlan)
+    internal suspend fun classifyPlan(
+        userMessage: String,
+        pendingQuestion: String?,
+        recentContext: String? = null,
+    ): List<DpsIntent>? =
+        generateClassification(userMessage, pendingQuestion, MAX_PLAN_CLASSIFICATION_TOKENS, recentContext)
+            ?.let(parser::parsePlan)
 
     private suspend fun generateClassification(
         userMessage: String,
         pendingQuestion: String?,
         maxOutputTokens: Int = MAX_CLASSIFICATION_TOKENS,
+        recentContext: String? = null,
     ): String? {
-        val prompt = promptBuilder.build(userMessage, pendingQuestion)
+        val prompt = promptBuilder.build(userMessage, pendingQuestion, recentContext)
 
         val request = CompletionRequest(
             prompt = prompt,
@@ -306,12 +328,14 @@ class ToolOrchestrator(
         /**
          * Output cap for a single-step classification.
          *
-         * The JSON needed is well under this. A cap matters because an
-         * unconstrained small model will happily continue explaining itself
-         * after the object closes, and every extra token is ~240 ms the user
-         * waits for output that is discarded.
+         * Raised from the original 160 (Day 08-B) to leave room for
+         * `parameters.message` to carry a short conversational reply
+         * ([IntentPromptBuilder]'s class doc) — a bare tool-intent JSON
+         * object is well under either number, so this only widens the
+         * budget for the case that needs it, at the (measured, not assumed)
+         * per-token cost this hardware already pays.
          */
-        const val MAX_CLASSIFICATION_TOKENS = 160
+        const val MAX_CLASSIFICATION_TOKENS = 224
 
         /**
          * Output cap for [classifyPlan]. Doubled from [MAX_CLASSIFICATION_TOKENS]

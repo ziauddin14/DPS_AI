@@ -13,6 +13,7 @@ import com.softwaremine.dps.domain.model.ModelConfig
 import com.softwaremine.dps.core.result.DpsResult
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
@@ -249,6 +250,108 @@ class GgufInferenceInstrumentedTest {
         assertTrue("Warm inference produced no text", done.completion.text.isNotBlank())
     }
 
+    /** Runs one generation to completion and returns the assembled text. */
+    private suspend fun generateText(prompt: String, maxTokens: Int = 64): String {
+        val request = CompletionRequest(
+            prompt = prompt,
+            config = ModelConfig.SECRETARY.copy(maxOutputTokens = maxTokens),
+            stopSequences = descriptor.stopSequences,
+        )
+        val text = StringBuilder()
+        container.aiEngine.generate(request).collect { chunk ->
+            if (chunk is CompletionChunk.Token) text.append(chunk.text)
+        }
+        return text.toString()
+    }
+
+    /**
+     * Day 08-A. The second prompt here is the first prompt plus its own reply
+     * plus a new question — the same shape [com.softwaremine.dps.ai.prompt.PromptManager]
+     * builds turn to turn in a growing conversation. Unlike [t04b_warmInferenceThroughput]'s
+     * unrelated prompt, this one shares a real, long prefix with the call
+     * before it, which is exactly the case KV cache reuse targets.
+     *
+     * This cannot assert a specific cache-hit count from Kotlin — the native
+     * layer only logs it (`PROFILE ... cache_reused=N cache_new=M`), matching
+     * this project's established measurement discipline of reading real
+     * figures back from logcat rather than estimating them. What this proves
+     * is correctness: reusing the shared prefix must not corrupt either reply.
+     */
+    @Test
+    fun t04c_secondTurnWithSharedPrefixProducesCoherentReply() = runBlocking {
+        requireModel()
+
+        val firstTurn = "<|im_start|>system\nYou are DPS. Answer in one short sentence." +
+            "<|im_end|>\n<|im_start|>user\nWhat is 2 plus 2?<|im_end|>\n<|im_start|>assistant\n"
+        val firstReply = generateText(firstTurn)
+        perf("shared_prefix_first_reply", firstReply.trim())
+        assertTrue("First reply was blank", firstReply.isNotBlank())
+
+        val secondTurn = firstTurn + firstReply.trim() + "<|im_end|>\n" +
+            "<|im_start|>user\nNow what is 3 plus 3?<|im_end|>\n<|im_start|>assistant\n"
+        val secondReply = generateText(secondTurn)
+        perf("shared_prefix_second_reply", secondReply.trim())
+        assertTrue("Second reply (shared-prefix turn) was blank", secondReply.isNotBlank())
+    }
+
+    /**
+     * Day 08-A. A conversation reset — or simply a new, unrelated message —
+     * means the next prompt shares little with what the cache holds from the
+     * call before it, unlike [t04c_secondTurnWithSharedPrefixProducesCoherentReply]'s
+     * long shared prefix. Proves the prefix-diff logic still produces a
+     * correct reply when the reusable prefix is short (realistically, just
+     * the system preamble), not only when a real conversation continues.
+     */
+    @Test
+    fun t04d_unrelatedPromptAfterPriorTurnStartsClean() = runBlocking {
+        requireModel()
+
+        generateText(
+            "<|im_start|>system\nYou are DPS. Answer in one short sentence." +
+                "<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+        )
+
+        val unrelated = generateText(
+            "<|im_start|>system\nYou are DPS. Answer in one short sentence." +
+                "<|im_end|>\n<|im_start|>user\nName a fruit.<|im_end|>\n<|im_start|>assistant\n",
+        )
+        perf("unrelated_after_prior_turn_reply", unrelated.trim())
+        assertTrue("Reply after an unrelated prompt was blank", unrelated.isNotBlank())
+    }
+
+    /**
+     * Day 08-A. `llama_decode`'s own documented contract allows a cancelled
+     * (aborted) call to leave part of its batch committed to the KV cache.
+     * The native `reconcile_cache()` step exists precisely so the session's
+     * bookkeeping never trusts more than what actually landed — this test
+     * proves that from the outside, the only way it is observable from
+     * Kotlin: a normal follow-up call after a cancellation must still succeed.
+     */
+    @Test
+    fun t04e_cancellationMidGenerationLeavesSessionUsableForNextCall() = runBlocking {
+        requireModel()
+
+        val longRequest = CompletionRequest(
+            prompt = "<|im_start|>system\nYou are DPS.<|im_end|>\n" +
+                "<|im_start|>user\nWrite a long detailed essay about rivers.<|im_end|>\n" +
+                "<|im_start|>assistant\n",
+            config = ModelConfig.SECRETARY.copy(maxOutputTokens = 200),
+            stopSequences = descriptor.stopSequences,
+        )
+
+        val job = launch { container.aiEngine.generate(longRequest).collect { } }
+        delay(CANCEL_AFTER_MILLIS)
+        job.cancel()
+        job.join()
+
+        val followUp = generateText(
+            "<|im_start|>system\nYou are DPS. Answer in one short sentence." +
+                "<|im_end|>\n<|im_start|>user\nWhat is 5 plus 5?<|im_end|>\n<|im_start|>assistant\n",
+        )
+        perf("after_cancellation_reply", followUp.trim())
+        assertTrue("Reply after a cancelled generation was blank", followUp.isNotBlank())
+    }
+
     /** The full session pipeline: prompt build → generate → parse → conversation. */
     @Test
     fun t05_sessionPipelineProducesAssistantMessage() = runBlocking {
@@ -271,6 +374,145 @@ class GgufInferenceInstrumentedTest {
         val reply = finished!!.visibleMessages.last()
         android.util.Log.i(PERF_TAG, "PIPELINE_REPLY = ${reply.content.trim()}")
         assertTrue("Assistant reply was blank", reply.content.isNotBlank())
+    }
+
+    /**
+     * Day 08-B. An ordinary conversational message through the real,
+     * unscripted pipeline.
+     *
+     * This does not assert an inference-pass count directly — that number is
+     * read back from the `DPS/llama_jni PROFILE` logcat lines this run
+     * produces, one per native `generate()` call, exactly the measurement
+     * discipline the rest of this suite already uses. What this proves is
+     * functional correctness: the real classification prompt, now carrying
+     * the Day 08-B schema addition, still produces a real model, and the
+     * reply that reaches the conversation is non-blank and was not silently
+     * corrupted by skipping the second pass.
+     */
+    @Test
+    fun t05b_ordinaryConversationReachesAReply() = runBlocking {
+        requireModel()
+        val session = container.sessionManager
+        session.resetConversation()
+
+        android.util.Log.i(PERF_TAG, "DAY08B_CONVERSATION_START")
+        assertTrue(session.sendMessage("Salam DPS, kya haal hai?") is DpsResult.Success)
+
+        val finished = withTimeoutOrNull(PIPELINE_TIMEOUT_MILLIS) {
+            session.conversation.first { state ->
+                !state.isGenerating && state.visibleMessages.any {
+                    it.role == com.softwaremine.dps.domain.conversation.MessageRole.ASSISTANT &&
+                        it.status is MessageStatus.Complete
+                }
+            }
+        }
+
+        assertTrue("Conversation did not complete within ${PIPELINE_TIMEOUT_MILLIS}ms", finished != null)
+        val reply = finished!!.visibleMessages.last()
+        android.util.Log.i(PERF_TAG, "DAY08B_CONVERSATION_REPLY = ${reply.content.trim()}")
+        assertTrue("Assistant reply was blank", reply.content.isNotBlank())
+    }
+
+    /**
+     * Day 08-B. A genuine tool request through the real pipeline — must be
+     * completely unaffected by the reply-shortcut addition: same one
+     * classification pass, real tool execution, real stored data.
+     */
+    @Test
+    fun t05c_toolRequestStillExecutes() = runBlocking {
+        requireModel()
+        val session = container.sessionManager
+        session.resetConversation()
+
+        android.util.Log.i(PERF_TAG, "DAY08B_TOOL_START")
+        assertTrue(session.sendMessage("Mere tasks dikhao.") is DpsResult.Success)
+
+        val finished = withTimeoutOrNull(PIPELINE_TIMEOUT_MILLIS) {
+            session.conversation.first { state ->
+                !state.isGenerating && state.visibleMessages.any {
+                    it.role == com.softwaremine.dps.domain.conversation.MessageRole.ASSISTANT &&
+                        it.status is MessageStatus.Complete
+                }
+            }
+        }
+
+        assertTrue("Tool request did not complete within ${PIPELINE_TIMEOUT_MILLIS}ms", finished != null)
+        val reply = finished!!.visibleMessages.last()
+        android.util.Log.i(PERF_TAG, "DAY08B_TOOL_REPLY = ${reply.content.trim()}")
+        assertTrue("Assistant reply was blank", reply.content.isNotBlank())
+    }
+
+    /**
+     * Day 08-C. The deterministic fast path this codebase already has (Day
+     * 05 Phase E Stage 2) for a reply to a pending confirmation, through the
+     * real, unscripted pipeline. Existing JVM tests already prove this at
+     * the scripted-engine level; this is the first real-device confirmation.
+     *
+     * Uses a TASK deletion request rather than a reminder/calendar-event
+     * creation on purpose. `askDeleteConfirmation()` fires purely from
+     * classification (`intent.type == TASK`, `action == CANCEL`, a title
+     * present) — it does not depend on any prior successful tool execution,
+     * unlike a follow-up suggestion, which only appears after a *successful*
+     * reminder/event creation. An earlier version of this test used a
+     * reminder for that setup step and repeatedly hit a real, pre-existing
+     * finding instead: the model's Roman Urdu date/time resolution is
+     * unreliable enough that "kal raat 11 baje" (tomorrow 11 PM) was
+     * sometimes read as a time already in the past, so the reminder never
+     * reached the state this test needs. That is a genuine, separate
+     * limitation (documented in the completion notes) — not something a
+     * task-deletion request depends on at all, which is why this version
+     * uses it instead. The `DAY08C_` markers bound the window a human (or
+     * this report) reads back from logcat: one `PROFILE` line is expected
+     * for the delete request itself — none after, for the decline.
+     */
+    @Test
+    fun t05d_decliningAFollowUpSuggestionCostsNoExtraInference() = runBlocking {
+        requireModel()
+        val session = container.sessionManager
+        session.resetConversation()
+
+        android.util.Log.i(PERF_TAG, "DAY08C_CONFIRMATION_START")
+        assertTrue(session.sendMessage("Buy milk wala task delete kar do.") is DpsResult.Success)
+
+        val afterDeleteRequest = withTimeoutOrNull(PIPELINE_TIMEOUT_MILLIS) {
+            session.conversation.first { state ->
+                !state.isGenerating && state.visibleMessages.any {
+                    it.role == com.softwaremine.dps.domain.conversation.MessageRole.ASSISTANT &&
+                        it.status is MessageStatus.Complete
+                }
+            }
+        }
+        assertTrue("Delete request did not complete within ${PIPELINE_TIMEOUT_MILLIS}ms", afterDeleteRequest != null)
+        val confirmationQuestion = afterDeleteRequest!!.visibleMessages.last { it.role == com.softwaremine.dps.domain.conversation.MessageRole.ASSISTANT }
+        android.util.Log.i(PERF_TAG, "DAY08C_DELETE_REQUEST_REPLY = ${confirmationQuestion.content.trim()}")
+        val assistantMessagesBeforeDecline = afterDeleteRequest.visibleMessages.count {
+            it.role == com.softwaremine.dps.domain.conversation.MessageRole.ASSISTANT
+        }
+
+        android.util.Log.i(PERF_TAG, "DAY08C_DECLINE_SENT")
+        val declineStart = System.currentTimeMillis()
+        assertTrue(session.sendMessage("nahi") is DpsResult.Success)
+
+        // Must check for a *new* assistant message specifically — right
+        // after sendMessage() appends the user's "nahi", that is briefly the
+        // last message and is already MessageStatus.Complete (user turns are
+        // never streamed), which would satisfy a role-blind check before any
+        // processing has actually happened.
+        val afterDecline = withTimeoutOrNull(PIPELINE_TIMEOUT_MILLIS) {
+            session.conversation.first { state ->
+                !state.isGenerating &&
+                    state.visibleMessages.count { it.role == com.softwaremine.dps.domain.conversation.MessageRole.ASSISTANT } >
+                    assistantMessagesBeforeDecline
+            }
+        }
+        val declineElapsedMs = System.currentTimeMillis() - declineStart
+        assertTrue("Decline did not complete within ${PIPELINE_TIMEOUT_MILLIS}ms", afterDecline != null)
+
+        val declineReply = afterDecline!!.visibleMessages.last { it.role == com.softwaremine.dps.domain.conversation.MessageRole.ASSISTANT }
+        perf("day08c_decline_wall_clock_ms", "$declineElapsedMs")
+        android.util.Log.i(PERF_TAG, "DAY08C_DECLINE_REPLY = ${declineReply.content.trim()}")
+        android.util.Log.i(PERF_TAG, "DAY08C_CONFIRMATION_END")
+        assertTrue("Decline reply was blank", declineReply.content.isNotBlank())
     }
 
     // -----------------------------------------------------------------

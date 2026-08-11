@@ -48,6 +48,32 @@ import java.time.format.DateTimeFormatter
  * the dominant cost; the classifier does not need to see memory to do its one
  * job of naming the intent type.
  *
+ * ## `parameters.reply` carries the conversational answer (Day 08-B)
+ * The Day 08 audit measured ordinary conversation paying for two full
+ * inference passes: this classification call, then a *second*, unrelated
+ * [com.softwaremine.dps.ai.prompt.PromptManager]-built generation just to
+ * answer. `reply` lets the model answer directly, in the same pass, when
+ * `intent` is `"conversation"`, so one pass can serve both jobs.
+ *
+ * This is a field of its own rather than reusing `message` — an early
+ * on-device measurement did exactly that and the model echoed the user's
+ * own text back instead of answering. `message` already means "body text to
+ * send someone" everywhere else in this schema; asking it to also mean "your
+ * reply to the user" measurably confused a model this size (see
+ * [com.softwaremine.dps.domain.intent.IntentParameters.reply]'s own doc).
+ *
+ * This is opportunistic, not required: [recentContext] gives the model just
+ * enough of the last exchange to answer sensibly, not the full history
+ * budget [PromptManager] uses, so a reply here is not guaranteed to be as
+ * context-aware as one from the full pipeline. Nothing downstream trusts
+ * this field blindly —
+ * [com.softwaremine.dps.ai.secretary.SecretaryOrchestrator] falls back to
+ * the existing, unchanged streaming-generation pass whenever `reply` comes
+ * back blank, which is exactly what already happened before this field
+ * existed. A model that never reliably populates it costs nothing extra
+ * beyond the few added schema/rule tokens; one that does removes an entire
+ * redundant pass.
+ *
  * ## Dependencies
  * Domain intent types, `java.time`. No Android.
  */
@@ -61,8 +87,12 @@ class IntentPromptBuilder(
      * @param pendingQuestion the follow-up DPS last asked, when this message is
      *   an answer to it. Supplying it lets the model interpret "at 4pm" as a
      *   time rather than as a fresh, meaningless request.
+     * @param recentContext the last exchange, pre-rendered as plain text (e.g.
+     *   `"User: ...\nDPS: ...\n"`), or `null` when there is none yet. Bounded
+     *   and small by construction of the caller — see the class doc for why
+     *   this is deliberately not the full conversation history.
      */
-    fun build(userMessage: String, pendingQuestion: String? = null): String {
+    fun build(userMessage: String, pendingQuestion: String? = null, recentContext: String? = null): String {
         val reference = now()
         val date = reference.format(DateTimeFormatter.ISO_LOCAL_DATE)
         val time = reference.format(DateTimeFormatter.ofPattern("HH:mm"))
@@ -90,11 +120,23 @@ class IntentPromptBuilder(
                     "something done (\"complete\"), or asking to see existing things (\"list\").",
             )
             appendLine("- Multiple actions: use {\"steps\":[{...}]} instead of one object.")
+            appendLine(
+                "- If intent is \"conversation\", put your full reply to the user in " +
+                    "parameters.reply — never in parameters.message, which is only for " +
+                    "text you are sending someone else. Be concise, professional and " +
+                    "direct, as DPS always is. Never just repeat the user's own words.",
+            )
 
             if (pendingQuestion != null) {
                 appendLine()
                 appendLine("You just asked: \"$pendingQuestion\"")
                 appendLine("The user is answering it. Fill only the fields their answer provides.")
+            }
+
+            if (!recentContext.isNullOrBlank()) {
+                appendLine()
+                appendLine("Recent conversation:")
+                append(recentContext)
             }
 
             appendLine()
@@ -115,7 +157,7 @@ class IntentPromptBuilder(
          * shorter and, in this case, less misleading.
          */
         val SCHEMA = """
-            {"intent":"...","action_type":"create|update|cancel|complete|list","parameters":{"person":"","date":"","time":"","message":"","title":"","description":"","email":"","phone":"","priority":"","duration":"","period":""}}
+            {"intent":"...","action_type":"create|update|cancel|complete|list","parameters":{"person":"","date":"","time":"","message":"","title":"","description":"","email":"","phone":"","priority":"","duration":"","period":"","reply":""}}
         """.trimIndent()
     }
 }

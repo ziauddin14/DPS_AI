@@ -109,8 +109,14 @@ class SecretaryOrchestrator(
      * Never throws — every path resolves to a [ToolOrchestrator.Outcome],
      * mirroring [ToolOrchestrator.handle]'s own guarantee, since a thrown
      * exception here would surface to the user as a crash.
+     *
+     * @param recentContext see [com.softwaremine.dps.ai.intent.IntentPromptBuilder.build]
+     *   (Day 08-B) — the last exchange, pre-rendered as plain text, or `null`
+     *   when there is none. Threaded through only so the classification pass
+     *   has enough context to answer directly when it turns out to be
+     *   conversation; nothing else here reads it.
      */
-    suspend fun handle(userMessage: String): ToolOrchestrator.Outcome {
+    suspend fun handle(userMessage: String, recentContext: String? = null): ToolOrchestrator.Outcome {
         pendingContactSelection?.let { return resolveContactSelection(userMessage, it) }
         pendingConfirmation?.let { return resolveConfirmation(userMessage, it) }
 
@@ -125,7 +131,7 @@ class SecretaryOrchestrator(
             if (awaiting != null) SecretaryEvent.InformationProvided else SecretaryEvent.MessageReceived,
         )
 
-        val steps = toolOrchestrator.classifyPlan(userMessage, awaiting?.question)
+        val steps = toolOrchestrator.classifyPlan(userMessage, awaiting?.question, recentContext)
             ?: run {
                 _state.value = transition(SecretaryEvent.Reset)
                 return ToolOrchestrator.Outcome.Conversational("classification failed")
@@ -161,7 +167,17 @@ class SecretaryOrchestrator(
         if (resolved.type == IntentType.CONVERSATION) {
             pendingClarification = null
             _state.value = transition(SecretaryEvent.Reset)
-            return ToolOrchestrator.Outcome.Conversational("model classified as conversation")
+            // Day 08-B: the same classification pass that decided this is
+            // conversation may have already answered it (parameters.reply
+            // — see IntentPromptBuilder). When it did, this reply is used
+            // directly and AiSessionManager skips the second, streaming
+            // generation pass entirely. When it did not — the common,
+            // always-safe case — replyText is null and behaviour is
+            // byte-for-byte what it was before this field existed.
+            return ToolOrchestrator.Outcome.Conversational(
+                reason = "model classified as conversation",
+                replyText = usableReply(userMessage, resolved.parameters.reply),
+            )
         }
 
         // The enrichment seam Phase D had no room for: correct the action the
@@ -191,6 +207,33 @@ class SecretaryOrchestrator(
                 proceedToExecution(enriched)
             }
         }
+    }
+
+    /**
+     * A same-pass reply worth using directly (Day 08-B), or `null` to fall
+     * back to the existing streaming-generation pass.
+     *
+     * Guards against the one failure mode on-device measurement actually
+     * found: a model that, asked to answer in the same breath as
+     * classifying, sometimes just restates the user's own words instead of
+     * answering them — a bare `intent must be one of...` prompt spends the
+     * model's whole attention on the schema and leaves it with little room
+     * to actually engage with what the user said, in a way the far larger,
+     * fully-conversational prompt [com.softwaremine.dps.ai.session.AiSessionManager.runGeneration]
+     * builds does not suffer from. This is a defensive sanity check on the
+     * *model's own output* against the *model's own input*, not a guess at
+     * what the user meant — it is symmetric and would catch the same
+     * degenerate pattern regardless of language or phrasing.
+     */
+    private fun usableReply(userMessage: String, rawReply: String?): String? {
+        val reply = rawReply?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val normalizedReply = reply.trim(*TRAILING_PUNCTUATION).lowercase()
+        val normalizedUser = userMessage.trim(*TRAILING_PUNCTUATION).lowercase()
+        if (normalizedReply == normalizedUser) {
+            logger.i(TAG, "Discarding a same-pass reply that only echoed the user's message.")
+            return null
+        }
+        return reply
     }
 
     /**
@@ -662,6 +705,9 @@ class SecretaryOrchestrator(
 
         /** 30 minutes — see [handlePlan]'s doc for why this is a fixed default. */
         const val DEFAULT_REMINDER_LEAD_MILLIS = 30L * 60L * 1000L
+
+        /** Stripped before comparing a reply against the user's message — see [usableReply]. */
+        val TRAILING_PUNCTUATION = charArrayOf('.', '?', '!', ' ', '\n')
 
         /** Intent types where grounding a bare name to a real contact is worth attempting. */
         val PERSON_GROUNDING_TYPES = setOf(

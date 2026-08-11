@@ -143,12 +143,20 @@ class IntentPromptBuilderTest {
         // assistant and an unusable one. The budget moved 800 (Phase D) → 900
         // (Phase E Stage 2, the steps-array rule) → 1050 (Day 06: five new
         // routable intent types, the complete/list actions, and the
-        // duration/period fields the productivity secretary needs) — each move
-        // is one deliberate, named addition, not drift; a regression here
-        // should still fail loudly.
+        // duration/period fields the productivity secretary needs) → 1250 →
+        // 1320 (Day 08-B: a `reply` field and rule telling the model to put
+        // a conversational answer there when intent is "conversation" — a
+        // dedicated key rather than reusing `message`, after an on-device
+        // measurement showed the model echoing the user's own words back
+        // when the two shared a key. The whole point of this addition is to
+        // let this same pass answer instead of paying for a second, separate
+        // generation, so this is the one case where a slightly larger prompt
+        // buys back far more than it costs) — each move is one deliberate,
+        // named addition, not drift; a regression here should still fail
+        // loudly.
         assertTrue(
             "Classification prompt has grown to ${prompt.length} characters",
-            prompt.length < 1050,
+            prompt.length < 1320,
         )
     }
 
