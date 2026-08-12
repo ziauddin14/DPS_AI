@@ -131,6 +131,112 @@ class IntentPromptBuilderTest {
     }
 
     // -----------------------------------------------------------------
+    // KV-cache prefix stability (Day 08-D)
+    //
+    // The instruction/intent-list/schema/rules block never changes for the
+    // life of a loaded model — only the caller's arguments do. Everything
+    // in this section proves that block is a genuine, stable string
+    // prefix, so LlamaCppRuntimeProvider's cache-reuse (Day 08-A) has real
+    // work to reuse rather than losing it to "Now:" sitting near the top,
+    // as it did before Day 08-D.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `Now no longer sits before the static instruction block`() {
+        val prompt = builder.build("anything")
+
+        val nowAt = prompt.indexOf("Now:")
+        val shapeAt = prompt.indexOf("Shape:")
+        val rulesAt = prompt.indexOf("Rules:")
+
+        assertTrue("Now: missing from the prompt", nowAt >= 0)
+        assertTrue("Now: must come after Shape:, not before it", nowAt > shapeAt)
+        assertTrue("Now: must come after Rules:, not before it", nowAt > rulesAt)
+    }
+
+    @Test
+    fun `two prompts differing only in timestamp share an identical static prefix`() {
+        val morning = IntentPromptBuilder(now = { LocalDateTime.of(2026, 8, 6, 9, 0) })
+            .build("remind me to call the bank at 4")
+        val night = IntentPromptBuilder(now = { LocalDateTime.of(2026, 8, 9, 23, 45) })
+            .build("remind me to call the bank at 4")
+
+        val sharedPrefix = commonPrefix(morning, night)
+
+        // The static block (instruction, intent list, conversation rule,
+        // schema, all five rules) is comfortably over 900 characters; a
+        // shared prefix that long can only be that block, not coincidence.
+        // It legitimately includes the literal "Now: " label — that text
+        // is identical in both; only the date/time *value* after it (and
+        // the weekday, chosen deliberately to differ here too) diverges,
+        // which is exactly where a real common-prefix comparison should stop.
+        assertTrue(
+            "Expected a long shared prefix across different timestamps, got ${sharedPrefix.length} chars",
+            sharedPrefix.length > 900,
+        )
+        assertTrue(
+            "Shared prefix must not reach the differing date/time value itself",
+            !sharedPrefix.contains("2026-08-06") && !sharedPrefix.contains("2026-08-09"),
+        )
+        assertTrue("Shared prefix should reach through the rules", sharedPrefix.contains("Rules:"))
+        assertTrue(
+            "Shared prefix should reach the reply-shortcut rule (Day 08-B)",
+            sharedPrefix.contains("parameters.reply"),
+        )
+    }
+
+    @Test
+    fun `two prompts differing only in the user's message share the same static prefix`() {
+        val first = builder.build("remind me to call the bank at 4")
+        val second = builder.build("what's the weather like tomorrow")
+
+        val sharedPrefix = commonPrefix(first, second)
+
+        assertTrue(
+            "Expected a long shared prefix across different messages, got ${sharedPrefix.length} chars",
+            sharedPrefix.length > 900,
+        )
+        assertTrue(!sharedPrefix.contains("call the bank"))
+        assertTrue(!sharedPrefix.contains("weather"))
+    }
+
+    @Test
+    fun `a different timestamp and a different message together still share the static prefix`() {
+        val first = IntentPromptBuilder(now = { LocalDateTime.of(2026, 8, 6, 9, 0) })
+            .build("remind me to call the bank at 4")
+        val second = IntentPromptBuilder(now = { LocalDateTime.of(2026, 8, 9, 23, 45) })
+            .build("what's the weather like tomorrow")
+
+        val sharedPrefix = commonPrefix(first, second)
+
+        assertTrue(
+            "Expected a long shared prefix even with both timestamp and message varying, got ${sharedPrefix.length} chars",
+            sharedPrefix.length > 900,
+        )
+    }
+
+    @Test
+    fun `Now still appears immediately beside the user's message it resolves relative times for`() {
+        val prompt = builder.build("remind me tomorrow at 4")
+
+        val nowAt = prompt.indexOf("Now:")
+        val userAt = prompt.indexOf("User:")
+        assertTrue("Now: missing", nowAt >= 0)
+        assertTrue("User: missing", userAt >= 0)
+        // Only a single line (the blank separator) should sit between them.
+        val between = prompt.substring(nowAt, userAt)
+        assertTrue(
+            "Now: and User: should be adjacent, found: ${between.length} chars between them: '$between'",
+            between.count { it == '\n' } <= 2,
+        )
+    }
+
+    private fun commonPrefix(a: String, b: String): String {
+        val length = a.indices.firstOrNull { it >= b.length || a[it] != b[it] } ?: minOf(a.length, b.length)
+        return a.substring(0, length)
+    }
+
+    // -----------------------------------------------------------------
     // Cost
     // -----------------------------------------------------------------
 

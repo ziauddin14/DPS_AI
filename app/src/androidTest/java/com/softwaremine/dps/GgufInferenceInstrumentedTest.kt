@@ -3,6 +3,20 @@ package com.softwaremine.dps
 import android.os.Debug
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.softwaremine.dps.ai.intent.ClarificationEngine
+import com.softwaremine.dps.ai.intent.IntentJsonParser
+import com.softwaremine.dps.ai.intent.IntentPromptBuilder
+import com.softwaremine.dps.ai.intent.ToolOrchestrator
+import com.softwaremine.dps.ai.intent.ToolResponseGenerator
+import com.softwaremine.dps.ai.intent.ToolSelector
+import com.softwaremine.dps.ai.memory.ActionDetector
+import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
+import com.softwaremine.dps.ai.memory.ReferenceResolver
+import com.softwaremine.dps.ai.plan.ConfirmationParser
+import com.softwaremine.dps.ai.plan.ContactSelectionParser
+import com.softwaremine.dps.ai.plan.FollowUpSuggestionGenerator
+import com.softwaremine.dps.ai.secretary.SecretaryOrchestrator
+import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.data.model.ModelCatalog
 import com.softwaremine.dps.di.AiContainer
 import com.softwaremine.dps.domain.ai.AiState
@@ -25,6 +39,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.MethodSorters
 import java.io.File
+import java.time.LocalDateTime
 
 /**
  * First real offline GGUF inference on device (Day 04, Phases C–G).
@@ -515,6 +530,159 @@ class GgufInferenceInstrumentedTest {
         assertTrue("Decline reply was blank", declineReply.content.isNotBlank())
     }
 
+    /**
+     * Day 08-D A/B evidence. Run this exact test unmodified against both
+     * the pre-08-D and post-08-D [com.softwaremine.dps.ai.intent.IntentPromptBuilder]
+     * (via `git stash` on that one file only) to get directly comparable
+     * real-device numbers for the same messages in the same session — this
+     * test's own behavior does not know or care how the prompt is ordered
+     * internally, only what the classification/tool/reply outcome is, so it
+     * is valid evidence either way and worth keeping as permanent tool-
+     * routing regression coverage afterward.
+     *
+     * Each scenario resets the conversation first so results are
+     * independent and comparable turn-for-turn. `DAY08D_<tag>_REPLY` lines
+     * are read back from logcat alongside the native `PROFILE` lines for
+     * `prompt_decode`, `decode`, `cache_reused`/`cache_new`, and total time.
+     */
+    @Test
+    fun t05e_day08dToolRoutingAndDateTimeMatrix() = runBlocking {
+        requireModel()
+        val session = container.sessionManager
+
+        runScenario(session, "TASK_CREATE", "Buy milk ka task bana do.")
+        runScenario(session, "TASK_DELETE", "Buy milk wala task delete kar do.")
+        runScenario(session, "REMINDER_ABS_DATE", "20 August ko meeting ka reminder laga do.")
+        runScenario(session, "REMINDER_ABS_TIME", "4 baje mujhe call karne ka reminder laga do.")
+        runScenario(session, "REMINDER_KAL_BARE", "Kal mujhe yaad dila dena ke meeting hai.")
+        runScenario(session, "REMINDER_KAL_SHAAM_7", "Kal shaam 7 baje mujhe yaad dila dena.")
+        runScenario(session, "REMINDER_KAL_RAAT_11", "Kal raat 11 baje mujhe yaad dila dena.")
+        runScenario(session, "CONVERSATION", "Salam DPS, kya haal hai?")
+        runScenario(session, "CLARIFICATION", "Remind me about the meeting.")
+    }
+
+    /** One scenario: reset, send [message], wait for the assistant's reply, log it tagged with [tag]. */
+    private suspend fun runScenario(session: com.softwaremine.dps.ai.session.AiSessionManager, tag: String, message: String) {
+        session.resetConversation()
+        android.util.Log.i(PERF_TAG, "DAY08D_${tag}_START")
+        val started = System.currentTimeMillis()
+        assertTrue("$tag: sendMessage failed", session.sendMessage(message) is DpsResult.Success)
+
+        val finished = withTimeoutOrNull(PIPELINE_TIMEOUT_MILLIS) {
+            session.conversation.first { state ->
+                !state.isGenerating && state.visibleMessages.any {
+                    it.role == com.softwaremine.dps.domain.conversation.MessageRole.ASSISTANT &&
+                        it.status is MessageStatus.Complete
+                }
+            }
+        }
+        val elapsed = System.currentTimeMillis() - started
+        assertTrue("$tag did not complete within ${PIPELINE_TIMEOUT_MILLIS}ms", finished != null)
+
+        val reply = finished!!.visibleMessages.last { it.role == com.softwaremine.dps.domain.conversation.MessageRole.ASSISTANT }
+        perf("day08d_${tag.lowercase()}_wall_clock_ms", "$elapsed")
+        android.util.Log.i(PERF_TAG, "DAY08D_${tag}_REPLY = ${reply.content.trim()}")
+        assertTrue("$tag: reply was blank", reply.content.isNotBlank())
+    }
+
+    /**
+     * Day 08-D controlled retest: OLD vs NEW `Now:` position, same fixed
+     * clock, same five date/time messages.
+     *
+     * ## Why this bypasses [container.sessionManager]
+     * The production [SecretaryOrchestrator] is wired (in [AiContainer])
+     * against a default, real-clock [IntentPromptBuilder] — exactly what
+     * made the first Day 08-D A/B run uncontrolled: the "before" and
+     * "after" runs happened at genuinely different wall-clock times, so a
+     * changed date/time reply could have come from the reordering, from
+     * the different real `Now:` value, or from ordinary model variance,
+     * and there was no way to tell which. This test builds its own
+     * [ToolOrchestrator]/[SecretaryOrchestrator] pair — reusing the real,
+     * on-device [AiContainer.aiEngine], [AiContainer.toolExecutor] and
+     * [AiContainer.toolRegistry], so the model and tools are exactly what
+     * production uses — but with [IntentPromptBuilder] given a fixed
+     * [FIXED_NOW] instead of [LocalDateTime.now]. Run once against the
+     * `IntentPromptBuilder.kt` on disk, then again after `git stash` /
+     * `git stash pop` on that single file to flip old vs new ordering:
+     * with the clock held constant, any difference in the logged
+     * `DAY08D_CLOCK_*` results can only come from where `Now:` sits in
+     * the prompt.
+     *
+     * `FIXED_NOW` (Tuesday 2026-08-11 09:00) was chosen so every case has
+     * an unambiguous answer: "kal" is tomorrow (08-12), 4pm is hours away
+     * the same day, tomorrow evening/night are both comfortably in the
+     * future, and 20 August is nine days out — nothing here should
+     * plausibly resolve to "in the past" against this clock.
+     *
+     * A fresh orchestrator pair per case keeps the five results
+     * independent of each other (no clarification or memory carried over
+     * from one case into the next), the same isolation
+     * [t05e_day08dToolRoutingAndDateTimeMatrix] gets via
+     * `session.resetConversation()`.
+     */
+    @Test
+    fun t05f_day08dFixedClockDateTimeMatrix() = runBlocking {
+        requireModel()
+
+        logClockCase("CASE_A_ABS_DATE", "20 August ko meeting ka reminder laga do.")
+        logClockCase("CASE_B_ABS_TIME", "4 baje mujhe call karne ka reminder laga do.")
+        logClockCase("CASE_C_KAL_BARE", "Kal mujhe yaad dila dena ke meeting hai.")
+        logClockCase("CASE_D_KAL_SHAAM_7", "Kal shaam 7 baje mujhe yaad dila dena.")
+        logClockCase("CASE_E_KAL_RAAT_11", "Kal raat 11 baje mujhe yaad dila dena.")
+    }
+
+    private suspend fun logClockCase(tag: String, message: String) {
+        val outcome = freshSecretary().handle(message)
+        android.util.Log.i(PERF_TAG, "DAY08D_CLOCK_${tag}_NOW = $FIXED_NOW")
+        android.util.Log.i(PERF_TAG, "DAY08D_CLOCK_${tag}_RESULT = ${summarize(outcome)}")
+    }
+
+    private fun summarize(outcome: ToolOrchestrator.Outcome): String = when (outcome) {
+        is ToolOrchestrator.Outcome.Handled ->
+            "HANDLED date=${outcome.intent.parameters.date} time=${outcome.intent.parameters.time} " +
+                "result=${outcome.result} reply=${outcome.reply.trim()}"
+        is ToolOrchestrator.Outcome.Clarify ->
+            "CLARIFY question=${outcome.question.trim()} " +
+                "partialDate=${outcome.resolution.partial.date} partialTime=${outcome.resolution.partial.time}"
+        is ToolOrchestrator.Outcome.NeedsPermission ->
+            "NEEDS_PERMISSION reply=${outcome.reply.trim()} result=${outcome.result}"
+        is ToolOrchestrator.Outcome.Conversational ->
+            "CONVERSATIONAL reply=${outcome.replyText?.trim()}"
+    }
+
+    /** A fresh, isolated orchestrator pair sharing the real engine/tools but a fixed clock. */
+    private fun freshSecretary(): SecretaryOrchestrator {
+        val toolOrchestrator = ToolOrchestrator(
+            engine = container.aiEngine,
+            executor = container.toolExecutor,
+            registry = container.toolRegistry,
+            promptBuilder = IntentPromptBuilder(now = { FIXED_NOW }),
+            parser = IntentJsonParser(),
+            clarification = ClarificationEngine(),
+            selector = ToolSelector(),
+            responses = ToolResponseGenerator(),
+            logger = silentLogger,
+        )
+        return SecretaryOrchestrator(
+            toolOrchestrator = toolOrchestrator,
+            referenceResolver = ReferenceResolver(),
+            actionDetector = ActionDetector(),
+            clarification = ClarificationEngine(),
+            memoryUpdater = ConversationMemoryUpdater(),
+            contactSelectionParser = ContactSelectionParser(),
+            confirmationParser = ConfirmationParser(),
+            followUpSuggestions = FollowUpSuggestionGenerator(),
+            logger = silentLogger,
+        )
+    }
+
+    private val silentLogger = object : DpsLogger {
+        override fun d(tag: String, message: String) = Unit
+        override fun i(tag: String, message: String) = Unit
+        override fun w(tag: String, message: String, throwable: Throwable?) = Unit
+        override fun e(tag: String, message: String, throwable: Throwable?) = Unit
+    }
+
     // -----------------------------------------------------------------
     // Phase E — streaming and cancellation
     // -----------------------------------------------------------------
@@ -604,6 +772,9 @@ class GgufInferenceInstrumentedTest {
         private const val GENERATION_START_TIMEOUT_MILLIS = 60_000L
         private const val CANCEL_AFTER_MILLIS = 3_000L
         private const val CANCEL_SETTLE_TIMEOUT_MILLIS = 30_000L
+
+        /** Tuesday 2026-08-11, 09:00 — see [t05f_day08dFixedClockDateTimeMatrix]'s doc for why. */
+        private val FIXED_NOW = LocalDateTime.of(2026, 8, 11, 9, 0)
 
         /** One engine for the whole suite. See the `container` property. */
         private lateinit var sharedContainer: AiContainer

@@ -29,6 +29,26 @@ import java.time.format.DateTimeFormatter
  * into a date, and the alternative — parsing relative expressions in Kotlin —
  * would guess worse and without the conversation for context.
  *
+ * ## Why `Now:` sits near the end, not the top (Day 08-D)
+ * Everything from the opening instruction through the end of Rules is
+ * identical on every single classification call for the life of a loaded
+ * model — no user data, no timestamp, no conversation state. [Now][now]
+ * changes on every call, and having it appear second (right after the
+ * opening line) meant that one line broke
+ * [com.softwaremine.dps.data.runtime.llamacpp.LlamaCppRuntimeProvider]'s KV
+ * cache prefix match for the other ~90% of the prompt that never changes —
+ * confirmed on-device (Day 08 audit, then the Day 08-D investigation):
+ * consecutive classification calls in the same session were reusing only
+ * ~11% of the prompt from cache. Moving `Now:` — and only `Now:`, same
+ * wording, same value — to immediately before `User:` lets the stable block
+ * above it be reused on every subsequent call, while `Now:` still sits right
+ * next to the message it resolves relative times for.
+ *
+ * This is a pure reordering. No word in the stable block changed, and rule
+ * 1 ("Resolve relative times against Now") still reads correctly — the
+ * model sees the whole prompt before generating regardless of where within
+ * it any one line sits.
+ *
  * ## The optional `steps` array (Day 05 Phase E Stage 2)
  * "...meeting schedule kar do aur ... reminder laga do" is two actions in one
  * message. Rather than grow the schema with a worked example — which the
@@ -99,9 +119,15 @@ class IntentPromptBuilder(
         val day = reference.dayOfWeek.name.lowercase().replaceFirstChar { it.uppercase() }
 
         return buildString {
+            // Day 08-D: everything from here through the end of Rules is
+            // byte-for-byte identical on every call, for the life of a
+            // loaded model — no user data, no timestamp, no conversation
+            // state. That makes it a stable prefix 08-A's cache-reuse can
+            // hit on every classification call after the first one in a
+            // session, rather than just the first line. Nothing below this
+            // comment differs in wording from before Day 08-D — only
+            // "Now: ..." moved, from here down to just above "User:".
             appendLine("Classify the user's request as JSON. Reply with JSON only.")
-            appendLine()
-            appendLine("Now: $day $date $time")
             appendLine()
             appendLine("intent must be one of:")
             appendLine(ROUTABLE_INTENTS.joinToString(", ") { it.wireName } + ", conversation")
@@ -126,6 +152,7 @@ class IntentPromptBuilder(
                     "text you are sending someone else. Be concise, professional and " +
                     "direct, as DPS always is. Never just repeat the user's own words.",
             )
+            // --- end of the stable prefix ---
 
             if (pendingQuestion != null) {
                 appendLine()
@@ -139,7 +166,11 @@ class IntentPromptBuilder(
                 append(recentContext)
             }
 
+            // Now: kept immediately beside the message it resolves relative
+            // times for, rather than at the top — same content, same
+            // wording, only relocated. See the class doc's KV-cache note.
             appendLine()
+            appendLine("Now: $day $date $time")
             appendLine("User: $userMessage")
             appendLine("JSON:")
         }
