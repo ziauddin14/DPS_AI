@@ -96,6 +96,12 @@
             <action android:name="android.intent.action.SENDTO" />
             <data android:scheme="mailto" />
         </intent>
+
+        <!-- The system dialer, matching DialIntentBuilder's tel: intent (ACTION_DIAL only). -->
+        <intent>
+            <action android:name="android.intent.action.DIAL" />
+            <data android:scheme="tel" />
+        </intent>
     </queries>
 
     <!--

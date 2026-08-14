@@ -67,6 +67,16 @@ class CalendarWriter(
     /** The two columns [readEvent] needs to preserve duration across a reschedule. */
     data class EventTimes(val startMillis: Long, val endMillis: Long)
 
+    /** One event found by [findEvents]. */
+    data class EventSummary(val id: Long, val title: String, val startMillis: Long, val endMillis: Long)
+
+    /** Outcome of a read-only range query. */
+    sealed interface QueryOutcome {
+        data class Found(val events: List<EventSummary>) : QueryOutcome
+        data object NoProvider : QueryOutcome
+        data class Failed(val reason: String) : QueryOutcome
+    }
+
     /** Outcome of an insert. */
     sealed interface InsertOutcome {
         data class Created(val eventId: Long) : InsertOutcome
@@ -222,6 +232,84 @@ class CalendarWriter(
         } catch (throwable: Throwable) {
             logger.w(TAG, "Could not read event id=$eventId before updating", throwable)
             null
+        }
+    }
+
+    /**
+     * Finds events starting in `[fromMillis, toMillis)`, ordered by
+     * [CalendarContract.Events.DTSTART] ascending, capped at [limit].
+     *
+     * `toMillis == null` means no upper bound — the "no date filter" case,
+     * where the caller (`AndroidCalendarTool`) already passed `fromMillis =
+     * now`, so this reads as "the next [limit] upcoming events".
+     *
+     * ## Read-only
+     * This method issues exactly one `ContentResolver.query` and nothing
+     * else — no insert, update or delete anywhere in this path.
+     *
+     * ## Excluding `DELETED = 1`
+     * An application delete (see [deleteEvent]'s own doc) flags a row rather
+     * than removing it until the next sync. Without this filter, an event
+     * DPS itself just deleted could still appear in a listing until that
+     * sync happens — a stale, misleading answer this class can cheaply avoid.
+     *
+     * ## The `LIMIT` clause
+     * `ContentResolver.query`'s `sortOrder` parameter is inserted directly
+     * into the underlying `ORDER BY` clause, and `CalendarProvider` (like
+     * most `ContentProvider`s backed by SQLite) accepts a trailing `LIMIT`
+     * there — the standard, portable way to bound a query on this API level
+     * (a dedicated `Bundle`-based limit argument only exists from API 30;
+     * this project's minSdk is 26).
+     */
+    fun findEvents(fromMillis: Long, toMillis: Long?, limit: Int): QueryOutcome {
+        val projection = arrayOf(
+            CalendarContract.Events._ID,
+            CalendarContract.Events.TITLE,
+            CalendarContract.Events.DTSTART,
+            CalendarContract.Events.DTEND,
+        )
+
+        val selectionParts = mutableListOf(
+            "${CalendarContract.Events.DELETED} != 1",
+            "${CalendarContract.Events.DTSTART} >= ?",
+        )
+        val selectionArgs = mutableListOf(fromMillis.toString())
+        if (toMillis != null) {
+            selectionParts += "${CalendarContract.Events.DTSTART} < ?"
+            selectionArgs += toMillis.toString()
+        }
+
+        return try {
+            val cursor = context.contentResolver.query(
+                CalendarContract.Events.CONTENT_URI,
+                projection,
+                selectionParts.joinToString(" AND "),
+                selectionArgs.toTypedArray(),
+                "${CalendarContract.Events.DTSTART} ASC LIMIT $limit",
+            ) ?: return QueryOutcome.NoProvider
+
+            cursor.use {
+                val events = buildList {
+                    while (it.moveToNext()) {
+                        add(
+                            EventSummary(
+                                id = it.getLong(it.getColumnIndexOrThrow(CalendarContract.Events._ID)),
+                                title = it.getString(it.getColumnIndexOrThrow(CalendarContract.Events.TITLE))
+                                    ?: "",
+                                startMillis = it.getLong(it.getColumnIndexOrThrow(CalendarContract.Events.DTSTART)),
+                                endMillis = it.getLong(it.getColumnIndexOrThrow(CalendarContract.Events.DTEND)),
+                            ),
+                        )
+                    }
+                }
+                QueryOutcome.Found(events)
+            }
+        } catch (security: SecurityException) {
+            logger.w(TAG, "Calendar query denied", security)
+            QueryOutcome.Failed("Calendar access was denied.")
+        } catch (throwable: Throwable) {
+            logger.e(TAG, "Calendar find failed", throwable)
+            QueryOutcome.Failed(throwable.message ?: "Could not read the calendar.")
         }
     }
 

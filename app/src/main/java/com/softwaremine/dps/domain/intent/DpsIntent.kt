@@ -52,6 +52,20 @@ enum class IntentType(
     @SerialName("email_message")
     EMAIL_MESSAGE("email_message"),
 
+    /**
+     * Open the system dialer, pre-filled with a grounded contact's number
+     * (Contacts + Calling milestone).
+     *
+     * The model only ever names *who* — never the number that reaches
+     * [com.softwaremine.dps.data.android.tool.AndroidCallTool]. See
+     * [com.softwaremine.dps.ai.secretary.SecretaryOrchestrator]'s
+     * `PERSON_GROUNDING_TYPES`/`CALL_CONFIRMATION_TYPES` for how the real,
+     * contact-sourced number is what the confirmation question shows and
+     * what the tool call actually carries.
+     */
+    @SerialName("call_contact")
+    CALL_CONTACT("call_contact"),
+
     // --- Day 06: productivity secretary ---
 
     @SerialName("task")
@@ -377,6 +391,13 @@ val IntentType.requiredFields: List<Set<IntentField>>
             setOf(IntentField.EMAIL, IntentField.MESSAGE),
         )
 
+        // A call needs only a target, never a message body — same shape as
+        // CONTACT_LOOKUP's own requirement.
+        IntentType.CALL_CONTACT -> listOf(
+            setOf(IntentField.PERSON),
+            setOf(IntentField.PHONE),
+        )
+
         // Day 06. LIST requests (e.g. "mere pending tasks dikhao") need none of
         // this — com.softwaremine.dps.ai.intent.ClarificationEngine special-cases
         // IntentAction.LIST before ever consulting requiredFields, so the groups
@@ -428,6 +449,7 @@ val IntentType.toolId: ToolId?
         IntentType.CONTACT_LOOKUP -> ToolId.CONTACTS
         IntentType.WHATSAPP_MESSAGE -> ToolId.WHATSAPP
         IntentType.EMAIL_MESSAGE -> ToolId.GMAIL
+        IntentType.CALL_CONTACT -> ToolId.PHONE
         IntentType.TASK -> ToolId.TASK
         IntentType.WORK_LOG -> ToolId.WORK_LOG
         IntentType.MEETING_NOTE -> ToolId.MEETING

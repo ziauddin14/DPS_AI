@@ -500,8 +500,51 @@ class SecretaryOrchestrator(
         return if (needsResolution) {
             resolveContactThenExecute(intent, personName!!)
         } else {
+            // Reached when the model gave a phone number directly, with no
+            // name to ground — the number is already known, so confirmation
+            // (if this type needs it) can be asked immediately rather than
+            // after a lookup that would never run.
+            proceedAfterContactResolved(intent)
+        }
+    }
+
+    /**
+     * The seam every path that just finished — or skipped — contact
+     * resolution funnels through, so [CALL_CONFIRMATION_TYPES] is asked
+     * about exactly once, in exactly one place, regardless of which of the
+     * three routes (direct phone, single resolved match, or a disambiguation
+     * pick) got here.
+     */
+    private suspend fun proceedAfterContactResolved(intent: DpsIntent): ToolOrchestrator.Outcome =
+        if (intent.type in CALL_CONFIRMATION_TYPES && intent.parameters.value(IntentField.PHONE) != null) {
+            askCallConfirmation(intent)
+        } else {
             finishExecution(intent)
         }
+
+    /**
+     * Asks before opening the dialer — the confirmation boundary this
+     * milestone exists to build. Mirrors [askDeleteConfirmation]'s shape
+     * exactly, reusing the same [PendingConfirmation]/[resolveConfirmation]
+     * machinery; the only difference is *why* it fires (a grounded call
+     * target, not a destructive verb) and the question shown.
+     *
+     * Only ever called once [intent.parameters.phone][IntentField.PHONE] is
+     * the real, contact-sourced number — see [applyResolvedContactData]'s
+     * doc — so the number named here is exactly what [proceedToExecution]
+     * eventually hands to [com.softwaremine.dps.data.android.tool.AndroidCallTool].
+     */
+    private fun askCallConfirmation(intent: DpsIntent): ToolOrchestrator.Outcome {
+        val name = intent.parameters.value(IntentField.PERSON)
+        val phone = intent.parameters.value(IntentField.PHONE).orEmpty()
+        val question = "Call ${if (name != null) "$name ($phone)" else phone}?"
+
+        pendingConfirmation = PendingConfirmation(intent, now())
+        _state.value = transition(SecretaryEvent.ConfirmationRequested)
+        return ToolOrchestrator.Outcome.Clarify(
+            question,
+            IntentResolution.NeedsClarification(intent, question, emptySet(), intent.parameters),
+        )
     }
 
     private suspend fun finishExecution(intent: DpsIntent): ToolOrchestrator.Outcome {
@@ -546,6 +589,15 @@ class SecretaryOrchestrator(
             ?: _memory.value.lastTask
                 ?.takeIf { it.id.toString() == intent.parameters.targetId }
                 ?.title
+
+        // Phase 5 — Reminder Cancel Confirmation. targetId is guaranteed
+        // resolved by the time this runs, exactly as for CALENDAR_EVENT
+        // above: REMINDER is already in ClarificationEngine's
+        // TARGETABLE_TYPES, so a CANCEL with no resolved target never
+        // reaches proceedToExecution at all.
+        IntentType.REMINDER -> _memory.value.lastReminder
+            ?.takeIf { it.id.toString() == intent.parameters.targetId }
+            ?.title
 
         else -> null
     }
@@ -622,7 +674,7 @@ class SecretaryOrchestrator(
                     result = success,
                     nowMillis = now(),
                 )
-                finishExecution(applyResolvedContactData(original, success.data))
+                proceedAfterContactResolved(applyResolvedContactData(original, success.data))
             }
 
             original.type in REQUIRES_RESOLVED_CONTACT ->
@@ -664,7 +716,7 @@ class SecretaryOrchestrator(
             lastReferencedPerson = chosen.displayName,
             updatedAtMillis = now(),
         )
-        return finishExecution(applyResolvedContact(selection.originalIntent, chosen))
+        return proceedAfterContactResolved(applyResolvedContact(selection.originalIntent, chosen))
     }
 
     private fun applyResolvedContactData(original: DpsIntent, data: Map<String, String>): DpsIntent {
@@ -673,6 +725,13 @@ class SecretaryOrchestrator(
         when (original.type) {
             IntentType.WHATSAPP_MESSAGE -> data["phone"]?.let { params = params.copy(phone = it) }
             IntentType.EMAIL_MESSAGE -> data["email"]?.let { params = params.copy(email = it) }
+            // Unconditional, unlike the two above: a call's phone argument
+            // is about to be shown to the user as ground truth and then
+            // dialed, so any value the model supplied on its own — real or
+            // fabricated — must be replaced outright, even when the
+            // resolved contact turns out to have no number at all (`null`
+            // clears it rather than leaking the model's original value).
+            IntentType.CALL_CONTACT -> params = params.copy(phone = data["phone"])
             else -> Unit
         }
         return original.copy(parameters = params)
@@ -683,6 +742,8 @@ class SecretaryOrchestrator(
         when (original.type) {
             IntentType.WHATSAPP_MESSAGE -> contact.primaryPhone?.let { params = params.copy(phone = it) }
             IntentType.EMAIL_MESSAGE -> contact.primaryEmail?.let { params = params.copy(email = it) }
+            // See applyResolvedContactData's doc for why this is unconditional.
+            IntentType.CALL_CONTACT -> params = params.copy(phone = contact.primaryPhone)
             else -> Unit
         }
         return original.copy(parameters = params)
@@ -809,18 +870,37 @@ class SecretaryOrchestrator(
             IntentType.WHATSAPP_MESSAGE,
             IntentType.EMAIL_MESSAGE,
             IntentType.CALENDAR_EVENT,
+            IntentType.CALL_CONTACT,
         )
 
         /** Of [PERSON_GROUNDING_TYPES], the ones that cannot proceed at all without a resolved contact. */
-        val REQUIRES_RESOLVED_CONTACT = setOf(IntentType.WHATSAPP_MESSAGE, IntentType.EMAIL_MESSAGE)
+        val REQUIRES_RESOLVED_CONTACT = setOf(
+            IntentType.WHATSAPP_MESSAGE,
+            IntentType.EMAIL_MESSAGE,
+            IntentType.CALL_CONTACT,
+        )
 
-        /** Intent types whose CANCEL asks for confirmation before deleting (Day 06 adds TASK). */
-        val DELETE_CONFIRMATION_TYPES = setOf(IntentType.CALENDAR_EVENT, IntentType.TASK)
+        /**
+         * Types that ask an explicit "yes" once their target is known, before
+         * their tool ever runs (Contacts + Calling milestone) — mirrors
+         * [DELETE_CONFIRMATION_TYPES]'s placement, but the trigger is "the
+         * phone number is now grounded", not an action verb.
+         */
+        val CALL_CONFIRMATION_TYPES = setOf(IntentType.CALL_CONTACT)
+
+        /**
+         * Intent types whose CANCEL asks for confirmation before deleting
+         * (Day 06 adds TASK; Phase 5 — Reminder Cancel Confirmation — adds
+         * REMINDER, closing the one destructive action in this codebase that
+         * previously ran with no "are you sure").
+         */
+        val DELETE_CONFIRMATION_TYPES = setOf(IntentType.CALENDAR_EVENT, IntentType.TASK, IntentType.REMINDER)
 
         /** Fallback noun for [askDeleteConfirmation] when nothing more specific is known. */
         val DELETE_TARGET_LABELS = mapOf(
             IntentType.CALENDAR_EVENT to "event",
             IntentType.TASK to "task",
+            IntentType.REMINDER to "reminder",
         )
     }
 }

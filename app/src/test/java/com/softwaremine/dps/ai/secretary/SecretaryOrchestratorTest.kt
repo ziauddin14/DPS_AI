@@ -49,6 +49,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.LocalDateTime
 import java.time.ZoneId
 
 /**
@@ -168,7 +169,7 @@ class SecretaryOrchestratorTest {
             promptBuilder = IntentPromptBuilder(),
             parser = IntentJsonParser(),
             clarification = ClarificationEngine(),
-            selector = ToolSelector(zone = zone),
+            selector = ToolSelector(zone = zone, now = temporalNow),
             responses = com.softwaremine.dps.ai.intent.ToolResponseGenerator(),
             logger = silentLogger,
         )
@@ -372,7 +373,12 @@ class SecretaryOrchestratorTest {
     fun `state settles at failed when the tool fails`() = runTest {
         // A resolvable target is required for the call to reach the tool at
         // all, so this first creates a reminder, then cancels it against a
-        // tool that always reports failure.
+        // tool that always reports failure. Phase 5 — Reminder Cancel
+        // Confirmation — inserted a confirmation turn between the cancel
+        // request and the tool actually running, so a "haan" is now needed
+        // to reach the failing tool; ConfirmationParser answers it
+        // deterministically, so the engine still only needs its original
+        // two scripted replies.
         val engine = ScriptedEngine(
             DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","raw_when":"16:00"}}"""),
             DpsResult.Success("""{"intent":"reminder","action_type":"cancel"}"""),
@@ -390,6 +396,7 @@ class SecretaryOrchestratorTest {
 
         orchestrator.handle("remind me at 16:00")
         orchestrator.handle("cancel the reminder")
+        orchestrator.handle("haan")
 
         assertEquals(SecretaryState.FAILED, orchestrator.state.value)
     }
@@ -746,6 +753,35 @@ class SecretaryOrchestratorTest {
     private fun taskTool(behaviour: suspend (ToolCall) -> ToolResult = {
         ToolResult.Success("Task \"${it.arguments["title"]}\" added.", mapOf("task_id" to "1"))
     }) = RecordingTool(ToolId.TASK, setOf("create_task"), behaviour = behaviour)
+
+    /** A single exact match for "Bilal", mirroring AndroidContactsTool's real single-match shape. */
+    private fun singleContactTool(phone: String? = "+923001234567") = RecordingTool(
+        ToolId.CONTACTS,
+        setOf("find_contact"),
+        requiredPermissions = setOf(DpsPermission.READ_CONTACTS),
+        behaviour = {
+            val data = buildMap {
+                put("contact_id", "9")
+                put("name", "Bilal Developer")
+                phone?.let { put("phone", it) }
+            }
+            ToolResult.Success("Found Bilal Developer.", data)
+        },
+    )
+
+    private fun noContactTool() = RecordingTool(
+        ToolId.CONTACTS,
+        setOf("find_contact"),
+        requiredPermissions = setOf(DpsPermission.READ_CONTACTS),
+        behaviour = { ToolResult.Failure("No contact named \"Bilal\".", retryable = false) },
+    )
+
+    private fun callTool(behaviour: suspend (ToolCall) -> ToolResult = {
+        ToolResult.Success(
+            "The dialer is open with ${it.arguments["contact"]}'s number.",
+            mapOf("recipient" to it.arguments["contact"].orEmpty(), "phone" to it.arguments["phone"].orEmpty()),
+        )
+    }) = RecordingTool(ToolId.PHONE, setOf("place_call"), behaviour = behaviour)
 
     // -----------------------------------------------------------------
     // Temporal grounding guard (Day 08-E follow-up)
@@ -1308,6 +1344,363 @@ class SecretaryOrchestratorTest {
             "Declining a confirmation must not cost another inference pass.",
             callsBeforeDecline,
             engine.index,
+        )
+    }
+
+    // -----------------------------------------------------------------
+    // Calendar update/reschedule (Phase 5 — Calendar Update/Delete Reliability, Gap C)
+    //
+    // Calendar CREATE and CANCEL both had end-to-end orchestrator coverage;
+    // UPDATE (reschedule) had none — update_event only ever appeared inside
+    // calendarTool()'s own behaviour stub, never in an actual test scenario.
+    // No confirmation gate applies to UPDATE (only CANCEL is in
+    // DELETE_CONFIRMATION_TYPES), so these mirror the reminder-reschedule
+    // shape (create, then a reference-only follow-up) rather than the
+    // delete-confirmation shape.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `rescheduling a calendar event resolves the remembered event and routes to update_event`() = runTest {
+        val calendar = calendarTool()
+        val fixedNow = { LocalDateTime.of(2026, 8, 10, 9, 0) }
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","raw_when":"09:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","action_type":"update","parameters":{"raw_when":"17:00"}}"""),
+        )
+        val secretary = secretary(engine, listOf(calendar), temporalNow = fixedNow)
+
+        secretary.handle("standup at 09:00")
+        calendar.calls.clear()
+        val outcome = secretary.handle("us meeting ko 17:00 kar do")
+
+        assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, calendar.calls.size)
+        val call = calendar.calls.single()
+        assertEquals("update_event", call.operation)
+        // The id calendarTool()'s create_event stub returns — proves
+        // ReferenceResolver actually grounded "us meeting" against the
+        // event just created in memory, not a guess.
+        assertEquals("500", call.arguments["id"])
+        // The grounded, resolved new time — never the model's raw "17:00"
+        // string — reaches the tool as a real epoch instant.
+        assertEquals(
+            LocalDateTime.of(2026, 8, 10, 17, 0).atZone(zone).toInstant().toEpochMilli().toString(),
+            call.arguments["start"],
+        )
+        // Successful update reaches the expected final state: memory still
+        // names the same event, not cleared or replaced.
+        assertEquals("500", secretary.memory.value.lastCalendarEvent?.id?.toString())
+    }
+
+    /**
+     * The Day 08-E invariant applied to this milestone, mirroring the
+     * equivalent reminder-cancel regression test: a targetId is never
+     * readable from the model's own JSON ([IntentJsonParser] maps no such
+     * key), but this pins the end-to-end guarantee — even a model that
+     * tries to smuggle an id-shaped value into `parameters` cannot make it
+     * to the tool call. Only [ReferenceResolver]'s memory-grounded id ever
+     * reaches `update_event`.
+     */
+    @Test
+    fun `a model-supplied target id never survives calendar-update grounding`() = runTest {
+        val calendar = calendarTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","raw_when":"09:00"}}"""),
+            DpsResult.Success(
+                """{"intent":"calendar_event","action_type":"update","parameters":{"raw_when":"17:00","target_id":"9999"}}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(calendar))
+
+        secretary.handle("standup at 09:00")
+        calendar.calls.clear()
+        secretary.handle("us meeting ko 17:00 kar do")
+
+        assertEquals(1, calendar.calls.size)
+        assertEquals(
+            "The reference-resolved id must win over anything the model supplied",
+            "500",
+            calendar.calls.single().arguments["id"],
+        )
+    }
+
+    // -----------------------------------------------------------------
+    // Reminder cancel confirmation (Phase 5 — Reminder Cancel Confirmation)
+    //
+    // Reminder cancellation previously ran immediately once its target was
+    // resolved — the one destructive action in this codebase with no "are
+    // you sure." These tests mirror the calendar-delete tests immediately
+    // above verbatim in shape: the same PendingConfirmation/ConfirmationParser
+    // machinery, the same describeDeletionTarget/DELETE_TARGET_LABELS seam,
+    // just DELETE_CONFIRMATION_TYPES now also covering IntentType.REMINDER.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `deleting a reminder asks before doing anything`() = runTest {
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","action_type":"cancel","parameters":{}}"""),
+        )
+        val secretary = secretary(engine, listOf(reminder))
+
+        secretary.handle("remind me to call the bank at 16:00")
+        reminder.calls.clear()
+        val outcome = secretary.handle("mera reminder cancel kar do")
+
+        assertTrue("Expected Clarify, got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((outcome as ToolOrchestrator.Outcome.Clarify).question.contains("call the bank"))
+        assertTrue(outcome.question.contains("can't be undone"))
+        assertTrue("Nothing may be cancelled before confirmation", reminder.calls.isEmpty())
+    }
+
+    @Test
+    fun `confirming a reminder cancellation executes it exactly once`() = runTest {
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","action_type":"cancel","parameters":{}}"""),
+        )
+        val secretary = secretary(engine, listOf(reminder))
+
+        secretary.handle("remind me to call the bank at 16:00")
+        reminder.calls.clear()
+        secretary.handle("mera reminder cancel kar do")
+        val confirmed = secretary.handle("haan")
+
+        assertTrue("Expected Handled, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, reminder.calls.size)
+        assertEquals("cancel_reminder", reminder.calls.single().operation)
+        // The id created two turns ago — proves the grounded reference, not
+        // anything the model said in the cancel turn itself, is what's cancelled.
+        assertEquals("1001", reminder.calls.single().arguments["id"])
+    }
+
+    @Test
+    fun `declining a reminder cancellation leaves it alone`() = runTest {
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","action_type":"cancel","parameters":{}}"""),
+        )
+        val secretary = secretary(engine, listOf(reminder))
+
+        secretary.handle("remind me to call the bank at 16:00")
+        reminder.calls.clear()
+        secretary.handle("mera reminder cancel kar do")
+        val callsBeforeDecline = engine.index
+        val declined = secretary.handle("nahi")
+
+        assertTrue("Expected Handled, got $declined", declined is ToolOrchestrator.Outcome.Handled)
+        assertTrue("Declining must not cancel anything", reminder.calls.isEmpty())
+        assertEquals(
+            "Declining a confirmation must not cost another inference pass.",
+            callsBeforeDecline,
+            engine.index,
+        )
+    }
+
+    /**
+     * The Day 08-E invariant applied to this milestone: a targetId is never
+     * readable from the model's own JSON at all ([IntentJsonParser] maps no
+     * such key), but this pins the end-to-end guarantee anyway — even a
+     * model that tries to smuggle an id-shaped value into `parameters`
+     * cannot make it to the tool call. Only [ReferenceResolver]'s
+     * memory-grounded id ever reaches `cancel_reminder`.
+     */
+    @Test
+    fun `a model-supplied target id never survives reminder-cancel grounding`() = runTest {
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","action_type":"cancel","parameters":{"target_id":"9999"}}"""),
+        )
+        val secretary = secretary(engine, listOf(reminder))
+
+        secretary.handle("remind me to call the bank at 16:00")
+        reminder.calls.clear()
+        secretary.handle("mera reminder cancel kar do")
+        val confirmed = secretary.handle("haan")
+
+        assertTrue("Expected Handled, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, reminder.calls.size)
+        assertEquals(
+            "The reference-resolved id must win over anything the model supplied",
+            "1001",
+            reminder.calls.single().arguments["id"],
+        )
+    }
+
+    @Test
+    fun `a reminder cancellation with no resolvable target asks which one rather than guessing`() = runTest {
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","action_type":"cancel","parameters":{}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(reminder)).handle("reminder cancel kar do")
+
+        assertTrue("Expected Clarify, got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((outcome as ToolOrchestrator.Outcome.Clarify).question.contains("Which reminder"))
+        assertTrue("Nothing may be cancelled without a resolved target", reminder.calls.isEmpty())
+    }
+
+    // -----------------------------------------------------------------
+    // Calling (Contacts + Calling milestone) — grounded phone, explicit
+    // confirmation, ACTION_DIAL only.
+    //
+    // Reuses the exact contact-grounding and PendingConfirmation machinery
+    // already proven above for WhatsApp and calendar-delete; the only new
+    // rule is *where* confirmation is asked (after the phone number is
+    // grounded, before place_call ever runs) and that the grounded number
+    // always wins over anything the model supplied directly.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `an exact contact match asks to confirm before dialing`() = runTest {
+        val call = callTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"call_contact","parameters":{"person":"Bilal"}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(singleContactTool(), call)).handle("Bilal ko call laga do")
+
+        assertTrue("Expected Clarify, got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
+        val question = (outcome as ToolOrchestrator.Outcome.Clarify).question
+        assertTrue(question.contains("Bilal Developer"))
+        assertTrue(question.contains("+923001234567"))
+        assertTrue("Nothing may dial before confirmation", call.calls.isEmpty())
+    }
+
+    @Test
+    fun `confirming a call opens the dialer with the grounded number`() = runTest {
+        val call = callTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"call_contact","parameters":{"person":"Bilal"}}"""),
+        )
+        val secretary = secretary(engine, listOf(singleContactTool(), call))
+
+        secretary.handle("Bilal ko call laga do")
+        val confirmed = secretary.handle("haan")
+
+        assertTrue("Expected Handled, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, call.calls.size)
+        assertEquals("place_call", call.calls.single().operation)
+        assertEquals("Bilal Developer", call.calls.single().arguments["contact"])
+        assertEquals("+923001234567", call.calls.single().arguments["phone"])
+    }
+
+    @Test
+    fun `declining a call leaves the dialer untouched`() = runTest {
+        val call = callTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"call_contact","parameters":{"person":"Bilal"}}"""),
+        )
+        val secretary = secretary(engine, listOf(singleContactTool(), call))
+
+        secretary.handle("Bilal ko call laga do")
+        val declined = secretary.handle("nahi")
+
+        assertTrue("Expected Handled, got $declined", declined is ToolOrchestrator.Outcome.Handled)
+        assertTrue("Declining must never open the dialer", call.calls.isEmpty())
+    }
+
+    @Test
+    fun `an ambiguous name asks which contact instead of guessing before ever asking to call`() = runTest {
+        val call = callTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"call_contact","parameters":{"person":"Abdul"}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(ambiguousContactsTool(), call)).handle("Abdul ko call karo")
+
+        assertTrue("Expected Clarify, got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((outcome as ToolOrchestrator.Outcome.Clarify).question.contains("Abdul Rahman"))
+        assertTrue(outcome.question.contains("Abdul Rauf"))
+        assertTrue("Nothing may dial before disambiguation", call.calls.isEmpty())
+    }
+
+    @Test
+    fun `picking a candidate by number still asks to confirm before dialing`() = runTest {
+        val call = callTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"call_contact","parameters":{"person":"Abdul"}}"""),
+        )
+        val secretary = secretary(engine, listOf(ambiguousContactsTool(), call))
+
+        secretary.handle("Abdul ko call karo")
+        val outcome = secretary.handle("2")
+
+        assertTrue("Expected Clarify (confirmation), got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((outcome as ToolOrchestrator.Outcome.Clarify).question.contains("Abdul Rauf"))
+        assertTrue(outcome.question.contains("+923002222222"))
+        assertTrue(call.calls.isEmpty())
+    }
+
+    @Test
+    fun `no matching contact reports the lookup failure rather than dialing anything`() = runTest {
+        val call = callTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"call_contact","parameters":{"person":"Bilal"}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(noContactTool(), call)).handle("Bilal ko call laga do")
+
+        assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
+        assertTrue((outcome as ToolOrchestrator.Outcome.Handled).reply.contains("No contact named"))
+        assertTrue(call.calls.isEmpty())
+    }
+
+    /**
+     * A resolved contact with no phone number on file must never reach
+     * confirmation or the dialer — and the tool itself reports why, exactly
+     * like [PrepareWhatsAppMessageTool]'s equivalent case.
+     */
+    @Test
+    fun `a contact with no phone number never reaches confirmation or the dialer`() = runTest {
+        val call = callTool {
+            ToolResult.Failure("${it.arguments["contact"]} has no phone number saved.", retryable = false)
+        }
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"call_contact","parameters":{"person":"Bilal"}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(singleContactTool(phone = null), call)).handle("Bilal ko call laga do")
+
+        assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
+        assertTrue((outcome as ToolOrchestrator.Outcome.Handled).reply.contains("no phone number"))
+        // The tool itself is the one reporting the failure, so it is called
+        // once with no phone argument — never skipped, never dialed blind.
+        assertEquals(1, call.calls.size)
+        assertNull(call.calls.single().arguments["phone"])
+    }
+
+    /**
+     * The critical safety invariant for this milestone: a phone number the
+     * model supplies directly alongside a resolved name must never survive
+     * grounding. Bilal's real, contact-sourced number must reach the tool —
+     * never the model's fabricated one, even though the model emitted a
+     * syntactically-plausible-looking number of its own.
+     */
+    @Test
+    fun `a model-supplied phone number never survives contact grounding`() = runTest {
+        val call = callTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"intent":"call_contact","parameters":{"person":"Bilal","phone":"+92000FAKE0000"}}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(singleContactTool(), call))
+
+        secretary.handle("Bilal ko call laga do")
+        val confirmed = secretary.handle("haan")
+
+        assertTrue("Expected Handled, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, call.calls.size)
+        assertEquals(
+            "The resolved contact's real number must win over the model's own value",
+            "+923001234567",
+            call.calls.single().arguments["phone"],
         )
     }
 

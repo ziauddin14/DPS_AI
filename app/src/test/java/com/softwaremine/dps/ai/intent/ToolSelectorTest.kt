@@ -147,6 +147,39 @@ class ToolSelectorTest {
         assertNull(selector.select(intent(IntentType.CONVERSATION, IntentParameters())))
     }
 
+    /**
+     * The call-safety equivalent of the WhatsApp test above: the operation
+     * named here must never be one that dials automatically. `place_call`
+     * only opens the dialer — see [com.softwaremine.dps.data.android.tool.AndroidCallTool]'s
+     * doc for why `ACTION_DIAL`, never `ACTION_CALL`, is the only capability
+     * this codebase has.
+     */
+    @Test
+    fun `a call routes to the phone tool without a message argument`() {
+        val call = selector.select(
+            intent(
+                IntentType.CALL_CONTACT,
+                IntentParameters(person = "Bilal", phone = "+923001234567"),
+            ),
+        )!!
+
+        assertEquals(ToolId.PHONE, call.toolId)
+        assertEquals("place_call", call.operation)
+        assertEquals("Bilal", call.arguments["contact"])
+        assertEquals("+923001234567", call.arguments["phone"])
+        assertNull("A call carries no message body", call.arguments["message"])
+    }
+
+    @Test
+    fun `a call by phone number alone omits the contact argument`() {
+        val call = selector.select(
+            intent(IntentType.CALL_CONTACT, IntentParameters(phone = "+923001234567")),
+        )!!
+
+        assertEquals("+923001234567", call.arguments["phone"])
+        assertNull(call.arguments["contact"])
+    }
+
     @Test
     fun `a phone number is carried through when the user gave one instead of a name`() {
         val call = selector.select(
@@ -437,5 +470,30 @@ class ToolSelectorTest {
 
         assertNull(update.arguments["id"])
         assertNull(cancel.arguments["id"])
+    }
+
+    // -----------------------------------------------------------------
+    // Calendar Find/List (Phase 5)
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `a calendar list call forwards the already-resolved date`() {
+        val call = selector.select(
+            intent(IntentType.CALENDAR_EVENT, IntentParameters(date = "2026-08-07"), IntentAction.LIST),
+        )!!
+
+        assertEquals(ToolId.CALENDAR, call.toolId)
+        assertEquals("list_events", call.operation)
+        assertEquals("2026-08-07", call.arguments["date"])
+    }
+
+    @Test
+    fun `a calendar list call with no resolved date omits it rather than guessing`() {
+        val call = selector.select(
+            intent(IntentType.CALENDAR_EVENT, IntentParameters(), IntentAction.LIST),
+        )!!
+
+        assertEquals("list_events", call.operation)
+        assertNull(call.arguments["date"])
     }
 }

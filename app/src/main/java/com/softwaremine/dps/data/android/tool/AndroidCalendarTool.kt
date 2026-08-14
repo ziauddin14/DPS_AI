@@ -7,10 +7,11 @@ import com.softwaremine.dps.domain.tool.AndroidTool
 import com.softwaremine.dps.domain.tool.ToolCall
 import com.softwaremine.dps.domain.tool.ToolId
 import com.softwaremine.dps.domain.tool.ToolResult
+import java.time.LocalDate
 import java.time.ZoneId
 
 /**
- * Creates calendar events.
+ * Creates, updates, deletes and lists calendar events.
  *
  * ## Operations
  * | Operation | Arguments | Result |
@@ -18,10 +19,18 @@ import java.time.ZoneId
  * | `create_event` | `title` (required), `start` (required), `end`, `description`, `location`, `all_day`, `timezone` | [ToolResult.Success] with `event_id` |
  * | `update_event` | `id` (required), `title`, `start`, `end`, `timezone` | [ToolResult.Success] with `event_id` |
  * | `delete_event` | `id` (required) | [ToolResult.Success] with `event_id`, or [ToolResult.Failure] if no such event |
+ * | `list_events` | `date` (optional, ISO) | [ToolResult.Success] with flattened `event_N_*` entries — never a fabricated one |
  *
- * Listing remains declared in the catalogue and returns [ToolResult.Unsupported]
- * — nothing in this product needs to enumerate events, and claiming an
- * operation that does not work would be worse than declining it.
+ * ## `list_events` is read-only, and never guesses a date
+ * With `date`, results are bounded to that one calendar day. Without it —
+ * or with one that fails to parse — it falls back to the next handful of
+ * upcoming events from now, exactly the same "widen rather than invent"
+ * rule [com.softwaremine.dps.data.android.tool.AndroidWorkLogTool]'s own
+ * `list_work_logs` already follows: a date DPS cannot confidently resolve is
+ * never silently guessed at, only omitted from the filter. `date` itself is
+ * never computed here — it arrives already resolved, deterministically, by
+ * [com.softwaremine.dps.ai.memory.TemporalPhraseResolver] long before this
+ * tool ever runs (Day 08-E); this class only ever reads it.
  *
  * ## Failure modes handled explicitly
  * The brief calls for graceful detection of three conditions, each of which
@@ -52,10 +61,10 @@ class AndroidCalendarTool(
 
     override val id: ToolId = ToolId.CALENDAR
 
-    override val operations: Set<String> = setOf(OP_CREATE_EVENT, OP_UPDATE_EVENT, OP_DELETE_EVENT)
+    override val operations: Set<String> = setOf(OP_CREATE_EVENT, OP_UPDATE_EVENT, OP_DELETE_EVENT, OP_LIST_EVENTS)
 
     override val requiredPermissions: Set<DpsPermission> = setOf(
-        DpsPermission.READ_CALENDAR,   // required to find a writable calendar
+        DpsPermission.READ_CALENDAR,   // required to find a writable calendar, and to list
         DpsPermission.WRITE_CALENDAR,  // required to insert/update/delete
     )
 
@@ -63,6 +72,7 @@ class AndroidCalendarTool(
         OP_CREATE_EVENT -> createEvent(call)
         OP_UPDATE_EVENT -> updateEvent(call)
         OP_DELETE_EVENT -> deleteEvent(call)
+        OP_LIST_EVENTS -> listEvents(call)
         else -> ToolResult.Unsupported("'${call.operation}' is not implemented yet.")
     }
 
@@ -259,10 +269,69 @@ class AndroidCalendarTool(
         }
     }
 
+    /**
+     * Lists events, optionally filtered to a single calendar day.
+     *
+     * With [ARG_DATE], bounded to `[startOfDay, startOfNextDay)`. Without
+     * it — or with one that does not parse as an ISO date — bounded to
+     * `[now, ∞)`, capped at [MAX_LISTED_EVENTS]: the next handful of
+     * upcoming events is the useful default answer to "what are my
+     * meetings", not an arbitrary or unbounded dump of the whole calendar.
+     */
+    private fun listEvents(call: ToolCall): ToolResult {
+        val zone = ToolArguments.zone(call)
+        val dateFilter = call.argument(ARG_DATE)?.let(::parseIsoDate)
+
+        val fromMillis: Long
+        val toMillis: Long?
+        if (dateFilter != null) {
+            fromMillis = dateFilter.atStartOfDay(zone).toInstant().toEpochMilli()
+            toMillis = dateFilter.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+        } else {
+            fromMillis = System.currentTimeMillis()
+            toMillis = null
+        }
+
+        return when (val outcome = writer.findEvents(fromMillis, toMillis, MAX_LISTED_EVENTS)) {
+            is CalendarWriter.QueryOutcome.Found -> {
+                val events = outcome.events
+                if (events.isEmpty()) {
+                    ToolResult.Success(summary = "No events found.", data = mapOf("count" to "0"))
+                } else {
+                    ToolResult.Success(
+                        summary = "You have ${events.size} event${if (events.size == 1) "" else "s"}.",
+                        data = buildMap {
+                            put("count", events.size.toString())
+                            events.forEachIndexed { index, event ->
+                                put("event_${index}_id", event.id.toString())
+                                put("event_${index}_title", event.title)
+                                put("event_${index}_start", ToolArguments.describe(event.startMillis, zone))
+                                put("event_${index}_end", ToolArguments.describe(event.endMillis, zone))
+                            }
+                        },
+                    )
+                }
+            }
+
+            CalendarWriter.QueryOutcome.NoProvider -> ToolResult.Unsupported(
+                reason = "This device has no calendar app available.",
+            )
+
+            is CalendarWriter.QueryOutcome.Failed -> ToolResult.Failure(
+                reason = outcome.reason,
+                retryable = true,
+            )
+        }
+    }
+
+    /** `null` on anything that isn't a parseable ISO date — never guessed, only omitted. See [listEvents]. */
+    private fun parseIsoDate(raw: String): LocalDate? = runCatching { LocalDate.parse(raw.trim()) }.getOrNull()
+
     private companion object {
         const val OP_CREATE_EVENT = "create_event"
         const val OP_UPDATE_EVENT = "update_event"
         const val OP_DELETE_EVENT = "delete_event"
+        const val OP_LIST_EVENTS = "list_events"
 
         const val ARG_ID = "id"
         const val ARG_TITLE = "title"
@@ -271,6 +340,10 @@ class AndroidCalendarTool(
         const val ARG_DESCRIPTION = "description"
         const val ARG_LOCATION = "location"
         const val ARG_ALL_DAY = "all_day"
+        const val ARG_DATE = "date"
+
+        /** Mirrors AndroidWorkLogTool's MAX_UNFILTERED_RESULTS convention. */
+        const val MAX_LISTED_EVENTS = 20
 
         /** Assumed event length when no end time is supplied. */
         const val DEFAULT_DURATION_MILLIS = 60L * 60L * 1000L

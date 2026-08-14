@@ -34,6 +34,9 @@ import com.softwaremine.dps.domain.intent.IntentParameters
 import com.softwaremine.dps.domain.intent.IntentType
 import com.softwaremine.dps.domain.model.ModelConfig
 import com.softwaremine.dps.domain.model.ModelDescriptor
+import com.softwaremine.dps.domain.tool.ToolCall
+import com.softwaremine.dps.domain.tool.ToolId
+import com.softwaremine.dps.domain.tool.ToolResult
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -173,7 +176,18 @@ class SecretaryLiveWiringInstrumentedTest {
     // Memory persists across turns against the real tool layer
     // -----------------------------------------------------------------
 
-    /** Demo example 2 from the Phase E brief, against the real reminder tool. */
+    /**
+     * Demo example 2 from the Phase E brief, against the real reminder tool.
+     *
+     * ## Pre-existing fixture bug fixed here (Gap D)
+     * This test's message used to say "at 4pm" while the scripted `raw_when`
+     * said `"16:00"` — two different textual representations of the same
+     * time, so `TemporalGroundingGuard` correctly rejected `"16:00"` as not
+     * literally present in the user's own words, and the test never got
+     * past a "When should I remind you?" clarification. The fix is the
+     * message, not the grounding logic: state the time the same way the
+     * scripted `raw_when` already does.
+     */
     @Test
     fun rescheduleFollowUpResolvesAgainstTheRealReminderJustCreated(): Unit = runBlocking {
         val orchestrator = secretary(
@@ -181,7 +195,7 @@ class SecretaryLiveWiringInstrumentedTest {
             """{"intent":"reminder","action_type":"update"}""",
         )
 
-        val first = orchestrator.handle("remind me to call the bank at 4pm")
+        val first = orchestrator.handle("remind me to call the bank at 16:00")
         assertTrue("Expected Handled, got $first", first is ToolOrchestrator.Outcome.Handled)
         assertNotNull("Memory did not record the created reminder", orchestrator.memory.value.lastReminder)
 
@@ -208,6 +222,70 @@ class SecretaryLiveWiringInstrumentedTest {
         val outcome = secretary("""{"intent":"conversation"}""").handle("who are you?")
 
         assertTrue(outcome is ToolOrchestrator.Outcome.Conversational)
+    }
+
+    /**
+     * Phase 5 — Reminder Cancel Confirmation, against the real reminder tool
+     * (real `AlarmManager`/`ReminderStore`, not a mock). Mirrors
+     * [rescheduleAndDeleteResolveAgainstTheRealEventJustCreated]'s shape one
+     * step further: it also confirms, proving the full
+     * ask → still-exists → confirm → really-cancelled loop against real
+     * device state, not just that the question was asked.
+     *
+     * Always cleans up: the test's own last step *is* the cleanup (the
+     * reminder is genuinely cancelled by the time it finishes on the happy
+     * path), and the `finally` cancels it again defensively so a failed
+     * assertion earlier in the test can never leave a real alarm or
+     * `ReminderStore` record behind.
+     */
+    @Test
+    fun cancellingARealReminderRequiresConfirmationThenRemovesIt(): Unit = runBlocking {
+        val orchestrator = secretary(
+            """{"intent":"reminder","parameters":{"title":"Phase 5 confirmation flow check","raw_when":"16:00"}}""",
+            """{"intent":"reminder","action_type":"cancel","parameters":{}}""",
+        )
+
+        val created = orchestrator.handle("remind me about the Phase 5 confirmation flow check at 16:00")
+        assertTrue(
+            "Expected Handled or NeedsPermission, got $created",
+            created is ToolOrchestrator.Outcome.Handled || created is ToolOrchestrator.Outcome.NeedsPermission,
+        )
+        if (created !is ToolOrchestrator.Outcome.Handled) return@runBlocking // no POST_NOTIFICATIONS on this run; covered by AndroidToolsInstrumentedTest instead
+        val reminderId = orchestrator.memory.value.lastReminder?.id
+        assertNotNull("Memory did not record the created reminder", reminderId)
+
+        try {
+            val beforeConfirmation = container.toolExecutor.execute(ToolCall(ToolId.REMINDER, "list_reminders"))
+            assertTrue(
+                "Reminder must still exist before any confirmation, got $beforeConfirmation",
+                (beforeConfirmation as? ToolResult.Success)?.data?.containsValue(reminderId.toString()) == true,
+            )
+
+            val cancelRequest = orchestrator.handle("cancel that reminder")
+            assertTrue(
+                "Cancellation must ask for confirmation before doing anything, got $cancelRequest",
+                cancelRequest is ToolOrchestrator.Outcome.Clarify,
+            )
+
+            val afterAskBeforeConfirm = container.toolExecutor.execute(ToolCall(ToolId.REMINDER, "list_reminders"))
+            assertTrue(
+                "Reminder must still exist once only asked about, not yet confirmed, got $afterAskBeforeConfirm",
+                (afterAskBeforeConfirm as? ToolResult.Success)?.data?.containsValue(reminderId.toString()) == true,
+            )
+
+            val confirmed = orchestrator.handle("haan")
+            assertTrue("Expected Handled after confirming, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+
+            val afterConfirm = container.toolExecutor.execute(ToolCall(ToolId.REMINDER, "list_reminders"))
+            assertTrue(
+                "Reminder must be gone once confirmed, got $afterConfirm",
+                (afterConfirm as? ToolResult.Success)?.data?.containsValue(reminderId.toString()) != true,
+            )
+        } finally {
+            container.toolExecutor.execute(
+                ToolCall(ToolId.REMINDER, "cancel_reminder", mapOf("id" to reminderId.toString())),
+            )
+        }
     }
 
     // -----------------------------------------------------------------
@@ -244,6 +322,24 @@ class SecretaryLiveWiringInstrumentedTest {
      * same reasoning Phase D's own reminder equivalent already applies. What
      * this proves either way: the pipeline reaches the real tool and asks
      * honestly rather than silently failing or fabricating a result.
+     *
+     * ## Pre-existing fixture bug fixed here (Gap D)
+     * Both the create step ("at 9am" vs. scripted `raw_when="09:00"`) and
+     * the reschedule step ("5 baje" vs. scripted `raw_when="17:00"`) used to
+     * state the time differently from what the model was scripted to quote
+     * — `TemporalGroundingGuard` correctly rejected both as ungrounded, so
+     * this test never got past its first clarification question. Fixed by
+     * aligning the messages to the same colon-time form the scripted
+     * `raw_when` already uses; the grounding/resolution logic itself is
+     * unchanged.
+     *
+     * ## Now also confirms and cleans up (Gap D, extended)
+     * The original version stopped at the delete confirmation question,
+     * which — once the create step above actually started succeeding —
+     * would leave a real event behind on any device with calendar
+     * permission granted. This now sends the confirming "haan" and verifies
+     * the event is genuinely gone, with a defensive `finally` that deletes
+     * it directly if any assertion above fails first.
      */
     @Test
     fun rescheduleAndDeleteResolveAgainstTheRealEventJustCreated(): Unit = runBlocking {
@@ -253,26 +349,36 @@ class SecretaryLiveWiringInstrumentedTest {
             """{"intent":"calendar_event","action_type":"cancel","parameters":{}}""",
         )
 
-        val created = orchestrator.handle("standup at 9am")
+        val created = orchestrator.handle("standup at 09:00")
         assertTrue(
             "Expected Handled or NeedsPermission, got $created",
             created is ToolOrchestrator.Outcome.Handled || created is ToolOrchestrator.Outcome.NeedsPermission,
         )
         if (created !is ToolOrchestrator.Outcome.Handled) return@runBlocking // no calendar permission on this run; covered by AndroidToolsInstrumentedTest instead
-        assertNotNull("Memory did not record the created event", orchestrator.memory.value.lastCalendarEvent)
+        val eventId = orchestrator.memory.value.lastCalendarEvent?.id
+        assertNotNull("Memory did not record the created event", eventId)
 
-        val rescheduled = orchestrator.handle("us meeting ko 5 baje kar do")
-        assertTrue(
-            "Expected the reschedule to resolve, got $rescheduled",
-            rescheduled is ToolOrchestrator.Outcome.Handled || rescheduled is ToolOrchestrator.Outcome.Conversational,
-        )
+        try {
+            val rescheduled = orchestrator.handle("us meeting ko 17:00 kar do")
+            assertTrue(
+                "Expected the reschedule to resolve, got $rescheduled",
+                rescheduled is ToolOrchestrator.Outcome.Handled || rescheduled is ToolOrchestrator.Outcome.Conversational,
+            )
 
-        val deleteRequest = orchestrator.handle("us meeting ko delete kar do")
-        // Requirement 6: deletion asks first — the very next outcome must be a
-        // question, never the deletion itself.
-        assertTrue(
-            "Delete must ask for confirmation before doing anything, got $deleteRequest",
-            deleteRequest is ToolOrchestrator.Outcome.Clarify,
-        )
+            val deleteRequest = orchestrator.handle("us meeting ko delete kar do")
+            // Requirement 6: deletion asks first — the very next outcome must be
+            // a question, never the deletion itself.
+            assertTrue(
+                "Delete must ask for confirmation before doing anything, got $deleteRequest",
+                deleteRequest is ToolOrchestrator.Outcome.Clarify,
+            )
+
+            val confirmed = orchestrator.handle("haan")
+            assertTrue("Expected Handled after confirming, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        } finally {
+            container.toolExecutor.execute(
+                ToolCall(ToolId.CALENDAR, "delete_event", mapOf("id" to eventId.toString())),
+            )
+        }
     }
 }

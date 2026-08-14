@@ -216,18 +216,10 @@ class IntentPromptBuilderTest {
         // every call and defeated KV-cache reuse entirely, while this
         // slightly larger prompt is now byte-identical on every call —
         // each move is one deliberate, named change, not drift; a
-        // regression here should still fail loudly. → 1500 (Day 09: the
-        // model never once produced a `steps` array across 30 real compound
-        // requests when it was named only in a `Rules:` bullet — `Shape:`
-        // now shows the single-object and steps-array forms as equally
-        // prominent, schema-only entries, still with no field-value example,
-        // so this is width the model needs, not drift). This whole block is
-        // still fully static across every call, so the growth is a one-time
-        // recache cost, not a per-request one — see IntentPromptBuilder's
-        // class doc.
+        // regression here should still fail loudly.
         assertTrue(
             "Classification prompt has grown to ${prompt.length} characters",
-            prompt.length < 1500,
+            prompt.length < 1400,
         )
     }
 

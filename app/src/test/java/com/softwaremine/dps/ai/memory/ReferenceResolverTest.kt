@@ -242,11 +242,61 @@ class ReferenceResolverTest {
             memory,
         )
 
-        // No calendar-specific cue was present, and there was a title given? No
-        // — action != CREATE with no title still falls back for CALENDAR_EVENT
-        // too, so this actually does resolve via the implicit fallback. Assert
-        // it resolves to the *calendar* event, never the reminder.
-        assertEquals("8", resolved.parameters.targetId)
+        // The model classified this as CALENDAR_EVENT, but the user's own
+        // words name a reminder, not an event. Classification alone is not
+        // sufficient evidence — this must stay unresolved so
+        // ClarificationEngine asks, rather than silently cancelling the
+        // wrong thing.
+        assertNull(resolved.parameters.targetId)
+    }
+
+    @Test
+    fun `a task cue does not resolve a calendar event`() {
+        val memory = ConversationMemory(
+            lastTask = com.softwaremine.dps.domain.memory.TaskMemory(id = 9, title = "x"),
+            lastCalendarEvent = CalendarEventMemory(id = 10, title = "y", startMillis = 0L, endMillis = 0L),
+        )
+        val resolved = resolver.resolve(
+            "us task ko cancel kar do",
+            intent(IntentType.CALENDAR_EVENT, action = IntentAction.CANCEL),
+            memory,
+        )
+
+        assertNull(resolved.parameters.targetId)
+    }
+
+    @Test
+    fun `cues for two different entities together leave the calendar event unresolved`() {
+        val memory = ConversationMemory(
+            lastReminder = ReminderMemory(id = 7, title = "x", triggerAtMillis = 0L),
+            lastCalendarEvent = CalendarEventMemory(id = 8, title = "y", startMillis = 0L, endMillis = 0L),
+        )
+        val resolved = resolver.resolve(
+            "us reminder ko us meeting jaisa treat karo",
+            intent(IntentType.CALENDAR_EVENT, action = IntentAction.CANCEL),
+            memory,
+        )
+
+        // A calendar cue ("us meeting") and a reminder cue ("us reminder")
+        // both appear — genuinely ambiguous, so this must not guess.
+        assertNull(resolved.parameters.targetId)
+    }
+
+    @Test
+    fun `a bare follow-up with no competing cue still resolves the calendar event`() {
+        // "move my last meeting to 5pm" — no listed calendar cue phrase, no
+        // title, no reminder or task cue either. This is the case the fix
+        // must not break: nothing else it could plausibly mean.
+        val memory = ConversationMemory(
+            lastCalendarEvent = CalendarEventMemory(id = 20, title = "standup", startMillis = 0L, endMillis = 0L),
+        )
+        val resolved = resolver.resolve(
+            "move my last meeting to 5pm",
+            intent(IntentType.CALENDAR_EVENT, action = IntentAction.UPDATE),
+            memory,
+        )
+
+        assertEquals("20", resolved.parameters.targetId)
     }
 
     // -----------------------------------------------------------------

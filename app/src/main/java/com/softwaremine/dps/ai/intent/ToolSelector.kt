@@ -105,6 +105,19 @@ class ToolSelector(
                 },
             )
 
+            // The preparing operation, never a dialing one — see
+            // AndroidCallTool's doc for why ACTION_DIAL is the only
+            // capability this codebase has. No "message" argument: a call
+            // carries no body.
+            IntentType.CALL_CONTACT -> ToolCall(
+                toolId = ToolId.PHONE,
+                operation = "place_call",
+                arguments = buildMap {
+                    p.value(IntentField.PERSON)?.let { put("contact", it) }
+                    p.value(IntentField.PHONE)?.let { put("phone", it) }
+                },
+            )
+
             IntentType.TASK -> taskCall(intent.action, p)
             IntentType.WORK_LOG -> workLogCall(intent.action, p)
             IntentType.MEETING_NOTE -> meetingNoteCall(intent.action, p)
@@ -342,9 +355,14 @@ class ToolSelector(
      * whether the message already carries consent, not to this pure mapping.
      */
     private fun calendarCall(action: IntentAction, p: IntentParameters): ToolCall = when (action) {
-        // AndroidCalendarTool implements no list operation yet — named so the
-        // executor's Unsupported fallback reports that honestly.
-        IntentAction.LIST -> ToolCall(toolId = ToolId.CALENDAR, operation = "list_events")
+        // The only argument list_events reads — already resolved
+        // deterministically by TemporalPhraseResolver before this runs, so
+        // this never computes or guesses a date itself (Phase 5).
+        IntentAction.LIST -> ToolCall(
+            toolId = ToolId.CALENDAR,
+            operation = "list_events",
+            arguments = buildMap { p.value(IntentField.DATE)?.let { put("date", it) } },
+        )
 
         // No "complete" concept for a calendar event; see reminderCall's doc.
         IntentAction.COMPLETE -> ToolCall(toolId = ToolId.CALENDAR, operation = "complete_event")

@@ -108,6 +108,7 @@ class ToolResponseGenerator {
             IntentType.CONTACT_LOOKUP -> "look that person up"
             IntentType.WHATSAPP_MESSAGE -> "find who you meant"
             IntentType.EMAIL_MESSAGE -> "find their address"
+            IntentType.CALL_CONTACT -> "find who you meant"
             // Day 06 tools declare no required permissions — unreachable in
             // practice, but every case must say something.
             IntentType.TASK -> "manage that task"
@@ -139,6 +140,7 @@ class ToolResponseGenerator {
         IntentType.CONTACT_LOOKUP -> "Here's what I found."
         IntentType.WHATSAPP_MESSAGE -> "Your message is ready to send."
         IntentType.EMAIL_MESSAGE -> "Your email is ready to send."
+        IntentType.CALL_CONTACT -> "The dialer is open."
         IntentType.TASK -> "Done."
         IntentType.WORK_LOG -> "Logged."
         IntentType.MEETING_NOTE -> "Saved."

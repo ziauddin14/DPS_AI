@@ -55,20 +55,14 @@ import com.softwaremine.dps.domain.intent.IntentType
  * chasing — without asking the model to compute anything it cannot reliably
  * compute.
  *
- * ## The optional `steps` array (Day 05 Phase E Stage 2; salience fix Day 09)
+ * ## The optional `steps` array (Day 05 Phase E Stage 2)
  * "...meeting schedule kar do aur ... reminder laga do" is two actions in one
- * message. The original version of this prompt named the `{"steps":[...]}`
- * shape only in a single `Rules:` bullet, while `Shape:` showed just the
- * single-object form — real-device evidence (Day 09) found the model never
- * once produced a `steps` array across 30 compound-message calls, always
- * defaulting to the one shape shown prominently. `Shape:` now names both
- * forms as equally-weighted, schema-only entries — still no field-value
- * example, so the "small models copy content, not shape" principle below is
- * unchanged — so the model has an actual structural choice to make instead
- * of one shape shown and a second one merely described in prose.
- * [IntentJsonParser.parsePlan] treats a bare object as a one-step plan, so
- * this changes nothing for the common case; it only gives the model a real
- * way to say "and" when the request actually has one.
+ * message. Rather than grow the schema with a worked example — which the
+ * prompt's own design principle below rejects — a single rule line tells the
+ * model it may reply with `{"steps":[{...},{...}]}` instead of a bare object
+ * when there is more than one. [IntentJsonParser.parsePlan] treats a bare
+ * object as a one-step plan, so this changes nothing for the common case; it
+ * only gives the model a way to say "and" when the request actually has one.
  *
  * ## Why conversation memory is not injected here (Day 05 Phase E)
  * "Usko", "us reminder" and a relative offset like "30 minute pehle" are all
@@ -133,10 +127,7 @@ class IntentPromptBuilder {
             appendLine("Use \"conversation\" for anything that is not a request to act.")
             appendLine()
             appendLine("Shape:")
-            appendLine("One action:")
-            appendLine(SCHEMA_SINGLE)
-            appendLine("More than one action:")
-            appendLine(SCHEMA_STEPS)
+            appendLine(SCHEMA)
             appendLine()
             appendLine("Rules:")
             appendLine(
@@ -150,7 +141,7 @@ class IntentPromptBuilder {
                     "something that already exists (\"update\"/\"cancel\"), marking " +
                     "something done (\"complete\"), or asking to see existing things (\"list\").",
             )
-            appendLine("- If the message names more than one action, use the second shape above, one entry per action.")
+            appendLine("- Multiple actions: use {\"steps\":[{...}]} instead of one object.")
             appendLine(
                 "- If intent is \"conversation\", put your full reply to the user in " +
                     "parameters.reply — never in parameters.message, which is only for " +
@@ -187,20 +178,8 @@ class IntentPromptBuilder {
          * example's *content* rather than its shape. Naming the fields is
          * shorter and, in this case, less misleading.
          */
-        val SCHEMA_SINGLE = """
+        val SCHEMA = """
             {"intent":"...","action_type":"create|update|cancel|complete|list","parameters":{"person":"","raw_when":"","message":"","title":"","description":"","email":"","phone":"","priority":"","duration":"","period":"","reply":""}}
-        """.trimIndent()
-
-        /**
-         * Structural placeholders only, deliberately not each step's full
-         * field list — that would visually dwarf [SCHEMA_SINGLE] and risk
-         * steering the model right back toward the single-object shape it
-         * already over-favors (Day 09). The array-of-objects shape is the
-         * only thing this needs to convey; a step's actual fields are
-         * exactly [SCHEMA_SINGLE]'s `parameters`, already shown above.
-         */
-        val SCHEMA_STEPS = """
-            {"steps":[{...},{...}]}
         """.trimIndent()
     }
 }

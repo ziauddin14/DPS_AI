@@ -195,6 +195,8 @@ class ClarificationEngine {
                 else -> "Who should I email, and what should it say?"
             }
 
+            IntentType.CALL_CONTACT -> "Who would you like to call?"
+
             IntentType.TASK -> "What should the task be?"
             IntentType.WORK_LOG -> "What did you work on, or for how long?"
             IntentType.MEETING_NOTE -> "What should I note about the meeting?"

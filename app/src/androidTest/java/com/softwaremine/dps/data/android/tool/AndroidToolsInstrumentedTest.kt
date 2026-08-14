@@ -21,6 +21,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -244,19 +245,146 @@ class AndroidToolsInstrumentedTest {
     }
 
     /**
-     * `update_event`/`delete_event` were added in Day 05 Phase E Stage 2 —
-     * this test used to assert they were `Unsupported`, which stopped being
-     * true the moment `AndroidCalendarTool` implemented them. Listing remains
-     * genuinely unsupported (nothing in this product enumerates events), so
-     * that is what this now checks instead.
+     * `update_event`/`delete_event` were added in Day 05 Phase E Stage 2;
+     * `list_events` in Phase 5 (Calendar Find/List) — this test used to
+     * assert listing was `Unsupported`, which stopped being true the moment
+     * `AndroidCalendarTool` implemented it. A bare call with no arguments
+     * must not crash or fabricate anything, whatever this device's calendar
+     * permission state — it degrades to "upcoming from now", or asks for
+     * permission, but never throws. Goes through the real executor (not the
+     * tool directly) so the permission gate is exercised honestly, exactly
+     * like [calendarCreateEitherRequestsPermissionOrReallyCreatesTheEvent].
      */
     @Test
-    fun calendarListingRemainsUnsupported(): Unit = runBlocking {
-        val tool = container().toolRegistry.find(ToolId.CALENDAR)!!
+    fun calendarListingIsNowSupported(): Unit = runBlocking {
+        val result = container().toolExecutor.execute(ToolCall(ToolId.CALENDAR, "list_events"))
 
-        val result = tool.execute(ToolCall(ToolId.CALENDAR, "list_events"))
+        assertTrue(
+            "Expected Success or PermissionRequired, got $result",
+            result is ToolResult.Success || result is ToolResult.PermissionRequired,
+        )
+    }
 
-        assertTrue(result is ToolResult.Unsupported)
+    /**
+     * A `date` that fails to parse must never crash and must never be
+     * silently treated as a specific (wrong) day — it is dropped, and
+     * listing falls back to the same "upcoming from now" default a missing
+     * `date` gets, exactly mirroring [com.softwaremine.dps.data.android.tool.AndroidWorkLogTool]'s
+     * own established "widen rather than invent" rule for its own `date`
+     * filter.
+     */
+    @Test
+    fun calendarListingIgnoresAnUnparseableDateRatherThanCrashingOrGuessing(): Unit = runBlocking {
+        val result = container().toolExecutor.execute(
+            ToolCall(ToolId.CALENDAR, "list_events", mapOf("date" to "not-a-date")),
+        )
+
+        assertTrue(
+            "Expected Success or PermissionRequired, got $result",
+            result is ToolResult.Success || result is ToolResult.PermissionRequired,
+        )
+    }
+
+    /**
+     * A date range with genuinely nothing in it (far future, essentially
+     * guaranteed empty on any real device) must return a clean, typed empty
+     * result — never a fabricated event, never a crash, never a `Failure`.
+     */
+    @Test
+    fun calendarListingHandlesAnEmptyDayCleanly(): Unit = runBlocking {
+        val result = container().toolExecutor.execute(
+            ToolCall(ToolId.CALENDAR, "list_events", mapOf("date" to FAR_FUTURE_EMPTY_TEST_DATE)),
+        )
+
+        when (result) {
+            is ToolResult.Success -> assertEquals("0", result.data["count"])
+            is ToolResult.PermissionRequired -> Unit // legitimate; covered elsewhere
+            else -> fail("Expected Success or PermissionRequired, got $result")
+        }
+    }
+
+    /**
+     * The real end-to-end proof: create two controlled events on one known
+     * test day via the existing real `create_event` path, list that day,
+     * and confirm both — and only both — are returned, correctly ordered by
+     * start time. Cleans up both events in `finally` regardless of outcome,
+     * so nothing real is left behind on the device either way.
+     *
+     * Also exercises the "no date" default path for free: since both events
+     * are scheduled comfortably in the future relative to "now", a
+     * `list_events` call with no `date` at all must surface them too.
+     */
+    @Test
+    fun calendarListingFindsControlledEventsForASpecificDateThenCleansUp(): Unit = runBlocking {
+        val executor = container().toolExecutor
+        val zone = java.time.ZoneId.systemDefault()
+        val testDate = java.time.LocalDate.now(zone).plusDays(CALENDAR_LIST_TEST_DAY_OFFSET)
+        val earlyStart = testDate.atTime(9, 0).atZone(zone).toInstant().toEpochMilli()
+        val lateStart = testDate.atTime(15, 0).atZone(zone).toInstant().toEpochMilli()
+
+        val createdIds = mutableListOf<Long>()
+        try {
+            val first = executor.execute(
+                ToolCall(
+                    ToolId.CALENDAR,
+                    "create_event",
+                    mapOf(
+                        "title" to CALENDAR_LIST_TEST_TITLE_EARLY,
+                        "start" to earlyStart.toString(),
+                        "end" to (earlyStart + 3_600_000).toString(),
+                    ),
+                ),
+            )
+            val second = executor.execute(
+                ToolCall(
+                    ToolId.CALENDAR,
+                    "create_event",
+                    mapOf(
+                        "title" to CALENDAR_LIST_TEST_TITLE_LATE,
+                        "start" to lateStart.toString(),
+                        "end" to (lateStart + 3_600_000).toString(),
+                    ),
+                ),
+            )
+
+            if (first !is ToolResult.Success || second !is ToolResult.Success) {
+                // No writable calendar / no permission on this run — covered
+                // by calendarCreateEitherRequestsPermissionOrReallyCreatesTheEvent.
+                return@runBlocking
+            }
+            createdIds += first.data["event_id"]!!.toLong()
+            createdIds += second.data["event_id"]!!.toLong()
+
+            val dateIso = testDate.format(java.time.format.DateTimeFormatter.ISO_LOCAL_DATE)
+            val listed = executor.execute(ToolCall(ToolId.CALENDAR, "list_events", mapOf("date" to dateIso)))
+            assertTrue("Expected Success, got $listed", listed is ToolResult.Success)
+            val data = (listed as ToolResult.Success).data
+            assertEquals("2", data["count"])
+
+            val titles = listOf(data["event_0_title"], data["event_1_title"])
+            assertTrue(
+                "Both controlled events must be present and correctly ordered by start time: $data",
+                titles == listOf(CALENDAR_LIST_TEST_TITLE_EARLY, CALENDAR_LIST_TEST_TITLE_LATE),
+            )
+            val ids = listOf(data["event_0_id"], data["event_1_id"])
+            assertEquals(createdIds.map { it.toString() }, ids)
+
+            // The "no date" default path, using the same real fixtures —
+            // both events are upcoming from "now", so they must appear here too.
+            val upcoming = executor.execute(ToolCall(ToolId.CALENDAR, "list_events"))
+            assertTrue("Expected Success, got $upcoming", upcoming is ToolResult.Success)
+            val upcomingIds = (upcoming as ToolResult.Success).data.values.toSet()
+            createdIds.forEach { id ->
+                assertTrue(
+                    "Event $id must appear in the default upcoming-from-now listing",
+                    upcomingIds.contains(id.toString()),
+                )
+            }
+        } finally {
+            createdIds.forEach { id ->
+                executor.execute(ToolCall(ToolId.CALENDAR, "delete_event", mapOf("id" to id.toString())))
+            }
+        }
     }
 
     /** Calling update/delete with no `id` argument fails cleanly rather than crashing or guessing an event. */
@@ -523,5 +651,13 @@ class AndroidToolsInstrumentedTest {
     private companion object {
         const val TEST_NOTIFICATION_ID = 987001
         const val CALENDAR_TEST_TITLE = "DPS Phase B test event"
+
+        /** Essentially guaranteed to have nothing scheduled on any real test device. */
+        const val FAR_FUTURE_EMPTY_TEST_DATE = "2099-01-01"
+
+        /** A few days out — far enough that it can't collide with "today"'s real events. */
+        const val CALENDAR_LIST_TEST_DAY_OFFSET = 5L
+        const val CALENDAR_LIST_TEST_TITLE_EARLY = "DPS Phase 5 list test (early)"
+        const val CALENDAR_LIST_TEST_TITLE_LATE = "DPS Phase 5 list test (late)"
     }
 }

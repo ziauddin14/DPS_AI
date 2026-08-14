@@ -43,6 +43,7 @@ import com.softwaremine.dps.data.android.reminder.ReminderScheduler
 import com.softwaremine.dps.data.android.reminder.ReminderStore
 import com.softwaremine.dps.data.android.tool.AndroidActionItemTool
 import com.softwaremine.dps.data.android.tool.AndroidCalendarTool
+import com.softwaremine.dps.data.android.tool.AndroidCallTool
 import com.softwaremine.dps.data.android.tool.AndroidContactsTool
 import com.softwaremine.dps.data.android.tool.AndroidMeetingNoteTool
 import com.softwaremine.dps.data.android.tool.AndroidNotificationTool
@@ -311,6 +312,9 @@ class AiContainer(private val applicationContext: Context) {
                     AndroidContactsTool(contactRepository, contactResolver),
                     PrepareWhatsAppMessageTool(contactRepository, contactResolver, intentLauncher),
                     PrepareEmailTool(contactRepository, contactResolver, intentLauncher),
+                    // Contacts + Calling milestone â€” same resolver and launcher again;
+                    // ACTION_DIAL only, never ACTION_CALL. See AndroidCallTool's doc.
+                    AndroidCallTool(contactRepository, contactResolver, intentLauncher),
                     // Day 06 â€” productivity secretary
                     AndroidTaskTool(taskStore),
                     AndroidWorkLogTool(workLogStore),

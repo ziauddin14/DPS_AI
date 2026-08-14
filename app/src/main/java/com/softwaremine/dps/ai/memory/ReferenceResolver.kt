@@ -75,8 +75,15 @@ class ReferenceResolver(
                 }
 
                 IntentType.CALENDAR_EVENT -> {
-                    val referencesEvent = CALENDAR_CUES.any { normalized.contains(it) } ||
-                        (targetsExisting && parameters.title == null)
+                    // The model classifying this as CALENDAR_EVENT is not by
+                    // itself evidence of what the user's words actually
+                    // named — a cue for a different remembered entity
+                    // (reminder, task) means this must stay unresolved
+                    // rather than guess against the last calendar event.
+                    val hasConflictingCue = REMINDER_CUES.any { normalized.contains(it) } ||
+                        TASK_CUES.any { normalized.contains(it) }
+                    val referencesEvent = !hasConflictingCue &&
+                        (CALENDAR_CUES.any { normalized.contains(it) } || (targetsExisting && parameters.title == null))
                     if (referencesEvent) {
                         memory.lastCalendarEvent?.let { parameters = parameters.copy(targetId = it.id.toString()) }
                     }

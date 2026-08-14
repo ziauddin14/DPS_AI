@@ -5,6 +5,7 @@ import android.content.Intent
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.softwaremine.dps.core.logging.AndroidDpsLogger
+import com.softwaremine.dps.data.android.intent.DialIntentBuilder
 import com.softwaremine.dps.data.android.intent.EmailIntentBuilder
 import com.softwaremine.dps.data.android.intent.IntentLauncher
 import com.softwaremine.dps.data.android.intent.WhatsAppIntentBuilder
@@ -70,10 +71,16 @@ class CommunicationToolsInstrumentedTest {
         assertEquals(registry.all().size, registry.all().distinctBy { it.id }.size)
     }
 
-    /** Phone remains a declaration — Phase C implements three tools, not four. */
+    /**
+     * `ToolId.PHONE` has moved from a declaration to a real implementation
+     * (Contacts + Calling milestone) — the same transition WhatsApp/Gmail
+     * already went through in Phase C. `AndroidToolCatalog.declaredTools`
+     * prefers the real implementation by id, so the placeholder in
+     * `stillUnimplemented()` is simply superseded, not removed.
+     */
     @Test
-    fun outOfScopeToolsRemainUnimplemented() {
-        assertTrue(container().toolRegistry.find(ToolId.PHONE) is UnimplementedTool)
+    fun phoneIsNowARealImplementation() {
+        assertTrue(container().toolRegistry.find(ToolId.PHONE) is AndroidCallTool)
     }
 
     // -----------------------------------------------------------------
@@ -142,6 +149,23 @@ class CommunicationToolsInstrumentedTest {
         assertEquals(null, intent.getStringExtra(Intent.EXTRA_TEXT))
     }
 
+    /**
+     * `ACTION_DIAL` with a `tel:` URI — never `ACTION_CALL`. This is the one
+     * assertion that most directly protects the "never dials automatically"
+     * guarantee: if this ever changed to `ACTION_CALL`, every other test in
+     * this class would still pass while the app silently gained the ability
+     * to place real calls.
+     */
+    @Test
+    fun dialIntentIsBuiltWithTheDocumentedTelShapeAndNeverActionCall() {
+        val intent = DialIntentBuilder.build("+92 300 1234567")
+
+        assertEquals(Intent.ACTION_DIAL, intent.action)
+        assertTrue("Must never be ACTION_CALL", intent.action != Intent.ACTION_CALL)
+        assertEquals("tel", intent.data!!.scheme)
+        assertEquals("+92 300 1234567", intent.data!!.schemeSpecificPart)
+    }
+
     // -----------------------------------------------------------------
     // Intent resolution (package visibility)
     // -----------------------------------------------------------------
@@ -171,6 +195,24 @@ class CommunicationToolsInstrumentedTest {
             "whatsapp handlers=$whatsAppHandlers email handlers=$emailHandlers " +
                 "whatsappInstalled=${launcher.isPackageInstalled(WhatsAppIntentBuilder.PACKAGE_NAME)}",
         )
+    }
+
+    /**
+     * Mechanical verification only, matching this class's own documented
+     * boundary — resolution is checked, `launch()` never is. The `<queries>`
+     * `android.intent.action.DIAL`/`tel` declaration this test depends on is
+     * what lets this see anything at all under targetSdk 35's package
+     * visibility filtering; every real Android device ships a dialer that
+     * answers `ACTION_DIAL`, so a non-empty result here is the meaningful
+     * outcome, not merely "did not throw".
+     */
+    @Test
+    fun dialIntentResolvesToARealDialerOnThisDevice() {
+        val handlers = launcher().resolvedPackages(DialIntentBuilder.build("923001234567"))
+
+        assertNotNull(handlers)
+        android.util.Log.i("DPS/Calling", "dial handlers=$handlers")
+        assertTrue("Expected a real dialer app to resolve ACTION_DIAL on this device", handlers.isNotEmpty())
     }
 
     @Test
@@ -318,6 +360,37 @@ class CommunicationToolsInstrumentedTest {
         assertTrue(tool.supports("send_email"))
     }
 
+    @Test
+    fun callRequiresARecipient(): Unit = runBlocking {
+        val tool = container().toolRegistry.find(ToolId.PHONE)!!
+
+        val result = tool.execute(ToolCall(ToolId.PHONE, "place_call", emptyMap()))
+
+        assertTrue(result is ToolResult.Failure)
+        assertTrue((result as ToolResult.Failure).reason.contains("contact"))
+    }
+
+    @Test
+    fun callRejectsAnUnusablePhoneNumber(): Unit = runBlocking {
+        val tool = container().toolRegistry.find(ToolId.PHONE)!!
+
+        val result = tool.execute(
+            ToolCall(ToolId.PHONE, "place_call", mapOf("phone" to "123")),
+        )
+
+        assertTrue("Expected Failure, got $result", result is ToolResult.Failure)
+        assertTrue((result as ToolResult.Failure).reason.contains("not a usable phone number"))
+    }
+
+    @Test
+    fun callAcceptsOnlyThePlaceCallOperation() {
+        val tool = container().toolRegistry.find(ToolId.PHONE)!!
+
+        assertTrue(tool.supports("place_call"))
+        assertTrue("Must expose no operation that dials on its own", !tool.supports("call"))
+        assertTrue(!tool.supports("dial"))
+    }
+
     /**
      * The confirmation contract, asserted structurally.
      *
@@ -329,12 +402,21 @@ class CommunicationToolsInstrumentedTest {
     fun neitherCommunicationToolCanDeliverWithoutTheUser() {
         val whatsApp = container().toolRegistry.find(ToolId.WHATSAPP)!!
         val email = container().toolRegistry.find(ToolId.GMAIL)!!
+        val call = container().toolRegistry.find(ToolId.PHONE)!!
 
         assertEquals(setOf("prepare_message", "send_message"), whatsApp.operations)
         assertEquals(setOf("compose_email", "send_email"), email.operations)
+        assertEquals(setOf("place_call"), call.operations)
 
-        // Both require contacts access and nothing that would permit sending.
+        // All three require contacts access and nothing that would permit
+        // completing the action on the user's behalf — in particular, no
+        // CALL_PHONE, which is what ACTION_CALL (never used here) would need.
         assertEquals(setOf(DpsPermission.READ_CONTACTS), whatsApp.requiredPermissions)
         assertEquals(setOf(DpsPermission.READ_CONTACTS), email.requiredPermissions)
+        assertEquals(setOf(DpsPermission.READ_CONTACTS), call.requiredPermissions)
+        assertTrue(
+            "AndroidCallTool must never declare CALL_PHONE",
+            DpsPermission.CALL_PHONE !in call.requiredPermissions,
+        )
     }
 }

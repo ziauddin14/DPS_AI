@@ -154,3 +154,35 @@ object EmailIntentBuilder {
     /** `a@b.co` is the shortest realistic address. */
     private const val MIN_ADDRESS_LENGTH = 6
 }
+
+/**
+ * Builds an Intent that opens the system dialer. **Never dials.**
+ *
+ * ## `ACTION_DIAL`, never `ACTION_CALL` — stated plainly
+ * `ACTION_DIAL` opens the dialer app with the number pre-filled; the user
+ * still has to press the call button themselves. `ACTION_CALL` places the
+ * call immediately and requires the dangerous `CALL_PHONE` runtime
+ * permission. This codebase deliberately has no code path that places a
+ * call — the same "the user presses the final button" guarantee
+ * [WhatsAppIntentBuilder] and [EmailIntentBuilder] already give, and for the
+ * same reason: a call placed on someone's behalf cannot be recalled.
+ *
+ * ## Number format
+ * Passed through mostly as-is — `tel:` URIs conventionally accept `+`,
+ * spaces, hyphens and parentheses, unlike `wa.me`'s digits-only requirement.
+ * [Uri.encode] only protects the URI's own syntax; it does not alter the
+ * number a user or contact record actually has.
+ *
+ * ## Dependencies
+ * `android.content.Intent`, `android.net.Uri`.
+ */
+object DialIntentBuilder {
+
+    /**
+     * Builds an Intent opening the dialer with [phoneNumber] pre-filled.
+     *
+     * Nothing is dialed. The dialer opens and the user presses call.
+     */
+    fun build(phoneNumber: String): Intent =
+        Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phoneNumber.trim())}"))
+}
