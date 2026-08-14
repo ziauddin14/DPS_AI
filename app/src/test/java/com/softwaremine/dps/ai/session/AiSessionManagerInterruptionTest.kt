@@ -10,6 +10,10 @@ import com.softwaremine.dps.ai.intent.ToolSelector
 import com.softwaremine.dps.ai.memory.ActionDetector
 import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
 import com.softwaremine.dps.ai.memory.ReferenceResolver
+import com.softwaremine.dps.ai.memory.TemporalGroundingGuard
+import com.softwaremine.dps.ai.memory.TemporalPhraseSpanFinder
+import com.softwaremine.dps.ai.memory.TemporalStepAttributor
+import com.softwaremine.dps.ai.memory.TemporalPhraseResolver
 import com.softwaremine.dps.ai.plan.ConfirmationParser
 import com.softwaremine.dps.ai.plan.ContactSelectionParser
 import com.softwaremine.dps.ai.plan.FollowUpSuggestionGenerator
@@ -167,6 +171,9 @@ class AiSessionManagerInterruptionTest {
         val secretaryOrchestrator = SecretaryOrchestrator(
             toolOrchestrator = toolOrchestrator,
             referenceResolver = ReferenceResolver(zone = zone),
+            temporalPhraseResolver = TemporalPhraseResolver(zone = zone),
+            temporalGroundingGuard = TemporalGroundingGuard(),
+            temporalStepAttributor = TemporalStepAttributor(TemporalPhraseSpanFinder(), TemporalGroundingGuard()),
             actionDetector = ActionDetector(),
             clarification = ClarificationEngine(),
             memoryUpdater = ConversationMemoryUpdater(zone = zone),

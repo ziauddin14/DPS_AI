@@ -2,9 +2,9 @@ package com.softwaremine.dps.ai.intent
 
 import com.softwaremine.dps.domain.intent.IntentField
 import com.softwaremine.dps.domain.intent.IntentType
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.time.LocalDateTime
 
 /**
  * Verification of the intent classification prompt (Day 05 Phase D).
@@ -19,13 +19,19 @@ import java.time.LocalDateTime
  * Prompt ingestion is 76% of inference cost on this hardware
  * (`docs/PERFORMANCE-DAY-04.md`) and scales with length. The bound at the bottom
  * is not stylistic: growth here is paid for on every message the user sends.
+ *
+ * ## Why there is no fixed clock here anymore (Day 08-E)
+ * Every earlier version of this file constructed [IntentPromptBuilder] with an
+ * injected `now`. That parameter — and `Now:` itself — is gone: see
+ * [IntentPromptBuilder]'s class doc for why asking the model to compute a date
+ * or time was the actual defect Day 08-D traced, not where `Now:` sat in the
+ * prompt. [com.softwaremine.dps.ai.memory.TemporalPhraseResolver] owns that
+ * arithmetic now, entirely outside this class, and has its own fixed-clock
+ * tests. This class has nothing time-dependent left to inject.
  */
 class IntentPromptBuilderTest {
 
-    /** Thursday 6 August 2026, 14:30. */
-    private val fixedNow = LocalDateTime.of(2026, 8, 6, 14, 30)
-
-    private val builder = IntentPromptBuilder(now = { fixedNow })
+    private val builder = IntentPromptBuilder()
 
     // -----------------------------------------------------------------
     // The contract with the parser
@@ -43,11 +49,20 @@ class IntentPromptBuilderTest {
         }
     }
 
+    /**
+     * `date`/`time` are deliberately excluded here (Day 08-E) — they are
+     * still real [IntentField] entries used to gate clarification, but the
+     * model is never asked to fill them; see
+     * [com.softwaremine.dps.ai.intent.IntentJsonParser.toParameters]'s doc
+     * for why they are not even read from the model's JSON if it emits
+     * them anyway. Everything else the parser reads directly must still be
+     * named.
+     */
     @Test
-    fun `every field the parser reads is named in the schema`() {
+    fun `every field the parser reads directly is named in the schema`() {
         val prompt = builder.build("anything")
 
-        IntentField.entries.forEach { field ->
+        (IntentField.entries - IntentField.DATE - IntentField.TIME).forEach { field ->
             assertTrue(
                 "Prompt never names '${field.displayName}', so it will rarely be extracted",
                 prompt.contains(field.displayName),
@@ -65,29 +80,38 @@ class IntentPromptBuilderTest {
     }
 
     // -----------------------------------------------------------------
-    // Grounding in time
+    // No date/time arithmetic asked of the model (Day 08-E)
     // -----------------------------------------------------------------
 
     /**
-     * The model cannot know the date. Without it, "tomorrow at 4" cannot be
-     * resolved — and [ToolSelector] deliberately refuses to guess at relative
-     * expressions, so this is the only place that information enters.
+     * The regression this whole redesign exists to prevent: `Now:` must
+     * never reappear in this prompt, in any position. See
+     * [IntentPromptBuilder]'s class doc for the Day 08-D history.
      */
     @Test
-    fun `the current date, time and weekday are injected`() {
+    fun `Now is never injected into the prompt`() {
         val prompt = builder.build("remind me tomorrow at 4")
 
-        assertTrue("Missing date: $prompt", prompt.contains("2026-08-06"))
-        assertTrue("Missing time: $prompt", prompt.contains("14:30"))
-        assertTrue("Missing weekday: $prompt", prompt.contains("Thursday"))
+        assertTrue("'Now:' must never appear in the classification prompt", !prompt.contains("Now:"))
     }
 
+    /** The schema offers a quote field, not fields the model would have to compute. */
     @Test
-    fun `the model is told which formats to emit`() {
+    fun `the schema asks for raw_when instead of date or time`() {
         val prompt = builder.build("anything")
 
-        assertTrue(prompt.contains("YYYY-MM-DD"))
-        assertTrue(prompt.contains("HH:MM"))
+        assertTrue("Schema is missing 'raw_when'", prompt.contains("raw_when"))
+        assertTrue("Schema must not ask the model for a 'date' key", !prompt.contains("\"date\":"))
+        assertTrue("Schema must not ask the model for a 'time' key", !prompt.contains("\"time\":"))
+    }
+
+    /** The model is told what to do with raw_when: quote, never compute. */
+    @Test
+    fun `the model is told to quote raw_when verbatim, never compute it`() {
+        val prompt = builder.build("anything").lowercase()
+
+        assertTrue(prompt.contains("raw_when"))
+        assertTrue("Rule must forbid computing a date/time", prompt.contains("never compute"))
     }
 
     @Test
@@ -97,6 +121,44 @@ class IntentPromptBuilderTest {
         // The counterpart of the clarification flow: a model that invents a time
         // means the user is never asked for the right one.
         assertTrue(prompt.lowercase().contains("never invent"))
+    }
+
+    // -----------------------------------------------------------------
+    // Prompt stability — the whole point of removing Now: (Day 08-E)
+    // -----------------------------------------------------------------
+
+    /**
+     * With no injected clock left anywhere in this class, the prompt for a
+     * given [userMessage] is now **byte-for-byte deterministic** — not just
+     * "shares a long prefix", the way the (now-rejected) Day 08-D version
+     * could only claim. Two builds of the same message, however far apart
+     * in real time, must be identical.
+     */
+    @Test
+    fun `the same message always produces the exact same prompt`() {
+        val first = builder.build("remind me to call the bank at 4")
+        val second = builder.build("remind me to call the bank at 4")
+
+        assertEquals(first, second)
+    }
+
+    /**
+     * Two different messages still share the entire static block — the
+     * whole prompt except the message itself (and the optional
+     * pendingQuestion/recentContext blocks, which are absent here) — as one
+     * unbroken, byte-identical prefix ending exactly at "User: ".
+     */
+    @Test
+    fun `two different messages share the entire static prefix up to User`() {
+        val first = builder.build("remind me to call the bank at 4")
+        val second = builder.build("what's the weather like tomorrow")
+
+        val marker = "User: "
+        val firstPrefix = first.substring(0, first.indexOf(marker) + marker.length)
+        val secondPrefix = second.substring(0, second.indexOf(marker) + marker.length)
+
+        assertEquals(firstPrefix, secondPrefix)
+        assertTrue(firstPrefix.length > 700)
     }
 
     // -----------------------------------------------------------------
@@ -131,112 +193,6 @@ class IntentPromptBuilderTest {
     }
 
     // -----------------------------------------------------------------
-    // KV-cache prefix stability (Day 08-D)
-    //
-    // The instruction/intent-list/schema/rules block never changes for the
-    // life of a loaded model — only the caller's arguments do. Everything
-    // in this section proves that block is a genuine, stable string
-    // prefix, so LlamaCppRuntimeProvider's cache-reuse (Day 08-A) has real
-    // work to reuse rather than losing it to "Now:" sitting near the top,
-    // as it did before Day 08-D.
-    // -----------------------------------------------------------------
-
-    @Test
-    fun `Now no longer sits before the static instruction block`() {
-        val prompt = builder.build("anything")
-
-        val nowAt = prompt.indexOf("Now:")
-        val shapeAt = prompt.indexOf("Shape:")
-        val rulesAt = prompt.indexOf("Rules:")
-
-        assertTrue("Now: missing from the prompt", nowAt >= 0)
-        assertTrue("Now: must come after Shape:, not before it", nowAt > shapeAt)
-        assertTrue("Now: must come after Rules:, not before it", nowAt > rulesAt)
-    }
-
-    @Test
-    fun `two prompts differing only in timestamp share an identical static prefix`() {
-        val morning = IntentPromptBuilder(now = { LocalDateTime.of(2026, 8, 6, 9, 0) })
-            .build("remind me to call the bank at 4")
-        val night = IntentPromptBuilder(now = { LocalDateTime.of(2026, 8, 9, 23, 45) })
-            .build("remind me to call the bank at 4")
-
-        val sharedPrefix = commonPrefix(morning, night)
-
-        // The static block (instruction, intent list, conversation rule,
-        // schema, all five rules) is comfortably over 900 characters; a
-        // shared prefix that long can only be that block, not coincidence.
-        // It legitimately includes the literal "Now: " label — that text
-        // is identical in both; only the date/time *value* after it (and
-        // the weekday, chosen deliberately to differ here too) diverges,
-        // which is exactly where a real common-prefix comparison should stop.
-        assertTrue(
-            "Expected a long shared prefix across different timestamps, got ${sharedPrefix.length} chars",
-            sharedPrefix.length > 900,
-        )
-        assertTrue(
-            "Shared prefix must not reach the differing date/time value itself",
-            !sharedPrefix.contains("2026-08-06") && !sharedPrefix.contains("2026-08-09"),
-        )
-        assertTrue("Shared prefix should reach through the rules", sharedPrefix.contains("Rules:"))
-        assertTrue(
-            "Shared prefix should reach the reply-shortcut rule (Day 08-B)",
-            sharedPrefix.contains("parameters.reply"),
-        )
-    }
-
-    @Test
-    fun `two prompts differing only in the user's message share the same static prefix`() {
-        val first = builder.build("remind me to call the bank at 4")
-        val second = builder.build("what's the weather like tomorrow")
-
-        val sharedPrefix = commonPrefix(first, second)
-
-        assertTrue(
-            "Expected a long shared prefix across different messages, got ${sharedPrefix.length} chars",
-            sharedPrefix.length > 900,
-        )
-        assertTrue(!sharedPrefix.contains("call the bank"))
-        assertTrue(!sharedPrefix.contains("weather"))
-    }
-
-    @Test
-    fun `a different timestamp and a different message together still share the static prefix`() {
-        val first = IntentPromptBuilder(now = { LocalDateTime.of(2026, 8, 6, 9, 0) })
-            .build("remind me to call the bank at 4")
-        val second = IntentPromptBuilder(now = { LocalDateTime.of(2026, 8, 9, 23, 45) })
-            .build("what's the weather like tomorrow")
-
-        val sharedPrefix = commonPrefix(first, second)
-
-        assertTrue(
-            "Expected a long shared prefix even with both timestamp and message varying, got ${sharedPrefix.length} chars",
-            sharedPrefix.length > 900,
-        )
-    }
-
-    @Test
-    fun `Now still appears immediately beside the user's message it resolves relative times for`() {
-        val prompt = builder.build("remind me tomorrow at 4")
-
-        val nowAt = prompt.indexOf("Now:")
-        val userAt = prompt.indexOf("User:")
-        assertTrue("Now: missing", nowAt >= 0)
-        assertTrue("User: missing", userAt >= 0)
-        // Only a single line (the blank separator) should sit between them.
-        val between = prompt.substring(nowAt, userAt)
-        assertTrue(
-            "Now: and User: should be adjacent, found: ${between.length} chars between them: '$between'",
-            between.count { it == '\n' } <= 2,
-        )
-    }
-
-    private fun commonPrefix(a: String, b: String): String {
-        val length = a.indices.firstOrNull { it >= b.length || a[it] != b[it] } ?: minOf(a.length, b.length)
-        return a.substring(0, length)
-    }
-
-    // -----------------------------------------------------------------
     // Cost
     // -----------------------------------------------------------------
 
@@ -250,19 +206,28 @@ class IntentPromptBuilderTest {
         // (Phase E Stage 2, the steps-array rule) → 1050 (Day 06: five new
         // routable intent types, the complete/list actions, and the
         // duration/period fields the productivity secretary needs) → 1250 →
-        // 1320 (Day 08-B: a `reply` field and rule telling the model to put
-        // a conversational answer there when intent is "conversation" — a
-        // dedicated key rather than reusing `message`, after an on-device
-        // measurement showed the model echoing the user's own words back
-        // when the two shared a key. The whole point of this addition is to
-        // let this same pass answer instead of paying for a second, separate
-        // generation, so this is the one case where a slightly larger prompt
-        // buys back far more than it costs) — each move is one deliberate,
-        // named addition, not drift; a regression here should still fail
-        // loudly.
+        // 1320 (Day 08-B: the `reply` field) → 1400 (Day 08-E: `Now:` and the
+        // `date`/`time` schema keys are gone, but the new raw_when rule —
+        // spelling out three example phrases and an explicit "never
+        // compute" — is longer than the "resolve relative times against
+        // Now" line it replaced, so the net change is a small *increase*,
+        // not the decrease a naive count of removed characters would
+        // suggest. Worth paying: the removed `Now:` line was dynamic on
+        // every call and defeated KV-cache reuse entirely, while this
+        // slightly larger prompt is now byte-identical on every call —
+        // each move is one deliberate, named change, not drift; a
+        // regression here should still fail loudly. → 1500 (Day 09: the
+        // model never once produced a `steps` array across 30 real compound
+        // requests when it was named only in a `Rules:` bullet — `Shape:`
+        // now shows the single-object and steps-array forms as equally
+        // prominent, schema-only entries, still with no field-value example,
+        // so this is width the model needs, not drift). This whole block is
+        // still fully static across every call, so the growth is a one-time
+        // recache cost, not a per-request one — see IntentPromptBuilder's
+        // class doc.
         assertTrue(
             "Classification prompt has grown to ${prompt.length} characters",
-            prompt.length < 1320,
+            prompt.length < 1500,
         )
     }
 

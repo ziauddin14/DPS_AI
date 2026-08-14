@@ -5,6 +5,9 @@ import com.softwaremine.dps.ai.intent.ToolOrchestrator
 import com.softwaremine.dps.ai.memory.ActionDetector
 import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
 import com.softwaremine.dps.ai.memory.ReferenceResolver
+import com.softwaremine.dps.ai.memory.TemporalGroundingGuard
+import com.softwaremine.dps.ai.memory.TemporalPhraseResolver
+import com.softwaremine.dps.ai.memory.TemporalStepAttributor
 import com.softwaremine.dps.ai.plan.Confirmation
 import com.softwaremine.dps.ai.plan.ConfirmationParser
 import com.softwaremine.dps.ai.plan.ContactSelectionParser
@@ -70,6 +73,9 @@ import java.time.format.DateTimeFormatter
 class SecretaryOrchestrator(
     private val toolOrchestrator: ToolOrchestrator,
     private val referenceResolver: ReferenceResolver,
+    private val temporalPhraseResolver: TemporalPhraseResolver,
+    private val temporalGroundingGuard: TemporalGroundingGuard,
+    private val temporalStepAttributor: TemporalStepAttributor,
     private val actionDetector: ActionDetector,
     private val clarification: ClarificationEngine,
     private val memoryUpdater: ConversationMemoryUpdater,
@@ -141,7 +147,7 @@ class SecretaryOrchestrator(
             // A compound request discards any earlier pending question — it is
             // a fresh, self-contained instruction, not an answer to one.
             pendingClarification = null
-            return handlePlan(steps)
+            return handlePlan(userMessage, steps)
         }
 
         return handleSingleStep(userMessage, steps.single(), awaiting)
@@ -182,11 +188,12 @@ class SecretaryOrchestrator(
 
         // The enrichment seam Phase D had no room for: correct the action the
         // model guessed, then fill any gap a reference to memory can answer.
-        val enriched = referenceResolver.resolve(
+        val referenced = referenceResolver.resolve(
             rawText = userMessage,
             intent = resolved.copy(action = actionDetector.detect(userMessage, resolved.action)),
             memory = _memory.value,
         )
+        val enriched = withResolvedTemporalPhrase(userMessage, referenced)
 
         return when (val check = clarification.check(enriched)) {
             is ClarificationEngine.Check.Missing -> {
@@ -310,14 +317,42 @@ class SecretaryOrchestrator(
      * message is not yet parsed; asking for it as a follow-up message still
      * works, via [ReferenceResolver]'s existing single-turn path.
      */
-    private suspend fun handlePlan(steps: List<DpsIntent>): ToolOrchestrator.Outcome {
+    private suspend fun handlePlan(userMessage: String, steps: List<DpsIntent>): ToolOrchestrator.Outcome {
         val replies = mutableListOf<String>()
         var lastResult: ToolResult = ToolResult.Cancelled("No steps were run.")
         var lastIntent: DpsIntent = steps.first()
         var lastEventStartMillis: Long? = null
 
-        for (raw in steps) {
-            val step = anchorToPriorEvent(raw, lastEventStartMillis)
+        // Day 08-E follow-up: a whole-message grounding check (what
+        // withResolvedTemporalPhrase uses for single-step) was proven, by a
+        // JVM regression test, to accept a hallucinated raw_when on one step
+        // merely because a *different* step of the same compound message
+        // genuinely said those words — e.g. "kal shaam 7 baje reminder laga
+        // do aur milk ka task bana do" could let the "milk" step inherit the
+        // reminder step's real phrase. temporalStepAttributor closes this:
+        // it locates every genuine temporal phrase in the message via
+        // TemporalPhraseSpanFinder (delegating to temporalPhraseResolver's
+        // own vocabulary, never duplicating it) and lets each one be claimed
+        // by at most one step, in classification order. A step whose
+        // raw_when matches no still-unclaimed occurrence has it discarded —
+        // including a step that shares a *genuine* phrase with an earlier
+        // step ("kal shaam 7 baje reminder... aur kal shaam 7 baje doosra
+        // reminder..." legitimately said twice is the one case this would
+        // reject that a smarter model deserves; deliberately conservative,
+        // see TemporalStepAttributor's own doc). Steps are already scoped
+        // this way before the loop, so per-step resolution below only ever
+        // resolves what attribution already confirmed.
+        val attributedSteps = temporalStepAttributor.attribute(userMessage, steps)
+
+        for (raw in attributedSteps) {
+            // Unlike ReferenceResolver/ActionDetector (deliberately skipped
+            // per-step above — they scan the *raw text*, and a compound
+            // message's raw text does not belong to any one step),
+            // resolveTemporalPhrase only resolves what attribution above
+            // already confirmed belongs to this step — safe to run per step,
+            // and must run before anchorToPriorEvent so that fallback only
+            // ever fires when nothing else resolved anything.
+            val step = anchorToPriorEvent(resolveTemporalPhrase(raw), lastEventStartMillis)
 
             when (val check = clarification.check(step)) {
                 is ClarificationEngine.Check.Missing -> {
@@ -363,6 +398,66 @@ class SecretaryOrchestrator(
 
     private fun prefixed(completedReplies: List<String>, next: String): String =
         if (completedReplies.isEmpty()) next else "${completedReplies.joinToString(" ")} $next"
+
+    /**
+     * Fills `date`/`time` from [DpsIntent.parameters]' `rawWhen` — the
+     * model's verbatim quote — via [temporalPhraseResolver] (Day 08-E).
+     *
+     * Only fires when **both** are still absent, so it never overwrites a
+     * value [ReferenceResolver]'s relative-offset logic already wrote (e.g.
+     * "30 minute pehle kar do" on an existing reminder) or that a prior step
+     * in a plan already resolved — the same "new values win only where
+     * present" discipline [ClarificationEngine.merge] already follows.
+     * Leaves both `null` when [TemporalPhraseResolver] does not recognise
+     * the phrase, which is exactly what [ClarificationEngine] needs to ask
+     * a follow-up instead of anything being invented.
+     *
+     * ## The grounding check (Day 08-E follow-up)
+     * Real-device testing found the classification model reliably producing
+     * a plausible-looking `raw_when` — "kal shaam 7 baje" — for messages
+     * that never mentioned a time at all, reproduced with a fresh model
+     * reload and zero session history, which rules out cache/session
+     * contamination: it is a genuine, ungrounded extraction. Every
+     * `raw_when` is checked against [rawText] via [temporalGroundingGuard]
+     * *before* [temporalPhraseResolver] ever sees it — an ungrounded quote
+     * is discarded (including from [intent.parameters][DpsIntent.parameters]
+     * itself, so it cannot resurface later) rather than resolved, exactly
+     * the same "never invent" discipline [TemporalPhraseResolver] itself
+     * already follows for a phrase it cannot parse.
+     *
+     * Single-step only — [handlePlan] uses [temporalStepAttributor] instead,
+     * a stricter, per-occurrence check whole-message grounding cannot
+     * provide (see that class's doc for why).
+     */
+    private fun withResolvedTemporalPhrase(rawText: String, intent: DpsIntent): DpsIntent {
+        val parameters = intent.parameters
+        if (parameters.value(IntentField.DATE) != null || parameters.value(IntentField.TIME) != null) return intent
+        val rawWhen = parameters.rawWhen?.trim()?.takeIf { it.isNotEmpty() } ?: return intent
+
+        if (!temporalGroundingGuard.isGrounded(rawText, rawWhen)) {
+            logger.i(TAG, "Discarding an ungrounded raw_when (\"$rawWhen\" not found in the user's own message)")
+            return intent.copy(parameters = parameters.copy(rawWhen = null))
+        }
+
+        return resolveTemporalPhrase(intent)
+    }
+
+    /**
+     * Resolves an already-grounded `raw_when` into `date`/`time`. No
+     * grounding check of its own — the caller ([withResolvedTemporalPhrase]
+     * for single-step, [handlePlan] for multi-step) is responsible for
+     * having already confirmed `rawWhen` before this runs.
+     */
+    private fun resolveTemporalPhrase(intent: DpsIntent): DpsIntent {
+        val parameters = intent.parameters
+        if (parameters.value(IntentField.DATE) != null || parameters.value(IntentField.TIME) != null) return intent
+        val rawWhen = parameters.rawWhen?.trim()?.takeIf { it.isNotEmpty() } ?: return intent
+
+        val resolution = temporalPhraseResolver.resolve(rawWhen)
+        if (resolution.date == null && resolution.time == null) return intent
+
+        return intent.copy(parameters = parameters.copy(date = resolution.date, time = resolution.time))
+    }
 
     /** The one deterministic cross-step rule — see [handlePlan]'s doc. */
     private fun anchorToPriorEvent(step: DpsIntent, priorEventStartMillis: Long?): DpsIntent {

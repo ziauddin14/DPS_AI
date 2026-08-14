@@ -172,10 +172,24 @@ class IntentJsonParser(
     internal fun stripCodeFences(text: String): String =
         text.replace(CODE_FENCE, "").trim()
 
+    /**
+     * ## Why `date`/`time` are never read here (Day 08-E)
+     * [IntentParameters.date]/[IntentParameters.time] are still real fields —
+     * [com.softwaremine.dps.ai.memory.TemporalPhraseResolver] fills them
+     * deterministically after classification. They are not read from the
+     * model's own JSON at all, on purpose: the Day 08-D investigation proved
+     * a 1.5B model asked to compute an absolute date/time will sometimes
+     * substitute the current time for the one the user actually stated,
+     * silently. [IntentPromptBuilder] no longer asks for `date`/`time` in the
+     * schema — but even if a model ignores that and emits them anyway (old
+     * habit, hallucination, a stale local prompt), this parser drops them on
+     * the floor. The only path by which a request reaches
+     * [com.softwaremine.dps.ai.intent.ToolSelector] with a `date`/`time` is
+     * through [TemporalPhraseResolver] reading [rawWhen] against the real
+     * clock — never through this method.
+     */
     private fun JsonObject.toParameters(): IntentParameters = IntentParameters(
         person = stringOrNull("person") ?: stringOrNull("contact") ?: stringOrNull("name"),
-        date = stringOrNull("date"),
-        time = stringOrNull("time") ?: stringOrNull("datetime"),
         // Models use all three names for a message body interchangeably.
         message = stringOrNull("message") ?: stringOrNull("body") ?: stringOrNull("text"),
         title = stringOrNull("title") ?: stringOrNull("subject") ?: stringOrNull("summary"),
@@ -188,6 +202,9 @@ class IntentJsonParser(
         // Day 08-B. A distinct key from "message" on purpose — see
         // IntentParameters.reply's doc for why the two must not collide.
         reply = stringOrNull("reply"),
+        // Day 08-E. The user's own words about "when", quoted verbatim —
+        // see IntentParameters.rawWhen's doc.
+        rawWhen = stringOrNull("raw_when") ?: stringOrNull("when"),
     )
 
     /**

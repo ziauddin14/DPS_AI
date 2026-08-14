@@ -142,6 +142,12 @@ class ClarificationEngine {
             targetId = answer.targetId ?: existing.targetId,
             duration = answer.duration ?: existing.duration,
             period = answer.period ?: existing.period,
+            // Day 08-E: a bare answer to "When should I remind you?" — e.g.
+            // just "4 baje" — carries its own rawWhen quote and nothing
+            // else. Without folding it here, that quote would be discarded
+            // before com.softwaremine.dps.ai.memory.TemporalPhraseResolver
+            // ever saw it, and the follow-up would silently fail to resolve.
+            rawWhen = answer.rawWhen ?: existing.rawWhen,
         )
 
     /**

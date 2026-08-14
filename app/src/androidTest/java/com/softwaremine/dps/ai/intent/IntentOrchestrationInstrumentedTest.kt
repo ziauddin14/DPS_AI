@@ -289,7 +289,7 @@ class IntentOrchestrationInstrumentedTest {
         listOf(
             """{"intent":"contact_lookup","parameters":{"person":"Abdul"}}""",
             """{"intent":"notification","parameters":{"message":"x"}}""",
-            """{"intent":"reminder","parameters":{"title":"x","time":"23:59"}}""",
+            """{"intent":"reminder","parameters":{"title":"x","raw_when":"23:59"}}""",
         ).forEach { classification ->
             val reply = when (val outcome = orchestrator(classification).handle("go")) {
                 is ToolOrchestrator.Outcome.Handled -> outcome.reply

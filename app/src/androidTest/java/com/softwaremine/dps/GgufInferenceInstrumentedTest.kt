@@ -12,6 +12,10 @@ import com.softwaremine.dps.ai.intent.ToolSelector
 import com.softwaremine.dps.ai.memory.ActionDetector
 import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
 import com.softwaremine.dps.ai.memory.ReferenceResolver
+import com.softwaremine.dps.ai.memory.TemporalGroundingGuard
+import com.softwaremine.dps.ai.memory.TemporalPhraseSpanFinder
+import com.softwaremine.dps.ai.memory.TemporalStepAttributor
+import com.softwaremine.dps.ai.memory.TemporalPhraseResolver
 import com.softwaremine.dps.ai.plan.ConfirmationParser
 import com.softwaremine.dps.ai.plan.ContactSelectionParser
 import com.softwaremine.dps.ai.plan.FollowUpSuggestionGenerator
@@ -19,13 +23,20 @@ import com.softwaremine.dps.ai.secretary.SecretaryOrchestrator
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.data.model.ModelCatalog
 import com.softwaremine.dps.di.AiContainer
+import com.softwaremine.dps.domain.ai.AiCompletion
+import com.softwaremine.dps.domain.ai.AiEngine
 import com.softwaremine.dps.domain.ai.AiState
 import com.softwaremine.dps.domain.ai.CompletionChunk
 import com.softwaremine.dps.domain.ai.CompletionRequest
-import com.softwaremine.dps.domain.conversation.MessageStatus
 import com.softwaremine.dps.domain.model.ModelConfig
+import com.softwaremine.dps.domain.model.ModelDescriptor
+import com.softwaremine.dps.domain.conversation.MessageStatus
+import com.softwaremine.dps.domain.tool.ToolCall
+import com.softwaremine.dps.domain.tool.ToolExecutor
+import com.softwaremine.dps.domain.tool.ToolResult
 import com.softwaremine.dps.core.result.DpsResult
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -39,7 +50,6 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.MethodSorters
 import java.io.File
-import java.time.LocalDateTime
 
 /**
  * First real offline GGUF inference on device (Day 04, Phases C–G).
@@ -586,63 +596,139 @@ class GgufInferenceInstrumentedTest {
     }
 
     /**
-     * Day 08-D controlled retest: OLD vs NEW `Now:` position, same fixed
-     * clock, same five date/time messages.
+     * Day 08-E real-device validation: the actual 1.5B model, exercising
+     * the exact same production classes ([ToolOrchestrator],
+     * [SecretaryOrchestrator], [IntentPromptBuilder], [IntentJsonParser],
+     * [TemporalPhraseResolver]) [AiContainer] wires in production — only
+     * the engine is wrapped, purely to capture the raw completion text for
+     * evidence. No production behavior is altered by this test.
      *
-     * ## Why this bypasses [container.sessionManager]
-     * The production [SecretaryOrchestrator] is wired (in [AiContainer])
-     * against a default, real-clock [IntentPromptBuilder] — exactly what
-     * made the first Day 08-D A/B run uncontrolled: the "before" and
-     * "after" runs happened at genuinely different wall-clock times, so a
-     * changed date/time reply could have come from the reordering, from
-     * the different real `Now:` value, or from ordinary model variance,
-     * and there was no way to tell which. This test builds its own
-     * [ToolOrchestrator]/[SecretaryOrchestrator] pair — reusing the real,
-     * on-device [AiContainer.aiEngine], [AiContainer.toolExecutor] and
-     * [AiContainer.toolRegistry], so the model and tools are exactly what
-     * production uses — but with [IntentPromptBuilder] given a fixed
-     * [FIXED_NOW] instead of [LocalDateTime.now]. Run once against the
-     * `IntentPromptBuilder.kt` on disk, then again after `git stash` /
-     * `git stash pop` on that single file to flip old vs new ordering:
-     * with the clock held constant, any difference in the logged
-     * `DAY08D_CLOCK_*` results can only come from where `Now:` sits in
-     * the prompt.
+     * Each scenario gets a fresh [SecretaryOrchestrator] (no memory/pending-
+     * clarification carried between them) but shares [container.aiEngine]/
+     * [container.toolExecutor]/[container.toolRegistry] — the real, resident
+     * model and real tools, exactly like [t05e_day08dToolRoutingAndDateTimeMatrix].
      *
-     * `FIXED_NOW` (Tuesday 2026-08-11 09:00) was chosen so every case has
-     * an unambiguous answer: "kal" is tomorrow (08-12), 4pm is hours away
-     * the same day, tomorrow evening/night are both comfortably in the
-     * future, and 20 August is nine days out — nothing here should
-     * plausibly resolve to "in the past" against this clock.
-     *
-     * A fresh orchestrator pair per case keeps the five results
-     * independent of each other (no clarification or memory carried over
-     * from one case into the next), the same isolation
-     * [t05e_day08dToolRoutingAndDateTimeMatrix] gets via
-     * `session.resetConversation()`.
+     * Real wall-clock time is used deliberately, not a fixed clock — this is
+     * the one thing only a device with a real model and a real clock can
+     * prove: that the model actually populates `raw_when` the way the JVM
+     * suite assumed it would, and that [TemporalPhraseResolver] — never the
+     * model — produces the final `date`/`time`.
      */
     @Test
-    fun t05f_day08dFixedClockDateTimeMatrix() = runBlocking {
+    fun t05g_day08eRawWhenValidationMatrix() = runBlocking {
         requireModel()
+        val startedAt = java.time.LocalDateTime.now()
+        android.util.Log.i(PERF_TAG, "DAY08E_VALIDATION_STARTED_AT = $startedAt")
 
-        logClockCase("CASE_A_ABS_DATE", "20 August ko meeting ka reminder laga do.")
-        logClockCase("CASE_B_ABS_TIME", "4 baje mujhe call karne ka reminder laga do.")
-        logClockCase("CASE_C_KAL_BARE", "Kal mujhe yaad dila dena ke meeting hai.")
-        logClockCase("CASE_D_KAL_SHAAM_7", "Kal shaam 7 baje mujhe yaad dila dena.")
-        logClockCase("CASE_E_KAL_RAAT_11", "Kal raat 11 baje mujhe yaad dila dena.")
+        validateScenario("A_ABS_DATE", "20 August ko reminder lagao")
+        validateScenario("B_BARE_HOUR", "4 baje reminder lagao")
+        validateScenario("C_KAL_BARE", "kal reminder lagao")
+        validateScenario("D_KAL_SHAAM_7", "kal shaam 7 baje reminder lagao")
+        validateScenario("E_KAL_RAAT_11", "kal raat 11 baje reminder lagao")
+        // Adversarial: no vocabulary word here at all (no kal/aaj/baje/period
+        // word) is guaranteed to resolve — a model with nothing to anchor to
+        // (no Now: exists anymore) might be tempted to invent an absolute
+        // value anyway. It must not: raw_when should carry the phrase
+        // verbatim, and an unrecognised phrase must fail closed.
+        validateScenario("ADVERSARIAL_RELATIVE_OFFSET", "abhi se 2 ghante baad reminder lagao")
+        validateScenario("ROUTING_TASK", "Buy milk ka task bana do.")
+        validateScenario("ROUTING_CONVERSATION", "Salam DPS, kya haal hai?")
     }
 
-    private suspend fun logClockCase(tag: String, message: String) {
-        val outcome = freshSecretary().handle(message)
-        android.util.Log.i(PERF_TAG, "DAY08D_CLOCK_${tag}_NOW = $FIXED_NOW")
-        android.util.Log.i(PERF_TAG, "DAY08D_CLOCK_${tag}_RESULT = ${summarize(outcome)}")
+    /** Delegates to the real engine, capturing the raw prompt and completion text for evidence only. */
+    private class LoggingEngine(private val delegate: AiEngine) : AiEngine {
+        var lastRawCompletion: String? = null
+            private set
+        var lastPrompt: String? = null
+            private set
+
+        override val state get() = delegate.state
+        override val activeModel: ModelDescriptor? get() = delegate.activeModel
+
+        override suspend fun initialize(): DpsResult<Unit> = delegate.initialize()
+        override suspend fun loadModel(descriptor: ModelDescriptor, config: ModelConfig): DpsResult<Unit> =
+            delegate.loadModel(descriptor, config)
+
+        override suspend fun unloadModel(): DpsResult<Unit> = delegate.unloadModel()
+        override fun generate(request: CompletionRequest): Flow<CompletionChunk> = delegate.generate(request)
+
+        override suspend fun generateOnce(request: CompletionRequest): DpsResult<AiCompletion> {
+            lastPrompt = request.prompt
+            val result = delegate.generateOnce(request)
+            if (result is DpsResult.Success) lastRawCompletion = result.value.text
+            return result
+        }
+
+        override suspend fun tokenCount(text: String): DpsResult<Int> = delegate.tokenCount(text)
+        override suspend fun shutdown() = delegate.shutdown()
     }
 
-    private fun summarize(outcome: ToolOrchestrator.Outcome): String = when (outcome) {
+    private val diagnosticLogger = object : DpsLogger {
+        override fun d(tag: String, message: String) = Unit
+        override fun i(tag: String, message: String) = Unit
+        override fun w(tag: String, message: String, throwable: Throwable?) = Unit
+        override fun e(tag: String, message: String, throwable: Throwable?) = Unit
+    }
+
+    /** Delegates to the real executor, capturing the last [ToolCall]'s arguments for evidence only. */
+    private class LoggingToolExecutor(private val delegate: ToolExecutor) : ToolExecutor {
+        /** Every call this instance has seen, in order — a compound plan calls this more than once. */
+        val calls = mutableListOf<ToolCall>()
+        val lastCall: ToolCall? get() = calls.lastOrNull()
+
+        override suspend fun execute(call: ToolCall, timeoutMillis: Long): ToolResult {
+            calls += call
+            return delegate.execute(call, timeoutMillis)
+        }
+    }
+
+    /** A fresh orchestrator pair per scenario, built from exactly the classes production uses. */
+    private fun freshDiagnosticSecretary(engine: AiEngine, executor: ToolExecutor = container.toolExecutor): SecretaryOrchestrator {
+        val toolOrchestrator = ToolOrchestrator(
+            engine = engine,
+            executor = executor,
+            registry = container.toolRegistry,
+            promptBuilder = IntentPromptBuilder(),
+            parser = IntentJsonParser(),
+            clarification = ClarificationEngine(),
+            selector = ToolSelector(),
+            responses = ToolResponseGenerator(),
+            logger = diagnosticLogger,
+        )
+        return SecretaryOrchestrator(
+            toolOrchestrator = toolOrchestrator,
+            referenceResolver = ReferenceResolver(),
+            temporalPhraseResolver = TemporalPhraseResolver(),
+            temporalGroundingGuard = TemporalGroundingGuard(),
+            temporalStepAttributor = TemporalStepAttributor(TemporalPhraseSpanFinder(), TemporalGroundingGuard()),
+            actionDetector = ActionDetector(),
+            clarification = ClarificationEngine(),
+            memoryUpdater = ConversationMemoryUpdater(),
+            contactSelectionParser = ContactSelectionParser(),
+            confirmationParser = ConfirmationParser(),
+            followUpSuggestions = FollowUpSuggestionGenerator(),
+            logger = diagnosticLogger,
+        )
+    }
+
+    private suspend fun validateScenario(tag: String, message: String) {
+        val engine = LoggingEngine(container.aiEngine)
+        val secretary = freshDiagnosticSecretary(engine)
+
+        android.util.Log.i(PERF_TAG, "DAY08E_${tag}_INPUT = $message")
+        val outcome = secretary.handle(message)
+
+        android.util.Log.i(PERF_TAG, "DAY08E_${tag}_RAW_JSON = ${engine.lastRawCompletion?.trim()}")
+        android.util.Log.i(PERF_TAG, "DAY08E_${tag}_OUTCOME = ${summarizeOutcome(outcome)}")
+    }
+
+    private fun summarizeOutcome(outcome: ToolOrchestrator.Outcome): String = when (outcome) {
         is ToolOrchestrator.Outcome.Handled ->
-            "HANDLED date=${outcome.intent.parameters.date} time=${outcome.intent.parameters.time} " +
+            "HANDLED raw_when=${outcome.intent.parameters.rawWhen} date=${outcome.intent.parameters.date} " +
+                "time=${outcome.intent.parameters.time} action=${outcome.intent.action} " +
                 "result=${outcome.result} reply=${outcome.reply.trim()}"
         is ToolOrchestrator.Outcome.Clarify ->
-            "CLARIFY question=${outcome.question.trim()} " +
+            "CLARIFY question=${outcome.question.trim()} raw_when=${outcome.resolution.intent.parameters.rawWhen} " +
                 "partialDate=${outcome.resolution.partial.date} partialTime=${outcome.resolution.partial.time}"
         is ToolOrchestrator.Outcome.NeedsPermission ->
             "NEEDS_PERMISSION reply=${outcome.reply.trim()} result=${outcome.result}"
@@ -650,37 +736,233 @@ class GgufInferenceInstrumentedTest {
             "CONVERSATIONAL reply=${outcome.replyText?.trim()}"
     }
 
-    /** A fresh, isolated orchestrator pair sharing the real engine/tools but a fixed clock. */
-    private fun freshSecretary(): SecretaryOrchestrator {
+    /**
+     * Focused real-device verification that [TemporalGroundingGuard]
+     * actually blocks the exact hallucination a prior on-device investigation
+     * found: the model reliably producing `raw_when="kal shaam 7 baje"` for a
+     * message that never mentioned a time — reproduced with a fresh model
+     * reload and zero session history, which ruled out cache/session
+     * contamination as the cause (see [TemporalGroundingGuard]'s own doc for
+     * the full account). The model is not expected to stop hallucinating —
+     * the guard is what has to catch it. This exercises the real, unmodified
+     * [freshDiagnosticSecretary] pipeline (only the engine and tool executor
+     * are wrapped, purely to capture evidence).
+     */
+    @Test
+    fun t05i_day08eGroundingGuardValidation() = runBlocking {
+        requireModel()
+
+        validateGuardScenario("CASE1_CRITICAL_REGRESSION", "Buy milk ka task bana do")
+        validateGuardScenario("CASE2_GENUINE_TEMPORAL", "Kal shaam 7 baje reminder lagao")
+        validateGuardScenario("CASE3_FILLER_WORD", "Kal shaam ko 7 baje reminder lagao")
+        validateGuardScenario("CASE4_BARE_HOUR", "4 baje reminder lagao")
+        validateGuardScenario("CASE5_CONVERSATION", "Salam DPS, kya haal hai?")
+        validateGuardScenario("CASE6_REP1_NON_TEMPORAL_TASK", "Buy milk ka task bana do")
+        validateGuardScenario("CASE6_REP2_NON_TEMPORAL_TASK", "Buy milk ka task bana do")
+        validateGuardScenario("CASE6_REP3_NON_TEMPORAL_TASK", "Buy milk ka task bana do")
+    }
+
+    /**
+     * Like [investigateScenario], but also captures the exact [ToolCall]
+     * arguments sent to the real tool layer — the direct proof a fabricated
+     * `due` value never reaches [com.softwaremine.dps.data.android.tool.AndroidTaskTool].
+     */
+    private suspend fun validateGuardScenario(tag: String, message: String) {
+        val engine = LoggingEngine(container.aiEngine)
+        val toolExecutor = LoggingToolExecutor(container.toolExecutor)
+        val secretary = freshDiagnosticSecretary(engine, toolExecutor)
+
+        android.util.Log.i(PERF_TAG, "DAY08E_GUARD_${tag}_INPUT = $message")
+        val outcome = secretary.handle(message)
+
+        android.util.Log.i(PERF_TAG, "DAY08E_GUARD_${tag}_RAW_JSON = ${engine.lastRawCompletion?.trim()}")
+        android.util.Log.i(PERF_TAG, "DAY08E_GUARD_${tag}_OUTCOME = ${summarizeOutcome(outcome)}")
+        android.util.Log.i(
+            PERF_TAG,
+            "DAY08E_GUARD_${tag}_TOOL_CALL = operation=${toolExecutor.lastCall?.operation} " +
+                "arguments=${toolExecutor.lastCall?.arguments} hasDue=${toolExecutor.lastCall?.arguments?.containsKey("due")}",
+        )
+    }
+
+    /**
+     * Real-device diagnostic for whether the model's own `"steps"` output
+     * scopes `raw_when` correctly per step, and — via the real tool layer —
+     * whether [SecretaryOrchestrator.handlePlan]'s whole-message grounding
+     * check let anything incorrect through. Logs the model's raw `"steps"`
+     * JSON verbatim (evidence for what the model itself put in each step)
+     * and every real [ToolCall] the plan produced, in order, with each
+     * call's `due` presence made explicit. Purely diagnostic — asserts
+     * nothing, forces no production change; this exists to gather evidence
+     * per the Day 08-E multi-step grounding investigation.
+     */
+    @Test
+    fun t05j_day08eMultiStepGroundingDiagnostic() = runBlocking {
+        requireModel()
+
+        diagnoseMultiStepScenario("CASE_A_STEP1_TEMPORAL", "kal shaam 7 baje reminder laga do aur milk khareedne ka task bana do")
+        diagnoseMultiStepScenario("CASE_B_STEP2_TEMPORAL", "milk khareedne ka task bana do aur kal shaam 7 baje reminder laga do")
+        diagnoseMultiStepScenario("CASE_C_SEMANTIC_AMBIGUITY", "Ali ko kal shaam 7 baje call karo aur uska task bana do")
+        diagnoseMultiStepScenario("CASE_D_STEP2_TEMPORAL_NAMED", "Ali ko call karo aur Sara ko kal raat 11 baje reminder laga do")
+        diagnoseMultiStepScenario("CASE_E_BOTH_TEMPORAL", "kal shaam 7 baje reminder laga do aur kal raat 11 baje doosra reminder laga do")
+        diagnoseMultiStepScenario("CASE_F_NEITHER_TEMPORAL", "meeting ka reminder laga do aur milk ka task bana do")
+    }
+
+    /** Like [validateGuardScenario], but logs every tool call the plan produced, not just the last. */
+    private suspend fun diagnoseMultiStepScenario(tag: String, message: String) {
+        val engine = LoggingEngine(container.aiEngine)
+        val toolExecutor = LoggingToolExecutor(container.toolExecutor)
+        val secretary = freshDiagnosticSecretary(engine, toolExecutor)
+
+        android.util.Log.i(PERF_TAG, "DAY08E_MULTISTEP_${tag}_INPUT = $message")
+        val outcome = secretary.handle(message)
+
+        android.util.Log.i(PERF_TAG, "DAY08E_MULTISTEP_${tag}_RAW_JSON = ${engine.lastRawCompletion?.trim()}")
+        android.util.Log.i(PERF_TAG, "DAY08E_MULTISTEP_${tag}_OUTCOME = ${summarizeOutcome(outcome)}")
+        toolExecutor.calls.forEachIndexed { index, call ->
+            android.util.Log.i(
+                PERF_TAG,
+                "DAY08E_MULTISTEP_${tag}_TOOL_CALL_$index = operation=${call.operation} " +
+                    "arguments=${call.arguments} hasDue=${call.arguments.containsKey("due")}",
+            )
+        }
+        if (toolExecutor.calls.isEmpty()) {
+            android.util.Log.i(PERF_TAG, "DAY08E_MULTISTEP_${tag}_TOOL_CALL_NONE = no tool was ever called")
+        }
+    }
+
+    /**
+     * Focused real-device validation of [TemporalStepAttributor] itself —
+     * not [TemporalPhraseResolver]'s vocabulary, already covered on JVM.
+     * Captures the full intermediate chain the earlier
+     * [t05j_day08eMultiStepGroundingDiagnostic] run did not: each step's
+     * `raw_when` *before* attribution, the spans
+     * [TemporalPhraseSpanFinder] finds directly from the original message,
+     * and each step's resolved date/time *after* attribution — not just the
+     * final tool call. A fixed clock (`2026-08-11T09:00`, the same one Day
+     * 08-D's controlled retest used) is injected into a fresh
+     * [TemporalPhraseResolver] built only for this diagnostic — no new
+     * production clock mechanism, the same "build a parallel diagnostic
+     * orchestrator from the real production classes" pattern every
+     * Day 08-D/E device validation in this file already uses.
+     *
+     * The "before" and "after" analysis is derived by re-parsing the exact
+     * completion [LoggingEngine] already captured — not a second inference
+     * call — since classification is deterministic (temp=0) and the prompt
+     * is identical either way.
+     */
+    @Test
+    fun t05k_day08eMultiStepAttributionDiagnostic() = runBlocking {
+        requireModel()
+
+        diagnoseAttribution("CASE1_STEP1_TEMPORAL", "Kal shaam 7 baje Ali ko call karne ka reminder laga do aur Buy milk ka task bana do.")
+        diagnoseAttribution("CASE2_STEP2_TEMPORAL", "Ali ko call karne ka reminder laga do aur kal shaam 7 baje Buy milk ka task bana do.")
+        diagnoseAttribution("CASE3_TWO_DISTINCT", "Kal shaam 7 baje Ali ko call karne ka reminder laga do aur kal raat 11 baje Buy milk ka task bana do.")
+        diagnoseAttribution("CASE4_SAME_PHRASE_TWICE", "Kal shaam 7 baje Ali ko call karne ka reminder laga do aur kal shaam 7 baje Buy milk ka task bana do.")
+        diagnoseAttribution("CASE5_TRAILING_AMBIGUOUS", "Ali ko call karne ka reminder laga do aur Buy milk ka task bana do kal shaam 7 baje.")
+        diagnoseAttribution("CASE6_NEITHER_TEMPORAL", "Ali ko call karne ka reminder laga do aur Buy milk ka task bana do.")
+        diagnoseAttribution("CASE8_FILLER_WORDS", "Kal shaam ko 7 baje Ali ko call karne ka reminder laga do aur kal raat ko 11 baje Buy milk ka task bana do.")
+        diagnoseAttribution("CASE9_ABSOLUTE_PLUS_RELATIVE", "20 August ko Ali ko call karne ka reminder laga do aur kal shaam 7 baje Buy milk ka task bana do.")
+        diagnoseAttribution("CASE10_UNRELATED_WORDS_BETWEEN", "Kal shaam 7 baje Ali ko call karne ka reminder laga do, phir thoda kaam karo, aur kal raat 11 baje Buy milk ka task bana do.")
+    }
+
+    /**
+     * Case 7 (hallucination inside a compound request) reuses Case 6's exact
+     * message — the point is to see whether the real model fabricates a
+     * raw_when for either step when the user said no temporal phrase at
+     * all, and confirm the attributor rejects it regardless. Logged
+     * separately so it is not mistaken for a duplicate of Case 6.
+     */
+    @Test
+    fun t05l_day08eHallucinationInsideCompoundRequest() = runBlocking {
+        requireModel()
+        diagnoseAttribution("CASE7_HALLUCINATION_CHECK", "Ali ko call karne ka reminder laga do aur Buy milk ka task bana do.")
+    }
+
+    private suspend fun diagnoseAttribution(tag: String, message: String) {
+        val engine = LoggingEngine(container.aiEngine)
+        val toolExecutor = LoggingToolExecutor(container.toolExecutor)
+        val temporalPhraseResolver = TemporalPhraseResolver(now = { FIXED_NOW })
+        val temporalGroundingGuard = TemporalGroundingGuard()
+        val spanFinder = TemporalPhraseSpanFinder(resolver = temporalPhraseResolver)
+        val attributor = TemporalStepAttributor(spanFinder = spanFinder, groundingGuard = temporalGroundingGuard)
+
         val toolOrchestrator = ToolOrchestrator(
-            engine = container.aiEngine,
-            executor = container.toolExecutor,
+            engine = engine,
+            executor = toolExecutor,
             registry = container.toolRegistry,
-            promptBuilder = IntentPromptBuilder(now = { FIXED_NOW }),
+            promptBuilder = IntentPromptBuilder(),
             parser = IntentJsonParser(),
             clarification = ClarificationEngine(),
             selector = ToolSelector(),
             responses = ToolResponseGenerator(),
-            logger = silentLogger,
+            logger = diagnosticLogger,
         )
-        return SecretaryOrchestrator(
+        val secretary = SecretaryOrchestrator(
             toolOrchestrator = toolOrchestrator,
             referenceResolver = ReferenceResolver(),
+            temporalPhraseResolver = temporalPhraseResolver,
+            temporalGroundingGuard = temporalGroundingGuard,
+            temporalStepAttributor = attributor,
             actionDetector = ActionDetector(),
             clarification = ClarificationEngine(),
             memoryUpdater = ConversationMemoryUpdater(),
             contactSelectionParser = ContactSelectionParser(),
             confirmationParser = ConfirmationParser(),
             followUpSuggestions = FollowUpSuggestionGenerator(),
-            logger = silentLogger,
+            logger = diagnosticLogger,
         )
-    }
 
-    private val silentLogger = object : DpsLogger {
-        override fun d(tag: String, message: String) = Unit
-        override fun i(tag: String, message: String) = Unit
-        override fun w(tag: String, message: String, throwable: Throwable?) = Unit
-        override fun e(tag: String, message: String, throwable: Throwable?) = Unit
+        android.util.Log.i(PERF_TAG, "DAY08E_ATTR_${tag}_INPUT = $message")
+        val outcome = secretary.handle(message)
+        val rawJson = engine.lastRawCompletion?.trim()
+        android.util.Log.i(PERF_TAG, "DAY08E_ATTR_${tag}_RAW_JSON = $rawJson")
+
+        // Re-parse the exact captured completion — no second inference call.
+        val stepsBeforeAttribution = rawJson?.let { IntentJsonParser().parsePlan(it) }.orEmpty()
+        android.util.Log.i(PERF_TAG, "DAY08E_ATTR_${tag}_STEP_COUNT = ${stepsBeforeAttribution.size}")
+
+        if (stepsBeforeAttribution.size <= 1) {
+            android.util.Log.i(
+                PERF_TAG,
+                "DAY08E_ATTR_${tag}_MODEL_COMPOUND_LIMITATION = true " +
+                    "(model did not produce a multi-step plan; TemporalStepAttributor is never reached in " +
+                    "production for this call — handleSingleStep's whole-message check applies instead)",
+            )
+        } else {
+            android.util.Log.i(PERF_TAG, "DAY08E_ATTR_${tag}_MODEL_COMPOUND_LIMITATION = false")
+        }
+
+        stepsBeforeAttribution.forEachIndexed { index, step ->
+            android.util.Log.i(
+                PERF_TAG,
+                "DAY08E_ATTR_${tag}_STEP${index}_BEFORE = intent=${step.type} raw_when=${step.parameters.rawWhen}",
+            )
+        }
+
+        val spans = spanFinder.findSpans(message)
+        android.util.Log.i(PERF_TAG, "DAY08E_ATTR_${tag}_SPANS_FOUND = ${spans.map { it.text }}")
+
+        val attributedSteps = attributor.attribute(message, stepsBeforeAttribution)
+        attributedSteps.forEachIndexed { index, step ->
+            val resolution = temporalPhraseResolver.resolve(step.parameters.rawWhen)
+            android.util.Log.i(
+                PERF_TAG,
+                "DAY08E_ATTR_${tag}_STEP${index}_AFTER = raw_when=${step.parameters.rawWhen} " +
+                    "resolved_date=${resolution.date} resolved_time=${resolution.time}",
+            )
+        }
+
+        android.util.Log.i(PERF_TAG, "DAY08E_ATTR_${tag}_OUTCOME = ${summarizeOutcome(outcome)}")
+        toolExecutor.calls.forEachIndexed { index, call ->
+            android.util.Log.i(
+                PERF_TAG,
+                "DAY08E_ATTR_${tag}_TOOL_CALL_$index = operation=${call.operation} " +
+                    "arguments=${call.arguments} hasDue=${call.arguments.containsKey("due")}",
+            )
+        }
+        if (toolExecutor.calls.isEmpty()) {
+            android.util.Log.i(PERF_TAG, "DAY08E_ATTR_${tag}_TOOL_CALL_NONE = no tool was ever called")
+        }
     }
 
     // -----------------------------------------------------------------
@@ -773,8 +1055,8 @@ class GgufInferenceInstrumentedTest {
         private const val CANCEL_AFTER_MILLIS = 3_000L
         private const val CANCEL_SETTLE_TIMEOUT_MILLIS = 30_000L
 
-        /** Tuesday 2026-08-11, 09:00 — see [t05f_day08dFixedClockDateTimeMatrix]'s doc for why. */
-        private val FIXED_NOW = LocalDateTime.of(2026, 8, 11, 9, 0)
+        /** Tuesday 2026-08-11, 09:00 — the same fixed clock Day 08-D's controlled retest used. */
+        private val FIXED_NOW = java.time.LocalDateTime.of(2026, 8, 11, 9, 0)
 
         /** One engine for the whole suite. See the `container` property. */
         private lateinit var sharedContainer: AiContainer

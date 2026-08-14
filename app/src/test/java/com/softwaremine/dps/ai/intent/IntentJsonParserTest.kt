@@ -35,12 +35,12 @@ class IntentJsonParserTest {
     @Test
     fun `parses a well-formed classification`() {
         val intent = parser.parse(
-            """{"intent":"reminder","parameters":{"title":"call the bank","time":"16:00"}}""",
+            """{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"4 baje"}}""",
         )
 
         assertEquals(IntentType.REMINDER, intent.type)
         assertEquals("call the bank", intent.parameters.title)
-        assertEquals("16:00", intent.parameters.time)
+        assertEquals("4 baje", intent.parameters.rawWhen)
     }
 
     @Test
@@ -125,11 +125,11 @@ class IntentJsonParserTest {
     @Test
     fun `accepts parameters flattened into the top level`() {
         // Small models drop the nesting roughly as often as they honour it.
-        val intent = parser.parse("""{"intent":"reminder","title":"pay rent","time":"08:00"}""")
+        val intent = parser.parse("""{"intent":"reminder","title":"pay rent","raw_when":"8 baje"}""")
 
         assertEquals(IntentType.REMINDER, intent.type)
         assertEquals("pay rent", intent.parameters.title)
-        assertEquals("08:00", intent.parameters.time)
+        assertEquals("8 baje", intent.parameters.rawWhen)
     }
 
     @Test
@@ -168,16 +168,79 @@ class IntentJsonParserTest {
     }
 
     // -----------------------------------------------------------------
+    // raw_when, and why date/time from the model are never read (Day 08-E)
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `reads raw_when as the model's verbatim quote of when`() {
+        val intent = parser.parse(
+            """{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"kal shaam 7 baje"}}""",
+        )
+
+        assertEquals("kal shaam 7 baje", intent.parameters.rawWhen)
+    }
+
+    @Test
+    fun `accepts when as an alias for raw_when`() {
+        val intent = parser.parse("""{"intent":"reminder","parameters":{"when":"kal"}}""")
+
+        assertEquals("kal", intent.parameters.rawWhen)
+    }
+
+    /**
+     * The safety-critical case. Even if a model emits `date`/`time` directly —
+     * against the prompt's own instruction, an old cached prompt, or a
+     * hallucination — this parser must never let it through.
+     * [com.softwaremine.dps.ai.memory.TemporalPhraseResolver] is the only
+     * legitimate source of these fields from here on.
+     */
+    @Test
+    fun `date and time supplied directly by the model are always ignored`() {
+        val intent = parser.parse(
+            """{"intent":"reminder","parameters":{"title":"call the bank","date":"2099-01-01","time":"23:59"}}""",
+        )
+
+        assertNull("A model-supplied date must never reach IntentParameters", intent.parameters.date)
+        assertNull("A model-supplied time must never reach IntentParameters", intent.parameters.time)
+    }
+
+    @Test
+    fun `date and time are ignored even when raw_when is also present`() {
+        val intent = parser.parse(
+            """{"intent":"reminder","parameters":{"raw_when":"kal","date":"2099-01-01","time":"23:59"}}""",
+        )
+
+        assertEquals("kal", intent.parameters.rawWhen)
+        assertNull(intent.parameters.date)
+        assertNull(intent.parameters.time)
+    }
+
+    @Test
+    fun `datetime supplied directly by the model is also ignored`() {
+        // The model used to be allowed to use "datetime" as an alias for "time".
+        val intent = parser.parse("""{"intent":"reminder","parameters":{"datetime":"2099-01-01T23:59"}}""")
+
+        assertNull(intent.parameters.time)
+    }
+
+    @Test
+    fun `a blank raw_when is treated as absent`() {
+        val intent = parser.parse("""{"intent":"reminder","parameters":{"raw_when":"   "}}""")
+
+        assertNull(intent.parameters.rawWhen)
+    }
+
+    // -----------------------------------------------------------------
     // Value coercion
     // -----------------------------------------------------------------
 
     @Test
     fun `coerces an unquoted number rather than discarding it`() {
-        // A model asked for a time emits 1600 unquoted often enough to matter,
-        // and throwing away a value plainly present forces a needless question.
-        val intent = parser.parse("""{"intent":"reminder","parameters":{"time":1600,"title":"x"}}""")
+        // A model emits a bare number unquoted often enough to matter, and
+        // throwing away a value plainly present forces a needless question.
+        val intent = parser.parse("""{"intent":"work_log","parameters":{"duration":180,"title":"x"}}""")
 
-        assertEquals("1600", intent.parameters.time)
+        assertEquals("180", intent.parameters.duration)
     }
 
     @Test
@@ -332,8 +395,8 @@ class IntentJsonParserTest {
     fun `a steps array becomes one intent per element in order`() {
         val steps = parser.parsePlan(
             """{"steps":[
-                {"intent":"calendar_event","parameters":{"title":"meeting","date":"2026-08-07","time":"16:00"}},
-                {"intent":"reminder","parameters":{"title":"meeting","time":"15:30"}}
+                {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"7 August"}},
+                {"intent":"reminder","parameters":{"title":"meeting","raw_when":"3:30"}}
             ]}""",
         )
 
@@ -341,7 +404,7 @@ class IntentJsonParserTest {
         assertEquals(IntentType.CALENDAR_EVENT, steps[0].type)
         assertEquals("meeting", steps[0].parameters.title)
         assertEquals(IntentType.REMINDER, steps[1].type)
-        assertEquals("15:30", steps[1].parameters.time)
+        assertEquals("3:30", steps[1].parameters.rawWhen)
     }
 
     @Test

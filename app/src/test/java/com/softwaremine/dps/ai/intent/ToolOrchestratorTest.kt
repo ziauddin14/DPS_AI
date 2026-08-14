@@ -180,7 +180,7 @@ class ToolOrchestratorTest {
                 apiLevel = 35,
             ),
             registry = registry,
-            promptBuilder = IntentPromptBuilder(now = { fixedNow }),
+            promptBuilder = IntentPromptBuilder(),
             parser = IntentJsonParser(),
             clarification = ClarificationEngine(),
             selector = ToolSelector(zone = zone, now = { fixedNow }),
@@ -198,25 +198,52 @@ class ToolOrchestratorTest {
         behaviour = behaviour,
     )
 
+    /**
+     * A title-only intent (Day 06) — used in place of REMINDER wherever a
+     * test's actual point is "a complete request runs" rather than date/time
+     * itself (Day 08-E). REMINDER can no longer be completed by
+     * [ToolOrchestrator] alone: `date`/`time` are resolved by
+     * [com.softwaremine.dps.ai.memory.TemporalPhraseResolver], which only
+     * runs inside [com.softwaremine.dps.ai.secretary.SecretaryOrchestrator]
+     * — see [IntentJsonParserTest]'s "date and time supplied directly by the
+     * model are always ignored" for the parser-level half of this.
+     */
+    private fun taskTool(
+        behaviour: suspend (ToolCall) -> ToolResult = { ToolResult.Success("Task added.") },
+    ) = RecordingTool(
+        id = ToolId.TASK,
+        operations = setOf("create_task"),
+        behaviour = behaviour,
+    )
+
+    /** A two-field intent (PERSON+MESSAGE) — see [taskTool]'s doc for why REMINDER/TIME no longer fits here. */
+    private fun whatsAppTool(
+        behaviour: suspend (ToolCall) -> ToolResult = { ToolResult.Success("Message ready.") },
+    ) = RecordingTool(
+        id = ToolId.WHATSAPP,
+        operations = setOf("prepare_message"),
+        behaviour = behaviour,
+    )
+
     // -----------------------------------------------------------------
     // Routing
     // -----------------------------------------------------------------
 
     @Test
     fun `a complete request runs the tool and reports what happened`() = runTest {
-        val tool = reminderTool()
+        val tool = taskTool()
         val engine = ScriptedEngine(
             DpsResult.Success(
-                """{"intent":"reminder","parameters":{"title":"call the bank","time":"16:00"}}""",
+                """{"intent":"task","parameters":{"title":"call the bank"}}""",
             ),
         )
 
-        val outcome = orchestrator(engine, listOf(tool)).handle("remind me to call the bank at 4")
+        val outcome = orchestrator(engine, listOf(tool)).handle("add a task to call the bank")
 
         assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
-        assertEquals("Reminder set.", (outcome as ToolOrchestrator.Outcome.Handled).reply)
+        assertEquals("Task added.", (outcome as ToolOrchestrator.Outcome.Handled).reply)
         assertEquals(1, tool.calls.size)
-        assertEquals("create_reminder", tool.calls.single().operation)
+        assertEquals("create_task", tool.calls.single().operation)
         assertEquals("call the bank", tool.calls.single().arguments["title"])
     }
 
@@ -273,14 +300,16 @@ class ToolOrchestratorTest {
 
     @Test
     fun `an intent whose tool is not registered does not crash`() = runTest {
-        // The calendar tool is absent from the registry entirely.
+        // The notification tool is absent from the registry entirely. A
+        // title alone satisfies NOTIFICATION's completeness check, so this
+        // reaches execution rather than stalling on a Clarify first.
         val engine = ScriptedEngine(
             DpsResult.Success(
-                """{"intent":"calendar_event","parameters":{"title":"standup","date":"2026-08-07"}}""",
+                """{"intent":"notification","parameters":{"title":"standup"}}""",
             ),
         )
 
-        val outcome = orchestrator(engine, listOf(reminderTool())).handle("add standup tomorrow")
+        val outcome = orchestrator(engine, listOf(reminderTool())).handle("remind everyone about standup")
 
         assertTrue("Expected Conversational, got $outcome", outcome is ToolOrchestrator.Outcome.Conversational)
     }
@@ -310,59 +339,64 @@ class ToolOrchestratorTest {
 
     @Test
     fun `answering the question completes the original request`() = runTest {
-        val tool = reminderTool()
+        // REMINDER can no longer be completed by ToolOrchestrator alone
+        // (see taskTool's doc), so this uses WHATSAPP_MESSAGE's two
+        // required fields (PERSON, MESSAGE) to exercise the same
+        // one-field-known-first-one-supplied-by-answer shape.
+        val tool = whatsAppTool()
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"the meeting"}}"""),
-            DpsResult.Success("""{"intent":"reminder","parameters":{"time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"whatsapp_message","parameters":{"person":"Sara"}}"""),
+            DpsResult.Success("""{"intent":"whatsapp_message","parameters":{"message":"running late"}}"""),
         )
         val orchestrator = orchestrator(engine, listOf(tool))
 
-        orchestrator.handle("remind me about the meeting")
-        val outcome = orchestrator.handle("at 4pm")
+        orchestrator.handle("message Sara")
+        val outcome = orchestrator.handle("running late")
 
         assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
-        // The meeting survived the follow-up: the user answered a question
-        // rather than repeating themselves.
-        assertEquals("the meeting", tool.calls.single().arguments["title"])
+        // Sara survived the follow-up: the user answered a question rather
+        // than repeating themselves.
+        assertEquals("Sara", tool.calls.single().arguments["contact"])
+        assertEquals("running late", tool.calls.single().arguments["message"])
         assertNull("The question should be cleared once answered", orchestrator.pendingQuestion())
     }
 
     @Test
     fun `the follow-up question is given to the model so a bare answer makes sense`() = runTest {
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"the meeting"}}"""),
-            DpsResult.Success("""{"intent":"reminder","parameters":{"time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"whatsapp_message","parameters":{"person":"Sara"}}"""),
+            DpsResult.Success("""{"intent":"whatsapp_message","parameters":{"message":"running late"}}"""),
         )
-        val orchestrator = orchestrator(engine, listOf(reminderTool()))
+        val orchestrator = orchestrator(engine, listOf(whatsAppTool()))
 
-        orchestrator.handle("remind me about the meeting")
-        orchestrator.handle("at 4pm")
+        orchestrator.handle("message Sara")
+        orchestrator.handle("running late")
 
         assertTrue(
             "Second prompt lacked the pending question",
-            engine.prompts[1].contains("When should I remind you?"),
+            engine.prompts[1].contains("What would you like the message to say?"),
         )
     }
 
     /**
-     * A bare answer often classifies as conversation — "4pm" on its own is not a
-     * request to do anything. Discarding the pending intent at that point would
-     * lose the request the user is in the middle of making.
+     * A bare answer often classifies as conversation — "running late" on its
+     * own is not a request to do anything. Discarding the pending intent at
+     * that point would lose the request the user is in the middle of making.
      */
     @Test
     fun `an answer the model reads as conversation still fills the pending request`() = runTest {
-        val tool = reminderTool()
+        val tool = whatsAppTool()
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"the meeting"}}"""),
-            DpsResult.Success("""{"intent":"conversation","parameters":{"time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"whatsapp_message","parameters":{"person":"Sara"}}"""),
+            DpsResult.Success("""{"intent":"conversation","parameters":{"message":"running late"}}"""),
         )
         val orchestrator = orchestrator(engine, listOf(tool))
 
-        orchestrator.handle("remind me about the meeting")
-        val outcome = orchestrator.handle("4pm")
+        orchestrator.handle("message Sara")
+        val outcome = orchestrator.handle("running late")
 
         assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
-        assertEquals("the meeting", tool.calls.single().arguments["title"])
+        assertEquals("Sara", tool.calls.single().arguments["contact"])
     }
 
     @Test
@@ -530,12 +564,12 @@ class ToolOrchestratorTest {
 
     @Test
     fun `a tool that throws produces an apology, not a crash`() = runTest {
-        val tool = reminderTool { error("alarm manager exploded") }
+        val tool = taskTool { error("storage layer exploded") }
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"task","parameters":{"title":"x"}}"""),
         )
 
-        val outcome = orchestrator(engine, listOf(tool)).handle("remind me at 4")
+        val outcome = orchestrator(engine, listOf(tool)).handle("add a task")
 
         assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
         val handled = outcome as ToolOrchestrator.Outcome.Handled
@@ -546,17 +580,17 @@ class ToolOrchestratorTest {
 
     @Test
     fun `a tool that fails passes the reason through unchanged`() = runTest {
-        val tool = reminderTool {
-            ToolResult.Failure("I couldn't reach your alarms.", retryable = true)
+        val tool = taskTool {
+            ToolResult.Failure("I couldn't reach storage.", retryable = true)
         }
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"task","parameters":{"title":"x"}}"""),
         )
 
-        val outcome = orchestrator(engine, listOf(tool)).handle("remind me at 4")
+        val outcome = orchestrator(engine, listOf(tool)).handle("add a task")
             as ToolOrchestrator.Outcome.Handled
 
-        assertTrue(outcome.reply.startsWith("I couldn't reach your alarms."))
+        assertTrue(outcome.reply.startsWith("I couldn't reach storage."))
         assertTrue(outcome.reply.contains("try again"))
     }
 
@@ -575,11 +609,11 @@ class ToolOrchestratorTest {
     fun `exactly one inference pass is spent per user message`() = runTest {
         val engine = ScriptedEngine(
             DpsResult.Success(
-                """{"intent":"reminder","parameters":{"title":"call the bank","time":"16:00"}}""",
+                """{"intent":"task","parameters":{"title":"call the bank"}}""",
             ),
         )
 
-        orchestrator(engine, listOf(reminderTool())).handle("remind me to call the bank at 4")
+        orchestrator(engine, listOf(taskTool())).handle("add a task to call the bank")
 
         assertEquals(1, engine.prompts.size)
     }
@@ -600,14 +634,23 @@ class ToolOrchestratorTest {
         )
     }
 
+    /**
+     * The inverse of what this test asserted before Day 08-E. A prompt that
+     * once needed the current date injected now needs none at all — see
+     * [com.softwaremine.dps.ai.intent.IntentPromptBuilder]'s class doc for
+     * why, and [com.softwaremine.dps.ai.intent.IntentPromptBuilderTest] for
+     * the unit-level coverage of the builder in isolation. This checks the
+     * same invariant holds for the exact prompt this orchestrator actually
+     * sends to the engine.
+     */
     @Test
-    fun `the classification prompt is grounded in the current date`() = runTest {
+    fun `the classification prompt sent to the engine never contains Now`() = runTest {
         val engine = ScriptedEngine(DpsResult.Success("""{"intent":"conversation"}"""))
 
         orchestrator(engine, listOf(reminderTool())).handle("remind me tomorrow")
 
         assertNotNull(engine.prompts.singleOrNull())
-        assertTrue(engine.prompts.single().contains("2026-08-06"))
+        assertTrue(!engine.prompts.single().contains("Now:"))
     }
 
     /** Nothing that reaches the orchestrator may escape as an exception. */

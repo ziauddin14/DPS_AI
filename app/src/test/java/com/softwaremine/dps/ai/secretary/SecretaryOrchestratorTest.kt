@@ -8,6 +8,10 @@ import com.softwaremine.dps.ai.intent.ToolSelector
 import com.softwaremine.dps.ai.memory.ActionDetector
 import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
 import com.softwaremine.dps.ai.memory.ReferenceResolver
+import com.softwaremine.dps.ai.memory.TemporalGroundingGuard
+import com.softwaremine.dps.ai.memory.TemporalPhraseSpanFinder
+import com.softwaremine.dps.ai.memory.TemporalStepAttributor
+import com.softwaremine.dps.ai.memory.TemporalPhraseResolver
 import com.softwaremine.dps.ai.plan.ConfirmationParser
 import com.softwaremine.dps.ai.plan.ContactSelectionParser
 import com.softwaremine.dps.ai.plan.FollowUpSuggestionGenerator
@@ -147,6 +151,7 @@ class SecretaryOrchestratorTest {
         tools: List<AndroidTool>,
         permissions: PermissionManager = FakePermissions(),
         now: () -> Long = System::currentTimeMillis,
+        temporalNow: () -> java.time.LocalDateTime = { java.time.LocalDateTime.now(zone) },
     ): SecretaryOrchestrator {
         val registry = DefaultToolRegistry(silentLogger).apply { tools.forEach(::register) }
         val executor = DefaultToolExecutor(
@@ -168,9 +173,18 @@ class SecretaryOrchestratorTest {
             logger = silentLogger,
         )
 
+        val temporalPhraseResolver = TemporalPhraseResolver(zone = zone, now = temporalNow)
+        val temporalGroundingGuard = TemporalGroundingGuard()
+
         return SecretaryOrchestrator(
             toolOrchestrator = toolOrchestrator,
             referenceResolver = ReferenceResolver(zone = zone),
+            temporalPhraseResolver = temporalPhraseResolver,
+            temporalGroundingGuard = temporalGroundingGuard,
+            temporalStepAttributor = TemporalStepAttributor(
+                spanFinder = TemporalPhraseSpanFinder(resolver = temporalPhraseResolver),
+                groundingGuard = temporalGroundingGuard,
+            ),
             actionDetector = ActionDetector(),
             clarification = ClarificationEngine(),
             memoryUpdater = ConversationMemoryUpdater(zone = zone),
@@ -216,11 +230,11 @@ class SecretaryOrchestratorTest {
         val tool = reminderTool()
         val engine = ScriptedEngine(
             DpsResult.Success(
-                """{"intent":"reminder","parameters":{"title":"call the bank","time":"16:00"}}""",
+                """{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"16:00"}}""",
             ),
         )
 
-        val outcome = secretary(engine, listOf(tool)).handle("remind me to call the bank at 4")
+        val outcome = secretary(engine, listOf(tool)).handle("remind me to call the bank at 16:00")
 
         assertTrue(outcome is ToolOrchestrator.Outcome.Handled)
         assertEquals("create_reminder", tool.calls.single().operation)
@@ -245,12 +259,12 @@ class SecretaryOrchestratorTest {
         val reminders = reminderTool()
         val engine = ScriptedEngine(
             DpsResult.Success(
-                """{"intent":"reminder","parameters":{"person":"Abdul","title":"call Abdul","date":"2026-08-07","time":"16:00"}}""",
+                """{"intent":"reminder","parameters":{"person":"Abdul","title":"call Abdul","raw_when":"16:00"}}""",
             ),
         )
         val orchestrator = secretary(engine, listOf(reminders))
 
-        val outcome = orchestrator.handle("Kal 4 baje Abdul ko yaad dila dena.")
+        val outcome = orchestrator.handle("Kal 16:00 Abdul ko yaad dila dena.")
 
         assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
         assertEquals(1001, orchestrator.memory.value.lastReminder?.id)
@@ -261,14 +275,14 @@ class SecretaryOrchestratorTest {
         val tool = reminderTool()
         val engine = ScriptedEngine(
             DpsResult.Success(
-                """{"intent":"reminder","parameters":{"title":"call the bank","time":"16:00"}}""",
+                """{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"16:00"}}""",
             ),
             // No reminder named — the follow-up must resolve it from memory.
             DpsResult.Success("""{"intent":"reminder","action_type":"update"}"""),
         )
         val orchestrator = secretary(engine, listOf(tool))
 
-        orchestrator.handle("remind me to call the bank at 4")
+        orchestrator.handle("remind me to call the bank at 16:00")
         val second = orchestrator.handle("Uska reminder 30 minute pehle kar do.")
 
         assertTrue("Expected Handled, got $second", second is ToolOrchestrator.Outcome.Handled)
@@ -345,11 +359,11 @@ class SecretaryOrchestratorTest {
     @Test
     fun `a reminder create settles at waiting-confirmation because of its own follow-up suggestion`() = runTest {
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","raw_when":"16:00"}}"""),
         )
         val orchestrator = secretary(engine, listOf(reminderTool()))
 
-        orchestrator.handle("remind me at 4")
+        orchestrator.handle("remind me at 16:00")
 
         assertEquals(SecretaryState.WAITING_CONFIRMATION, orchestrator.state.value)
     }
@@ -360,7 +374,7 @@ class SecretaryOrchestratorTest {
         // all, so this first creates a reminder, then cancels it against a
         // tool that always reports failure.
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","raw_when":"16:00"}}"""),
             DpsResult.Success("""{"intent":"reminder","action_type":"cancel"}"""),
         )
         val failingTool = reminderTool { call ->
@@ -374,7 +388,7 @@ class SecretaryOrchestratorTest {
         }
         val orchestrator = secretary(engine, listOf(failingTool))
 
-        orchestrator.handle("remind me at 4")
+        orchestrator.handle("remind me at 16:00")
         orchestrator.handle("cancel the reminder")
 
         assertEquals(SecretaryState.FAILED, orchestrator.state.value)
@@ -396,14 +410,14 @@ class SecretaryOrchestratorTest {
     fun `state waits on missing information and returns to executing once answered`() = runTest {
         val engine = ScriptedEngine(
             DpsResult.Success("""{"intent":"reminder","parameters":{"title":"the meeting"}}"""),
-            DpsResult.Success("""{"intent":"reminder","parameters":{"time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","parameters":{"raw_when":"16:00"}}"""),
         )
         val orchestrator = secretary(engine, listOf(reminderTool()))
 
         orchestrator.handle("remind me about the meeting")
         assertEquals(SecretaryState.WAITING_MISSING_INFORMATION, orchestrator.state.value)
 
-        orchestrator.handle("at 4pm")
+        orchestrator.handle("at 16:00")
         // Not COMPLETED: the reminder's own follow-up suggestion fires
         // immediately after it succeeds (Stage 2) — see the dedicated test
         // for that behavior.
@@ -521,11 +535,11 @@ class SecretaryOrchestratorTest {
     @Test
     fun `reset forgets memory and returns to idle`() = runTest {
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","raw_when":"16:00"}}"""),
         )
         val orchestrator = secretary(engine, listOf(reminderTool()))
 
-        orchestrator.handle("remind me at 4")
+        orchestrator.handle("remind me at 16:00")
         orchestrator.reset()
 
         assertEquals(SecretaryState.IDLE, orchestrator.state.value)
@@ -650,10 +664,10 @@ class SecretaryOrchestratorTest {
         // The schema addition must not change tool-routing behaviour at all:
         // no reply field is expected or read for a real action.
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"16:00"}}"""),
         )
 
-        val outcome = secretary(engine, listOf(reminderTool())).handle("remind me to call the bank at 4")
+        val outcome = secretary(engine, listOf(reminderTool())).handle("remind me to call the bank at 16:00")
 
         val handled = outcome as? ToolOrchestrator.Outcome.Handled
         assertTrue("Expected Handled, got $outcome", handled != null)
@@ -729,6 +743,346 @@ class SecretaryOrchestratorTest {
         )
     }) = RecordingTool(ToolId.WHATSAPP, setOf("prepare_message", "send_message"), behaviour = behaviour)
 
+    private fun taskTool(behaviour: suspend (ToolCall) -> ToolResult = {
+        ToolResult.Success("Task \"${it.arguments["title"]}\" added.", mapOf("task_id" to "1"))
+    }) = RecordingTool(ToolId.TASK, setOf("create_task"), behaviour = behaviour)
+
+    // -----------------------------------------------------------------
+    // Temporal grounding guard (Day 08-E follow-up)
+    //
+    // The real-device investigation found the classification model
+    // reliably producing raw_when="kal shaam 7 baje" for messages that
+    // never mentioned a time at all — reproduced with a fresh model reload
+    // and zero session history, ruling out cache/session contamination.
+    // TemporalGroundingGuard is the fix: these tests reproduce the exact
+    // failure through the full pipeline, scripted engine standing in for
+    // the real model's actual (wrong) output.
+    // -----------------------------------------------------------------
+
+    /**
+     * The critical regression test: byte-for-byte the real-device failure.
+     * A model that hallucinates a temporal phrase for a message that never
+     * had one must never let it reach TemporalPhraseResolver, ToolSelector,
+     * or the tool layer — not as a date, not as a time, not as a due date.
+     */
+    @Test
+    fun `a raw_when the model hallucinated for a non-temporal task is discarded entirely`() = runTest {
+        val tool = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"intent":"task","parameters":{"title":"Buy milk","raw_when":"kal shaam 7 baje"}}""",
+            ),
+        )
+
+        val outcome = secretary(engine, listOf(tool)).handle("Buy milk ka task bana do")
+
+        assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
+        val handled = outcome as ToolOrchestrator.Outcome.Handled
+        assertNull("Ungrounded raw_when must not survive", handled.intent.parameters.rawWhen)
+        assertNull("No date may be resolved from an ungrounded raw_when", handled.intent.parameters.date)
+        assertNull("No time may be resolved from an ungrounded raw_when", handled.intent.parameters.time)
+        assertTrue(
+            "A fabricated due date must never reach the tool call",
+            !tool.calls.single().arguments.containsKey("due"),
+        )
+    }
+
+    @Test
+    fun `a raw_when the model hallucinated for a conversational message is also discarded`() = runTest {
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"intent":"conversation","parameters":{"raw_when":"kal shaam 7 baje","reply":"I am fine, thanks!"}}""",
+            ),
+        )
+
+        val outcome = secretary(engine, listOf(reminderTool())).handle("Salam DPS, kya haal hai?")
+
+        // Conversation never routes through withResolvedTemporalPhrase at
+        // all, but this pins that a bogus raw_when riding along on an
+        // unrelated conversational reply causes no harm either.
+        assertTrue("Expected Conversational, got $outcome", outcome is ToolOrchestrator.Outcome.Conversational)
+    }
+
+    @Test
+    fun `a genuinely grounded raw_when still resolves normally through the guard`() = runTest {
+        val tool = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"16:00"}}""",
+            ),
+        )
+
+        val outcome = secretary(engine, listOf(tool)).handle("call the bank at 16:00")
+
+        assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
+        val handled = outcome as ToolOrchestrator.Outcome.Handled
+        assertEquals("16:00", handled.intent.parameters.time)
+    }
+
+    /**
+     * The regression test for the vulnerability the Day 08-E audit found and
+     * [TemporalStepAttributor] was built to close: a hallucinated `raw_when`
+     * on one step must never pass just because a *different* step of the
+     * same compound message genuinely said those words. Byte for byte the
+     * audit's own worked example (with a period word added so the phrase
+     * actually resolves — the audit's literal "kal 7 baje" is a bare hour,
+     * correctly refused by [TemporalPhraseResolver] regardless of this fix,
+     * which would stop the plan at step 1 and never reach step 2 at all).
+     *
+     * Before [TemporalStepAttributor] existed, this exact scenario passed
+     * both steps (see git history for the "KNOWN LIMITATION" test this
+     * replaces). It must now reject step 2.
+     */
+    @Test
+    fun `a hallucinated raw_when copying a sibling step's genuine phrase is now rejected`() = runTest {
+        val reminder = reminderTool()
+        val task = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"reminder","parameters":{"title":"call Ali","raw_when":"kal shaam 7 baje"}},
+                    {"intent":"task","parameters":{"title":"khareedna","raw_when":"kal shaam 7 baje"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(reminder, task))
+            .handle("kal shaam 7 baje Ali ko call karna aur milk khareedna")
+
+        // Step 1 legitimately said "kal shaam 7 baje" — claims the one
+        // occurrence in the message, resolves normally.
+        assertEquals(1, reminder.calls.size)
+        assertTrue("Step 1's genuine phrase must still resolve", reminder.calls.single().arguments.containsKey("time"))
+        // Step 2 never mentioned a time — its identical raw_when finds no
+        // still-unclaimed occurrence (the only one is already claimed by
+        // step 1), so it is discarded. No fabricated due date.
+        assertEquals(1, task.calls.size)
+        assertTrue(
+            "Step 2's raw_when must be rejected — the one occurrence of this phrase belongs to step 1",
+            !task.calls.single().arguments.containsKey("due"),
+        )
+    }
+
+    /**
+     * Multi-step investigation Case G: a phrase absent from the *entire*
+     * compound message — not just one step — must still be rejected on
+     * both steps. This already held under whole-message grounding and
+     * continues to hold under [TemporalStepAttributor]: with no genuine
+     * occurrence anywhere in the message, [TemporalPhraseSpanFinder] finds
+     * no span at all for either step to claim.
+     *
+     * Both steps are TASK, not REMINDER: TASK's completeness never depends
+     * on a time ([com.softwaremine.dps.domain.intent.requiredFields] only
+     * needs a title), so a rejected `raw_when` does not stop the plan at
+     * step 1 on a clarification question — both steps genuinely execute,
+     * which is what actually exercises the guard on step 2's raw_when
+     * rather than the plan never reaching it.
+     */
+    @Test
+    fun `multi-step Case G - a phrase absent from the whole message is rejected on every step`() = runTest {
+        val first = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"task","parameters":{"title":"meeting follow-up","raw_when":"kal shaam 7 baje"}},
+                    {"intent":"task","parameters":{"title":"milk","raw_when":"kal shaam 7 baje"}}
+                ]}""",
+            ),
+        )
+
+        val outcome = secretary(engine, listOf(first))
+            .handle("meeting follow-up ka task bana do aur milk ka task bana do")
+
+        // Both steps route to the one registered TASK tool, so both calls
+        // land on `first` — the point is that the hallucinated phrase is
+        // absent from the whole message, so TemporalPhraseSpanFinder finds
+        // no span for either step to claim.
+        assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
+        assertEquals(2, first.calls.size)
+        first.calls.forEach { call ->
+            assertTrue(
+                "A phrase absent from the whole message must be rejected on every step: $call",
+                !call.arguments.containsKey("due"),
+            )
+        }
+    }
+
+    /** Multi-step investigation Example 1: the temporal phrase belongs to step 1 only. */
+    @Test
+    fun `multi-step - a temporal phrase on the first step does not reach the second`() = runTest {
+        val reminder = reminderTool()
+        val task = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"reminder","parameters":{"title":"call Ali","raw_when":"kal shaam 7 baje"}},
+                    {"intent":"task","parameters":{"title":"milk"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(reminder, task))
+            .handle("kal shaam 7 baje Ali ko call karne ka reminder laga do aur milk khareedne ka task bana do")
+
+        assertEquals(1, reminder.calls.size)
+        assertTrue(reminder.calls.single().arguments.containsKey("time"))
+        assertEquals(1, task.calls.size)
+        assertTrue("Step 2 never had a raw_when at all — no due should appear", !task.calls.single().arguments.containsKey("due"))
+    }
+
+    /** Multi-step investigation Example 2: the temporal phrase belongs to step 2 only. */
+    @Test
+    fun `multi-step - a temporal phrase on the second step does not reach the first`() = runTest {
+        val task = taskTool()
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"task","parameters":{"title":"milk"}},
+                    {"intent":"reminder","parameters":{"title":"call Ali","raw_when":"kal shaam 7 baje"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(task, reminder))
+            .handle("milk khareedne ka task bana do aur kal shaam 7 baje Ali ko call karne ka reminder laga do")
+
+        assertTrue("Step 1 never had a raw_when at all — no due should appear", !task.calls.single().arguments.containsKey("due"))
+        assertEquals(1, reminder.calls.size)
+        assertTrue(reminder.calls.single().arguments.containsKey("time"))
+    }
+
+    /** Multi-step investigation Example 3: two distinct genuine phrases, each independently attributed. */
+    @Test
+    fun `multi-step - two different genuine phrases resolve independently`() = runTest {
+        val first = reminderTool()
+        val second = RecordingTool(ToolId.REMINDER, setOf("create_reminder")) {
+            ToolResult.Success("Reminder set.", mapOf("reminder_id" to "2", "trigger_at" to "2000000", "exact" to "true"))
+        }
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"reminder","parameters":{"title":"first reminder","raw_when":"kal shaam 7 baje"}},
+                    {"intent":"reminder","parameters":{"title":"second reminder","raw_when":"kal raat 11 baje"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(first))
+            .handle("kal shaam 7 baje reminder laga do aur kal raat 11 baje doosra reminder laga do")
+
+        // Both steps route to the one registered REMINDER tool.
+        assertEquals(2, first.calls.size)
+        first.calls.forEach { call ->
+            assertTrue("Each genuinely distinct phrase must resolve on its own step: $call", call.arguments.containsKey("time"))
+        }
+    }
+
+    /** Multi-step investigation Case F: no temporal phrase anywhere, nothing is invented for either step. */
+    @Test
+    fun `multi-step - neither step has a temporal phrase`() = runTest {
+        val task = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"task","parameters":{"title":"meeting follow-up"}},
+                    {"intent":"task","parameters":{"title":"milk"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(task))
+            .handle("meeting follow-up ka task bana do aur milk ka task bana do")
+
+        assertEquals(2, task.calls.size)
+        task.calls.forEach { call -> assertTrue(!call.arguments.containsKey("due")) }
+    }
+
+    /** Multi-step investigation: punctuation around the boundary must not break attribution. */
+    @Test
+    fun `multi-step - punctuation around the phrase does not prevent attribution`() = runTest {
+        val reminder = reminderTool()
+        val task = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"reminder","parameters":{"title":"call Ali","raw_when":"kal shaam 7 baje"}},
+                    {"intent":"task","parameters":{"title":"milk"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(reminder, task))
+            .handle("Kal, shaam 7 baje, Ali ko call karne ka reminder laga do — aur milk khareedne ka task bana do.")
+
+        assertTrue(reminder.calls.single().arguments.containsKey("time"))
+        assertTrue(!task.calls.single().arguments.containsKey("due"))
+    }
+
+    /** Multi-step investigation: a dropped ko/ke/ki filler word still attributes correctly. */
+    @Test
+    fun `multi-step - a raw_when that dropped a filler word still attributes to its own step`() = runTest {
+        val reminder = reminderTool()
+        val task = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"reminder","parameters":{"title":"call Ali","raw_when":"kal shaam 7 baje"}},
+                    {"intent":"task","parameters":{"title":"milk"}}
+                ]}""",
+            ),
+        )
+
+        // The user's own message says "kal shaam ko 7 baje"; the model's
+        // raw_when dropped "ko" — must still be accepted for step 1 and
+        // still never appear on step 2.
+        secretary(engine, listOf(reminder, task))
+            .handle("kal shaam ko 7 baje Ali ko call karne ka reminder laga do aur milk khareedne ka task bana do")
+
+        assertTrue(reminder.calls.single().arguments.containsKey("time"))
+        assertTrue(!task.calls.single().arguments.containsKey("due"))
+    }
+
+    /**
+     * Multi-step investigation: the deliberately unsolved case — a phrase
+     * genuinely meant to apply to two steps. "Kal subah 9 baje dono kaam
+     * karne hain: Ali ko call karo aur uska task bana do" (tomorrow 9am both
+     * things need doing — a full period+hour phrase, not the bare "kal
+     * subah" the task's own example uses, because a bare period word with
+     * no hour never resolves a time at all and would block the plan at step
+     * 1's own clarification before step 2 is ever reached, never exercising
+     * the behavior this test exists to prove). The phrase occurs exactly
+     * once in the message; a step whose raw_when could refer to it, but
+     * whose occurrence was already claimed by the other step, must fail
+     * closed rather than silently inherit — per this task's explicit
+     * instruction not to invent shared-ownership semantics.
+     */
+    @Test
+    fun `multi-step - a phrase intended for two steps is not silently shared, fails closed`() = runTest {
+        val reminder = reminderTool()
+        val task = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"reminder","parameters":{"title":"call Ali","raw_when":"kal subah 9 baje"}},
+                    {"intent":"task","parameters":{"title":"uska task","raw_when":"kal subah 9 baje"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(reminder, task))
+            .handle("Kal subah 9 baje dono kaam karne hain: Ali ko call karo aur uska task bana do")
+
+        // Step 1 claims the one genuine occurrence.
+        assertTrue(reminder.calls.single().arguments.containsKey("time"))
+        // Step 2's identical claim finds no unclaimed occurrence left —
+        // rejected, not silently granted the shared meaning.
+        assertTrue(
+            "A phrase meant for two steps must not be silently shared — this is deliberately unsolved",
+            !task.calls.single().arguments.containsKey("due"),
+        )
+    }
+
     // -----------------------------------------------------------------
     // Multi-step planning (Day 05 Phase E Stage 2)
     // -----------------------------------------------------------------
@@ -740,14 +1094,14 @@ class SecretaryOrchestratorTest {
         val engine = ScriptedEngine(
             DpsResult.Success(
                 """{"steps":[
-                    {"intent":"calendar_event","parameters":{"title":"meeting with Abdul","date":"2026-08-07","time":"16:00"}},
+                    {"intent":"calendar_event","parameters":{"title":"meeting with Abdul","raw_when":"16:00"}},
                     {"intent":"reminder","parameters":{"title":"meeting with Abdul"}}
                 ]}""",
             ),
         )
 
         val outcome = secretary(engine, listOf(calendar, reminder))
-            .handle("kal 4 baje meeting bana do aur reminder bhi laga do")
+            .handle("kal 16:00 meeting bana do aur reminder bhi laga do")
 
         assertTrue("Expected Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
         assertEquals(1, calendar.calls.size)
@@ -763,13 +1117,13 @@ class SecretaryOrchestratorTest {
         val engine = ScriptedEngine(
             DpsResult.Success(
                 """{"steps":[
-                    {"intent":"calendar_event","parameters":{"title":"meeting","date":"2026-08-07","time":"16:00"}},
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
                     {"intent":"reminder","parameters":{"title":"meeting"}}
                 ]}""",
             ),
         )
 
-        secretary(engine, listOf(calendar, reminder)).handle("kal 4 baje meeting bana do aur reminder bhi laga do")
+        secretary(engine, listOf(calendar, reminder)).handle("kal 16:00 meeting bana do aur reminder bhi laga do")
 
         val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 30)
             .atZone(zone).toInstant().toEpochMilli().toString()
@@ -783,14 +1137,14 @@ class SecretaryOrchestratorTest {
         val engine = ScriptedEngine(
             DpsResult.Success(
                 """{"steps":[
-                    {"intent":"calendar_event","parameters":{"title":"meeting","date":"2026-08-07","time":"16:00"}},
-                    {"intent":"reminder","parameters":{"title":"meeting","time":"15:30"}}
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"meeting","raw_when":"15:30"}}
                 ]}""",
             ),
         )
         val secretary = secretary(engine, listOf(calendar, reminder))
 
-        val outcome = secretary.handle("kal meeting bana do aur reminder laga do") as ToolOrchestrator.Outcome.Handled
+        val outcome = secretary.handle("kal 16:00 meeting bana do aur reminder laga do") as ToolOrchestrator.Outcome.Handled
 
         assertTrue(outcome.reply.contains("No calendar on this device"))
         // The second step must never have been attempted once the first, required, step failed.
@@ -803,14 +1157,14 @@ class SecretaryOrchestratorTest {
         val engine = ScriptedEngine(
             DpsResult.Success(
                 """{"steps":[
-                    {"intent":"calendar_event","parameters":{"title":"x","date":"2026-08-07","time":"16:00"}},
-                    {"intent":"reminder","parameters":{"title":"x","time":"15:30"}}
+                    {"intent":"calendar_event","parameters":{"title":"x","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"x","raw_when":"15:30"}}
                 ]}""",
             ),
         )
 
         secretary(engine, listOf(calendarTool(), reminderTool()))
-            .handle("kal meeting bana do aur reminder laga do")
+            .handle("kal 16:00 meeting bana do aur reminder laga do")
 
         assertEquals(1, engine.index)
     }
@@ -859,11 +1213,11 @@ class SecretaryOrchestratorTest {
     fun `a calendar event naming an ambiguous person also asks, matching the brief's own example`() = runTest {
         val calendar = calendarTool()
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"calendar_event","parameters":{"person":"Abdul","title":"meeting","date":"2026-08-07","time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"person":"Abdul","title":"meeting","raw_when":"16:00"}}"""),
         )
 
         val outcome = secretary(engine, listOf(ambiguousContactsTool(), calendar))
-            .handle("Kal 4 baje Abdul ke saath meeting schedule kar do")
+            .handle("Kal 16:00 Abdul ke saath meeting schedule kar do")
 
         assertTrue("Expected Clarify, got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
         assertTrue("Calendar event must wait for disambiguation", calendar.calls.isEmpty())
@@ -876,10 +1230,10 @@ class SecretaryOrchestratorTest {
             ToolId.CONTACTS, setOf("find_contact"), setOf(DpsPermission.READ_CONTACTS),
         ) { ToolResult.Failure("No contact matches \"Ghost\".", retryable = false) }
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"calendar_event","parameters":{"person":"Ghost","title":"meeting","date":"2026-08-07","time":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"person":"Ghost","title":"meeting","raw_when":"16:00"}}"""),
         )
 
-        val outcome = secretary(engine, listOf(noMatch, calendar)).handle("meeting with Ghost tomorrow at 4")
+        val outcome = secretary(engine, listOf(noMatch, calendar)).handle("meeting with Ghost tomorrow at 16:00")
 
         // Grounding is best-effort for calendar events — a miss must not block
         // a request the calendar tool never needed the contact to fulfil.
@@ -895,12 +1249,12 @@ class SecretaryOrchestratorTest {
     fun `deleting a calendar event asks before doing anything`() = runTest {
         val calendar = calendarTool()
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","date":"2026-08-07","time":"09:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","raw_when":"09:00"}}"""),
             DpsResult.Success("""{"intent":"calendar_event","action_type":"cancel","parameters":{}}"""),
         )
         val secretary = secretary(engine, listOf(calendar))
 
-        secretary.handle("standup tomorrow at 9")
+        secretary.handle("standup tomorrow at 09:00")
         calendar.calls.clear()
         val outcome = secretary.handle("us meeting ko delete kar do")
 
@@ -914,12 +1268,12 @@ class SecretaryOrchestratorTest {
     fun `confirming a delete executes it`() = runTest {
         val calendar = calendarTool()
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","date":"2026-08-07","time":"09:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","raw_when":"09:00"}}"""),
             DpsResult.Success("""{"intent":"calendar_event","action_type":"cancel","parameters":{}}"""),
         )
         val secretary = secretary(engine, listOf(calendar))
 
-        secretary.handle("standup tomorrow at 9")
+        secretary.handle("standup tomorrow at 09:00")
         calendar.calls.clear()
         secretary.handle("us meeting ko delete kar do")
         val confirmed = secretary.handle("haan")
@@ -933,12 +1287,12 @@ class SecretaryOrchestratorTest {
     fun `declining a delete leaves it alone`() = runTest {
         val calendar = calendarTool()
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","date":"2026-08-07","time":"09:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","raw_when":"09:00"}}"""),
             DpsResult.Success("""{"intent":"calendar_event","action_type":"cancel","parameters":{}}"""),
         )
         val secretary = secretary(engine, listOf(calendar))
 
-        secretary.handle("standup tomorrow at 9")
+        secretary.handle("standup tomorrow at 09:00")
         calendar.calls.clear()
         secretary.handle("us meeting ko delete kar do")
         val callsBeforeDecline = engine.index
@@ -964,11 +1318,11 @@ class SecretaryOrchestratorTest {
     @Test
     fun `a created calendar event offers a reminder suggestion in the same reply`() = runTest {
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","date":"2026-08-07","time":"09:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","raw_when":"09:00"}}"""),
         )
         val secretary = secretary(engine, listOf(calendarTool()))
 
-        val outcome = secretary.handle("standup tomorrow at 9") as ToolOrchestrator.Outcome.Handled
+        val outcome = secretary.handle("standup tomorrow at 09:00") as ToolOrchestrator.Outcome.Handled
 
         assertTrue(outcome.reply.contains("reminder"))
         assertEquals(SecretaryState.WAITING_CONFIRMATION, secretary.state.value)
@@ -979,11 +1333,11 @@ class SecretaryOrchestratorTest {
         val calendar = calendarTool()
         val reminder = reminderTool()
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","date":"2026-08-07","time":"09:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","raw_when":"09:00"}}"""),
         )
         val secretary = secretary(engine, listOf(calendar, reminder))
 
-        secretary.handle("standup tomorrow at 9")
+        secretary.handle("standup tomorrow at 09:00")
         val accepted = secretary.handle("haan please")
 
         assertTrue("Expected Handled, got $accepted", accepted is ToolOrchestrator.Outcome.Handled)
@@ -999,13 +1353,13 @@ class SecretaryOrchestratorTest {
         // classifies as — it must actually reach the model, proving the
         // pending suggestion did not silently swallow it as a yes/no answer.
         val engine = ScriptedEngine(
-            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","date":"2026-08-07","time":"09:00"}}"""),
-            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"pay rent","time":"18:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","raw_when":"09:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"pay rent","raw_when":"18:00"}}"""),
         )
         val secretary = secretary(engine, listOf(calendar, reminder))
 
-        secretary.handle("standup tomorrow at 9")
-        val continued = secretary.handle("remind me to pay rent at 6pm")
+        secretary.handle("standup tomorrow at 09:00")
+        val continued = secretary.handle("remind me to pay rent at 18:00")
 
         assertTrue("Expected Handled, got $continued", continued is ToolOrchestrator.Outcome.Handled)
         assertEquals(2, engine.index)

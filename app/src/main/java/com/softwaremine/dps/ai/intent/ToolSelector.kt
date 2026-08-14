@@ -409,12 +409,15 @@ class ToolSelector(
     }
 
     /**
-     * Parses a date from the shapes a model actually emits.
+     * Parses a date from the shapes this pipeline actually produces.
      *
      * ISO first, then a small set of common alternatives. Relative expressions —
-     * "tomorrow", "next Tuesday" — are deliberately **not** handled here: the
-     * model has the conversation and today's date and is asked to resolve them
-     * into `YYYY-MM-DD`. A parser in this layer would guess worse, and silently.
+     * "tomorrow", "kal shaam 7 baje" — are deliberately **not** handled here:
+     * by the time a [DpsIntent] reaches this class, `date`/`time` are already
+     * absolute, resolved deterministically by
+     * [com.softwaremine.dps.ai.memory.TemporalPhraseResolver] from the model's
+     * verbatim `raw_when` quote (Day 08-E) — this class never sees, and does
+     * not need to parse, a relative phrase at all.
      */
     internal fun parseDate(raw: String): LocalDate? {
         val trimmed = raw.trim()

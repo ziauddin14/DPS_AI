@@ -189,6 +189,32 @@ data class IntentParameters(
      * a clarification question would ask for.
      */
     val reply: String? = null,
+
+    /**
+     * The user's own words about *when*, quoted verbatim — never a date or
+     * time the model computed itself (Day 08-E).
+     *
+     * The Day 08-D investigation found that asking a 1.5B model to both
+     * classify a request *and* resolve "kal shaam 7 baje" against an
+     * injected `Now:` was unreliable regardless of where `Now:` sat in the
+     * prompt — in a controlled fixed-clock retest the model sometimes
+     * substituted `Now:`'s own value for the time the user actually stated,
+     * once producing a structurally successful but factually wrong
+     * reminder. [rawWhen] replaces that arithmetic with a quoting task: the
+     * model copies the phrase, and
+     * [com.softwaremine.dps.ai.memory.TemporalPhraseResolver] — deterministic
+     * Kotlin, reading the real system clock, never the model — turns it into
+     * [date]/[time]. This also means the classification prompt no longer
+     * needs `Now:` at all, restoring the byte-for-byte-stable prefix Day
+     * 08-D was chasing without the regression it caused.
+     *
+     * Not part of [IntentField]/[value] — like [reply], this names an
+     * intermediate quote the model produced, not a fact
+     * [com.softwaremine.dps.ai.intent.ClarificationEngine] gates
+     * completeness on; [date]/[time] remain the fields that gate it, exactly
+     * as before.
+     */
+    val rawWhen: String? = null,
 ) {
 
     /** Non-blank value for [field], or `null`. */

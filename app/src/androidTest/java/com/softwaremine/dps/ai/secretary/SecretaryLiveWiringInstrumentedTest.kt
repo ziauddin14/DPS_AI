@@ -11,6 +11,10 @@ import com.softwaremine.dps.ai.intent.ToolSelector
 import com.softwaremine.dps.ai.memory.ActionDetector
 import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
 import com.softwaremine.dps.ai.memory.ReferenceResolver
+import com.softwaremine.dps.ai.memory.TemporalGroundingGuard
+import com.softwaremine.dps.ai.memory.TemporalPhraseSpanFinder
+import com.softwaremine.dps.ai.memory.TemporalStepAttributor
+import com.softwaremine.dps.ai.memory.TemporalPhraseResolver
 import com.softwaremine.dps.ai.plan.ConfirmationParser
 import com.softwaremine.dps.ai.plan.ContactSelectionParser
 import com.softwaremine.dps.ai.plan.FollowUpSuggestionGenerator
@@ -124,6 +128,9 @@ class SecretaryLiveWiringInstrumentedTest {
         return SecretaryOrchestrator(
             toolOrchestrator = toolOrchestrator,
             referenceResolver = ReferenceResolver(),
+            temporalPhraseResolver = TemporalPhraseResolver(),
+            temporalGroundingGuard = TemporalGroundingGuard(),
+            temporalStepAttributor = TemporalStepAttributor(TemporalPhraseSpanFinder(), TemporalGroundingGuard()),
             actionDetector = ActionDetector(),
             clarification = ClarificationEngine(),
             memoryUpdater = ConversationMemoryUpdater(),
@@ -170,11 +177,11 @@ class SecretaryLiveWiringInstrumentedTest {
     @Test
     fun rescheduleFollowUpResolvesAgainstTheRealReminderJustCreated(): Unit = runBlocking {
         val orchestrator = secretary(
-            """{"intent":"reminder","parameters":{"title":"call the bank","date":"2099-01-01","time":"16:00"}}""",
+            """{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"16:00"}}""",
             """{"intent":"reminder","action_type":"update"}""",
         )
 
-        val first = orchestrator.handle("remind me to call the bank on 2099-01-01 at 4pm")
+        val first = orchestrator.handle("remind me to call the bank at 4pm")
         assertTrue("Expected Handled, got $first", first is ToolOrchestrator.Outcome.Handled)
         assertNotNull("Memory did not record the created reminder", orchestrator.memory.value.lastReminder)
 
@@ -241,12 +248,12 @@ class SecretaryLiveWiringInstrumentedTest {
     @Test
     fun rescheduleAndDeleteResolveAgainstTheRealEventJustCreated(): Unit = runBlocking {
         val orchestrator = secretary(
-            """{"intent":"calendar_event","parameters":{"title":"standup","date":"2099-01-01","time":"09:00"}}""",
-            """{"intent":"calendar_event","action_type":"update","parameters":{"time":"17:00"}}""",
+            """{"intent":"calendar_event","parameters":{"title":"standup","raw_when":"09:00"}}""",
+            """{"intent":"calendar_event","action_type":"update","parameters":{"raw_when":"17:00"}}""",
             """{"intent":"calendar_event","action_type":"cancel","parameters":{}}""",
         )
 
-        val created = orchestrator.handle("standup on 2099-01-01 at 9am")
+        val created = orchestrator.handle("standup at 9am")
         assertTrue(
             "Expected Handled or NeedsPermission, got $created",
             created is ToolOrchestrator.Outcome.Handled || created is ToolOrchestrator.Outcome.NeedsPermission,
