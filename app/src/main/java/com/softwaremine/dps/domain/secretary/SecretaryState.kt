@@ -29,6 +29,13 @@ enum class SecretaryState {
     /** Several contacts matched; waiting on the user to pick one. */
     WAITING_CONTACT_SELECTION,
 
+    /**
+     * The classification named a type with no resolvable target, and memory
+     * holds one or more plausible alternatives; waiting on the user to say
+     * which one, or none (Day 09, Option 1).
+     */
+    WAITING_TYPE_DISAMBIGUATION,
+
     /** The request is understood but missing a required detail. */
     WAITING_MISSING_INFORMATION,
 
@@ -76,6 +83,12 @@ sealed interface SecretaryEvent {
 
     /** The user picked one of the offered contacts. */
     data object ContactSelected : SecretaryEvent
+
+    /** A structurally ambiguous non-CREATE classification was held pending a redirect (Day 09, Option 1). */
+    data object TypeDisambiguationNeeded : SecretaryEvent
+
+    /** The user answered the redirect question, chosen or declined. */
+    data object TypeDisambiguationResolved : SecretaryEvent
 
     /** A follow-up suggestion was offered ("...bhi bana doon?"). */
     data object ConfirmationRequested : SecretaryEvent
@@ -131,9 +144,15 @@ object SecretaryStateMachine {
                 SecretaryEvent.ClarificationNeeded -> SecretaryState.WAITING_MISSING_INFORMATION
                 SecretaryEvent.PermissionNeeded -> SecretaryState.WAITING_PERMISSION
                 SecretaryEvent.ContactAmbiguous -> SecretaryState.WAITING_CONTACT_SELECTION
+                SecretaryEvent.TypeDisambiguationNeeded -> SecretaryState.WAITING_TYPE_DISAMBIGUATION
                 SecretaryEvent.ConfirmationRequested -> SecretaryState.WAITING_CONFIRMATION
                 SecretaryEvent.ExecutionSucceeded -> SecretaryState.COMPLETED
                 SecretaryEvent.ExecutionFailed -> SecretaryState.FAILED
+                else -> current
+            }
+
+            SecretaryState.WAITING_TYPE_DISAMBIGUATION -> when (event) {
+                SecretaryEvent.TypeDisambiguationResolved -> SecretaryState.EXECUTING
                 else -> current
             }
 

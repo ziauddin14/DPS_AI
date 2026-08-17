@@ -24,8 +24,11 @@ import com.softwaremine.dps.domain.intent.IntentType
 import com.softwaremine.dps.domain.intent.PendingPermissionAction
 import com.softwaremine.dps.domain.intent.toolId
 import com.softwaremine.dps.domain.memory.ConversationMemory
+import com.softwaremine.dps.domain.secretary.DisambiguationCandidate
 import com.softwaremine.dps.domain.secretary.PendingConfirmation
 import com.softwaremine.dps.domain.secretary.PendingContactSelection
+import com.softwaremine.dps.domain.secretary.PendingPlan
+import com.softwaremine.dps.domain.secretary.PendingTypeDisambiguation
 import com.softwaremine.dps.domain.secretary.SecretaryEvent
 import com.softwaremine.dps.domain.secretary.SecretaryState
 import com.softwaremine.dps.domain.secretary.SecretaryStateMachine
@@ -99,8 +102,22 @@ class SecretaryOrchestrator(
     /** A request held because a contact lookup found more than one match. */
     private var pendingContactSelection: PendingContactSelection? = null
 
+    /**
+     * A request held because its classification named a type with no
+     * resolvable target while memory held a plausible alternative it never
+     * considered (Day 09, Option 1). See [disambiguationCandidates].
+     */
+    private var pendingTypeDisambiguation: PendingTypeDisambiguation? = null
+
     /** A follow-up suggestion, or a destructive action, waiting on a yes/no. */
     private var pendingConfirmation: PendingConfirmation? = null
+
+    /**
+     * The unexecuted remainder of a multi-step plan, held alongside whichever
+     * of the four pending fields above is currently blocking step N (M2-C).
+     * See [PendingPlan]'s own doc for exactly what it does and does not own.
+     */
+    private var pendingPlan: PendingPlan? = null
 
     /**
      * The request a `find_contact` pre-resolution step was run on behalf of,
@@ -125,6 +142,7 @@ class SecretaryOrchestrator(
     suspend fun handle(userMessage: String, recentContext: String? = null): ToolOrchestrator.Outcome {
         pendingContactSelection?.let { return resolveContactSelection(userMessage, it) }
         pendingConfirmation?.let { return resolveConfirmation(userMessage, it) }
+        pendingTypeDisambiguation?.let { return resolveTypeDisambiguation(userMessage, it) }
 
         val awaiting = pendingClarification
 
@@ -162,12 +180,37 @@ class SecretaryOrchestrator(
         // Mirrors ToolOrchestrator.handle's own merge step exactly — an answer
         // to a follow-up carries only the missing piece, so it is folded into
         // what was already understood rather than replacing it.
-        val resolved = if (awaiting != null && classified.type != IntentType.CONVERSATION) {
-            classified.copy(parameters = clarification.merge(awaiting.partial, classified.parameters))
-        } else if (awaiting != null) {
-            awaiting.intent.copy(parameters = clarification.merge(awaiting.partial, classified.parameters))
-        } else {
-            classified
+        //
+        // The merge only fires when the new classification names the *same*
+        // intent type the pending question was actually about (or gave up
+        // and classified as bare conversation, which carries no fields of
+        // its own to conflict with anything). A message that classifies as a
+        // genuinely different type is a fresh, self-contained request, not
+        // an answer — merging would otherwise let a stale field from the
+        // abandoned question (e.g. a reminder's `message`) silently leak
+        // into an unrelated new intent (e.g. a notification), which could
+        // make that new request look complete when the model supplied
+        // nothing of its own. Investigation evidence: a dangling "when
+        // should I remind you?" clarification's leftover message field was
+        // observed satisfying a completely unrelated NOTIFICATION request's
+        // required-field check on a later turn.
+        val resolved = when {
+            awaiting == null -> classified
+
+            classified.type == IntentType.CONVERSATION ->
+                awaiting.intent.copy(parameters = clarification.merge(awaiting.partial, classified.parameters))
+
+            classified.type == awaiting.intent.type ->
+                classified.copy(parameters = clarification.merge(awaiting.partial, classified.parameters))
+
+            else -> {
+                // M2-C: a message that does not answer the pending
+                // clarification abandons whatever plan remainder was
+                // parked behind it too — the remainder only ever made
+                // sense in the context of the step being abandoned here.
+                pendingPlan = null
+                classified
+            }
         }
 
         if (resolved.type == IntentType.CONVERSATION) {
@@ -195,7 +238,19 @@ class SecretaryOrchestrator(
         )
         val enriched = withResolvedTemporalPhrase(userMessage, referenced)
 
-        return when (val check = clarification.check(enriched)) {
+        val check = clarification.check(enriched)
+
+        // Day 09, Option 1: before turning check's own verdict into a
+        // question or an execution, see whether memory holds a plausible
+        // alternative this classification never got to consider — see
+        // disambiguationCandidates's doc for exactly when this fires.
+        val candidates = disambiguationCandidates(enriched, check)
+        if (candidates.isNotEmpty()) {
+            pendingClarification = null
+            return askTypeDisambiguation(enriched, candidates)
+        }
+
+        return when (check) {
             is ClarificationEngine.Check.Missing -> {
                 val needs = IntentResolution.NeedsClarification(
                     intent = enriched,
@@ -211,7 +266,10 @@ class SecretaryOrchestrator(
 
             ClarificationEngine.Check.Complete -> {
                 pendingClarification = null
-                proceedToExecution(enriched)
+                // M2-C: continueAfterResumedStep is a no-op passthrough
+                // whenever pendingPlan is null (the ordinary, non-plan
+                // case) — see its own doc.
+                continueAfterResumedStep(proceedToExecution(enriched))
             }
         }
     }
@@ -270,7 +328,9 @@ class SecretaryOrchestrator(
     fun reset() {
         pendingClarification = null
         pendingContactSelection = null
+        pendingTypeDisambiguation = null
         pendingConfirmation = null
+        pendingPlan = null
         pendingIntentAwaitingContactPermission = null
         toolOrchestrator.reset()
         _state.value = transition(SecretaryEvent.Reset)
@@ -280,6 +340,7 @@ class SecretaryOrchestrator(
     /** The follow-up currently awaiting an answer, if any. */
     fun pendingQuestion(): String? = pendingClarification?.question
         ?: pendingContactSelection?.let { candidateQuestion(it.candidates) }
+        ?: pendingTypeDisambiguation?.let { disambiguationQuestion(it.candidates) }
         ?: pendingConfirmation?.let { CONFIRMATION_REPROMPT }
 
     /** Whether an action is held pending a permission grant. */
@@ -291,18 +352,24 @@ class SecretaryOrchestrator(
 
     /**
      * Runs [steps] in order, stopping at the first one that does not finish
-     * ([ClarificationEngine.Check.Missing], a permission, or contact
-     * ambiguity) or fails outright.
+     * ([ClarificationEngine.Check.Missing], a confirmation, contact
+     * ambiguity, or a Day 09 Option 1 redirect) or fails outright.
      *
      * ## Scope (documented, not hidden)
-     * A block mid-plan resolves the *one* step it blocked — permission
-     * granted, contact chosen, missing detail supplied — through exactly the
-     * same single-step resume paths Stage 1 already has. Steps after the
-     * blocked one are not automatically resumed; the report says so
-     * explicitly rather than silently dropping them. Reaching a genuinely
-     * useful "resume step 3 of 4" would need every one of those single-step
-     * resume paths to also carry the rest of the plan, which is real new
-     * surface area deferred rather than half-built here.
+     * A block mid-plan resolves the *one* step it blocked — contact chosen,
+     * missing detail supplied, confirmation decided, type disambiguated —
+     * through exactly the same single-step resume paths Stage 1 already has.
+     * Since M2-C, everything *after* that step is preserved as a
+     * [com.softwaremine.dps.domain.secretary.PendingPlan] and automatically
+     * continues once it resolves — see [continueAfterResumedStep] and
+     * [parkRemainder]. The one still-open exception is a step blocked on an
+     * Android/tool *permission*: that resumes through
+     * [onPermissionResult] — a system callback carrying no user message at
+     * all, entirely outside this class's `handle()`-based dispatch, with its
+     * own pending state living inside [ToolOrchestrator], not here. Reaching
+     * that case too would mean extending a second class's private state,
+     * genuinely separate surface area left for a future pass rather than
+     * folded in here.
      *
      * ## Why no cue-based enrichment runs per step
      * [ReferenceResolver] and [ActionDetector] both work from the *raw text
@@ -312,17 +379,10 @@ class SecretaryOrchestrator(
      * carries only what the model itself put in it, plus [anchorToPriorEvent]
      * — the one deterministic cross-step rule this class knows: a bodiless,
      * timeless reminder step immediately following a calendar event step
-     * defaults to 30 minutes before that event, the convention the brief's
-     * own worked example names. A different offset in the same compound
-     * message is not yet parsed; asking for it as a follow-up message still
-     * works, via [ReferenceResolver]'s existing single-turn path.
+     * defaults to 30 minutes before that event, unless it stated its own
+     * offset instead (M2-A; see [reminderOffsetMillis]).
      */
     private suspend fun handlePlan(userMessage: String, steps: List<DpsIntent>): ToolOrchestrator.Outcome {
-        val replies = mutableListOf<String>()
-        var lastResult: ToolResult = ToolResult.Cancelled("No steps were run.")
-        var lastIntent: DpsIntent = steps.first()
-        var lastEventStartMillis: Long? = null
-
         // Day 08-E follow-up: a whole-message grounding check (what
         // withResolvedTemporalPhrase uses for single-step) was proven, by a
         // JVM regression test, to accept a hallucinated raw_when on one step
@@ -342,9 +402,57 @@ class SecretaryOrchestrator(
         // see TemporalStepAttributor's own doc). Steps are already scoped
         // this way before the loop, so per-step resolution below only ever
         // resolves what attribution already confirmed.
+        //
+        // M2-A: each step's own stated cross-step offset ("15 minutes
+        // before") is read from its *pre-attribution* raw_when — see
+        // reminderOffsetMillis's doc for why this must happen before
+        // temporalStepAttributor runs, which would otherwise strip a
+        // relative-offset phrase it cannot itself resolve.
+        val offsets = steps.map(::reminderOffsetMillis)
         val attributedSteps = temporalStepAttributor.attribute(userMessage, steps)
 
-        for (raw in attributedSteps) {
+        return continuePlan(
+            steps = attributedSteps,
+            offsets = offsets,
+            completedReplies = mutableListOf(),
+            initialLastEventStartMillis = null,
+            initialLastIntent = steps.first(),
+            initialLastResult = ToolResult.Cancelled("No steps were run."),
+        )
+    }
+
+    /**
+     * The shared loop body both [handlePlan] (a fresh compound
+     * classification) and [continueAfterResumedStep] (M2-C: resuming after
+     * one step blocked) run — so a park-and-resume cycle never duplicates
+     * this logic, only re-enters it with a different starting point.
+     *
+     * @param steps already temporal-attributed and offset-extracted —
+     *   [handlePlan] does that once, up front, for the whole compound
+     *   message; a resumed continuation reuses exactly the values a
+     *   [PendingPlan] preserved rather than re-deriving them (re-attributing
+     *   only the remainder against the original message would risk a step
+     *   re-claiming a temporal span an already-completed earlier step
+     *   legitimately claimed the first time).
+     * @param completedReplies replies from steps already finished — empty
+     *   for a fresh plan, or seeded with a [PendingPlan]'s own
+     *   [PendingPlan.completedReplies] plus the just-resumed step's reply
+     *   for a continuation.
+     */
+    private suspend fun continuePlan(
+        steps: List<DpsIntent>,
+        offsets: List<Long?>,
+        completedReplies: MutableList<String>,
+        initialLastEventStartMillis: Long?,
+        initialLastIntent: DpsIntent,
+        initialLastResult: ToolResult,
+    ): ToolOrchestrator.Outcome {
+        val replies = completedReplies
+        var lastEventStartMillis = initialLastEventStartMillis
+        var lastIntent = initialLastIntent
+        var lastResult = initialLastResult
+
+        for ((index, raw) in steps.withIndex()) {
             // Unlike ReferenceResolver/ActionDetector (deliberately skipped
             // per-step above — they scan the *raw text*, and a compound
             // message's raw text does not belong to any one step),
@@ -352,12 +460,60 @@ class SecretaryOrchestrator(
             // already confirmed belongs to this step — safe to run per step,
             // and must run before anchorToPriorEvent so that fallback only
             // ever fires when nothing else resolved anything.
-            val step = anchorToPriorEvent(resolveTemporalPhrase(raw), lastEventStartMillis)
+            val step = anchorToPriorEvent(resolveTemporalPhrase(raw), lastEventStartMillis, offsets[index])
 
-            when (val check = clarification.check(step)) {
+            val check = clarification.check(step)
+
+            // M2-B: the same Day 09 Option 1 redirect handleSingleStep
+            // already applies is now reachable from inside a plan too — a
+            // second call site for the identical, unmodified mechanism
+            // (disambiguationCandidates/askTypeDisambiguation), not a
+            // second implementation. Only the reply prefixing below is
+            // new, matching every other outcome branch in this loop.
+            val candidates = disambiguationCandidates(step, check)
+            if (candidates.isNotEmpty()) {
+                pendingClarification = null
+                // An earlier step in this same plan may have just offered
+                // its own follow-up suggestion (attachSuggestionIfApplicable,
+                // called from proceedToExecution a loop iteration ago),
+                // leaving a stale pendingConfirmation behind — a real bug
+                // this test suite caught: without clearing it, the next
+                // handle() call would route to resolveConfirmation() first
+                // instead of resolveTypeDisambiguation(), misinterpreting
+                // the answer to this question as an answer to that
+                // abandoned suggestion. This mechanism is only ever reached
+                // once per turn from handleSingleStep, where pendingConfirmation
+                // is already guaranteed null at entry (see handle()'s own
+                // dispatch order) — handlePlan is the one path where a
+                // prior step's own execution can set it first, so the clear
+                // belongs here, not inside askTypeDisambiguation itself.
+                pendingConfirmation = null
+                // M2-C: everything after this step is preserved, not dropped.
+                parkRemainder(steps, offsets, index, replies, lastEventStartMillis)
+                val outcome = askTypeDisambiguation(step, candidates)
+                return if (outcome is ToolOrchestrator.Outcome.Clarify) {
+                    outcome.copy(question = prefixed(replies, outcome.question))
+                } else {
+                    outcome
+                }
+            }
+
+            when (check) {
                 is ClarificationEngine.Check.Missing -> {
                     val needs = IntentResolution.NeedsClarification(step, check.question, check.fields, step.parameters)
                     pendingClarification = needs
+                    // M2-C discovery: an earlier step in this same plan may
+                    // have already offered its own follow-up suggestion
+                    // (attachSuggestionIfApplicable), leaving a stale
+                    // pendingConfirmation behind — the same class of bug
+                    // M2-B found and fixed for the type-disambiguation
+                    // redirect below, but for this branch instead. Without
+                    // clearing it, handle()'s dispatch checks
+                    // pendingConfirmation before pendingClarification, so
+                    // the next message would be misread as answering the
+                    // abandoned suggestion rather than this question.
+                    pendingConfirmation = null
+                    parkRemainder(steps, offsets, index, replies, lastEventStartMillis)
                     _state.value = transition(SecretaryEvent.ClarificationNeeded)
                     return ToolOrchestrator.Outcome.Clarify(prefixed(replies, check.question), needs)
                 }
@@ -379,21 +535,128 @@ class SecretaryOrchestrator(
                     if (!outcome.result.isSuccess) {
                         // A required step failed — stop rather than run later
                         // steps against a plan that has already gone wrong.
+                        // No PendingPlan is parked: per the existing, unchanged
+                        // failure policy (no retry, no rollback), a failed step
+                        // is not something a later message resumes.
                         return ToolOrchestrator.Outcome.Handled(replies.joinToString(" "), lastIntent, lastResult)
                     }
                 }
 
-                is ToolOrchestrator.Outcome.Clarify ->
+                is ToolOrchestrator.Outcome.Clarify -> {
+                    // Covers both a destructive/call confirmation and an
+                    // ambiguous contact selection — parkRemainder does not
+                    // need to know which; the "why" already lives in
+                    // whichever pendingConfirmation/pendingContactSelection
+                    // proceedToExecution just set.
+                    parkRemainder(steps, offsets, index, replies, lastEventStartMillis)
                     return outcome.copy(question = prefixed(replies, outcome.question))
+                }
 
                 is ToolOrchestrator.Outcome.NeedsPermission ->
+                    // M2-C scope boundary, documented not silent: a step
+                    // blocked on a tool/Android permission is not parked
+                    // into a PendingPlan. Resuming it goes through
+                    // onPermissionResult() — a system callback with no user
+                    // message at all, entirely outside this class's
+                    // handle()-based dispatch — and the permission itself is
+                    // held inside ToolOrchestrator's own private state, not
+                    // here. Extending that path was out of this stage's
+                    // scope; the remainder is dropped exactly as it already
+                    // was before M2-C, not a new limitation.
                     return outcome.copy(reply = prefixed(replies, outcome.reply))
 
                 is ToolOrchestrator.Outcome.Conversational -> return outcome
             }
         }
 
+        pendingPlan = null
         return ToolOrchestrator.Outcome.Handled(replies.joinToString(" "), lastIntent, lastResult)
+    }
+
+    /**
+     * Parks everything in [steps] after [currentIndex] as a [PendingPlan],
+     * alongside whichever `pending*` field the caller is about to set for
+     * the step at [currentIndex] itself. Sets nothing when there is no
+     * remainder, so a block on the plan's *last* step behaves exactly as it
+     * always did — nothing left to continue.
+     */
+    private fun parkRemainder(
+        steps: List<DpsIntent>,
+        offsets: List<Long?>,
+        currentIndex: Int,
+        completedReplies: List<String>,
+        lastEventStartMillis: Long?,
+    ) {
+        val remainingSteps = steps.drop(currentIndex + 1)
+        pendingPlan = if (remainingSteps.isEmpty()) {
+            null
+        } else {
+            PendingPlan(
+                remainingSteps = remainingSteps,
+                remainingOffsets = offsets.drop(currentIndex + 1),
+                completedReplies = completedReplies.toList(),
+                lastEventStartMillis = lastEventStartMillis,
+                requestedAtMillis = now(),
+            )
+        }
+    }
+
+    /**
+     * After a single blocked step resolves — clarification answered,
+     * confirmation decided, contact chosen, or type disambiguated — continues
+     * whatever [PendingPlan] was parked alongside it (M2-C), or passes
+     * [outcome] straight through unchanged when none was in flight (the
+     * ordinary, single-step case, entirely unaffected).
+     *
+     * Only a [ToolOrchestrator.Outcome.Handled] outcome — the resumed step
+     * having genuinely finished, whether by success, tool failure, or an
+     * explicit decline — consumes and clears the plan. A [Clarify] or
+     * [NeedsPermission] here means the resumed step blocked again on a
+     * *different* reason; the plan is left exactly as it was, still
+     * correctly describing what comes after this still-unfinished step.
+     */
+    private suspend fun continueAfterResumedStep(outcome: ToolOrchestrator.Outcome): ToolOrchestrator.Outcome {
+        val plan = pendingPlan ?: return outcome
+
+        return when (outcome) {
+            is ToolOrchestrator.Outcome.Handled -> {
+                pendingPlan = null
+                if (!outcome.result.isSuccess) {
+                    // A decline, a cancellation, or a genuine failure — the
+                    // existing "no retry, no rollback, report honestly"
+                    // policy applies exactly as it does for a fresh plan's
+                    // own failed step.
+                    return outcome.copy(reply = prefixed(plan.completedReplies, outcome.reply))
+                }
+
+                val success = outcome.result as? ToolResult.Success
+                val lastEventStartMillis = if (outcome.intent.type == IntentType.CALENDAR_EVENT && success != null) {
+                    success.data["start"]?.let(::parseLocalMillis) ?: plan.lastEventStartMillis
+                } else {
+                    plan.lastEventStartMillis
+                }
+
+                continuePlan(
+                    steps = plan.remainingSteps,
+                    offsets = plan.remainingOffsets,
+                    completedReplies = (plan.completedReplies + outcome.reply).toMutableList(),
+                    initialLastEventStartMillis = lastEventStartMillis,
+                    initialLastIntent = outcome.intent,
+                    initialLastResult = outcome.result,
+                )
+            }
+
+            is ToolOrchestrator.Outcome.Clarify ->
+                outcome.copy(question = prefixed(plan.completedReplies, outcome.question))
+
+            is ToolOrchestrator.Outcome.NeedsPermission ->
+                outcome.copy(reply = prefixed(plan.completedReplies, outcome.reply))
+
+            is ToolOrchestrator.Outcome.Conversational -> {
+                pendingPlan = null
+                outcome
+            }
+        }
     }
 
     private fun prefixed(completedReplies: List<String>, next: String): String =
@@ -459,21 +722,61 @@ class SecretaryOrchestrator(
         return intent.copy(parameters = parameters.copy(date = resolution.date, time = resolution.time))
     }
 
-    /** The one deterministic cross-step rule — see [handlePlan]'s doc. */
-    private fun anchorToPriorEvent(step: DpsIntent, priorEventStartMillis: Long?): DpsIntent {
+    /**
+     * The one deterministic cross-step rule — see [handlePlan]'s doc.
+     *
+     * @param statedOffsetMillis a signed delta read from this step's own
+     *   `raw_when` before attribution stripped it (M2-A) — negative for
+     *   "before"/"pehle" — via [reminderOffsetMillis]. `null` when the step
+     *   named no explicit offset, in which case the original fixed
+     *   30-minutes-before default applies unchanged.
+     */
+    private fun anchorToPriorEvent(step: DpsIntent, priorEventStartMillis: Long?, statedOffsetMillis: Long?): DpsIntent {
         if (priorEventStartMillis == null) return step
         if (step.type != IntentType.REMINDER || step.action != IntentAction.CREATE) return step
         if (step.parameters.value(IntentField.DATE) != null || step.parameters.value(IntentField.TIME) != null) {
             return step
         }
 
-        val zoned = Instant.ofEpochMilli(priorEventStartMillis - DEFAULT_REMINDER_LEAD_MILLIS).atZone(zone)
+        val offsetMillis = statedOffsetMillis ?: -DEFAULT_REMINDER_LEAD_MILLIS
+        val zoned = Instant.ofEpochMilli(priorEventStartMillis + offsetMillis).atZone(zone)
         return step.copy(
             parameters = step.parameters.copy(
                 date = zoned.format(DateTimeFormatter.ISO_LOCAL_DATE),
                 time = zoned.format(DateTimeFormatter.ofPattern("HH:mm")),
             ),
         )
+    }
+
+    /**
+     * The signed offset [step] itself named ("15 minutes before", "10 min
+     * pehle"), or `null` when it named none (M2-A).
+     *
+     * ## Why this must run *before* [temporalStepAttributor] does
+     * [TemporalStepAttributor] keeps a step's `raw_when` only when it
+     * matches a genuine occurrence [TemporalPhraseSpanFinder] found — and
+     * that finder only recognises phrases [TemporalPhraseResolver] itself
+     * can resolve, which has no concept of a relative delta at all. A
+     * step whose `raw_when` is purely a relative offset therefore matches
+     * no absolute-time span anywhere in the message and would otherwise be
+     * silently nulled out by attribution before [anchorToPriorEvent] ever
+     * ran. Reading it here, from the step's own pre-attribution `raw_when`,
+     * sidesteps that entirely — this never inspects [handlePlan]'s
+     * `userMessage`, only the one field the model already scoped to this
+     * one step, so [TemporalStepAttributor]'s cross-step isolation
+     * guarantee is untouched by this reading elsewhere.
+     *
+     * ## Why [ReferenceResolver.findRelativeOffsetMillis], not a new parser
+     * Reuses the exact regex/vocabulary already shipped and tested for
+     * "30 minute pehle kar do" (single-turn reminder rescheduling) rather
+     * than a second, drifting copy of the same pattern — same sign
+     * convention (negative for "pehle"/"before"/"earlier"), so adding it to
+     * [priorEventStartMillis] in [anchorToPriorEvent] already means
+     * "earlier" without any translation here.
+     */
+    private fun reminderOffsetMillis(step: DpsIntent): Long? {
+        val rawWhen = step.parameters.rawWhen?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return referenceResolver.findRelativeOffsetMillis(rawWhen.lowercase())
     }
 
     // -----------------------------------------------------------------
@@ -657,6 +960,13 @@ class SecretaryOrchestrator(
                     finishExecution(original)
                 } else {
                     pendingContactSelection = PendingContactSelection(original, candidates, now())
+                    // Defensive, mirroring the Missing/type-disambiguation
+                    // fixes above: handle()'s dispatch already checks
+                    // pendingContactSelection before pendingConfirmation, so
+                    // this is not reachable as a live bug today, but a
+                    // dangling suggestion from an earlier plan step should
+                    // not linger past the step that actually replaces it.
+                    pendingConfirmation = null
                     _state.value = transition(SecretaryEvent.ContactAmbiguous)
                     val question = candidateQuestion(candidates)
                     ToolOrchestrator.Outcome.Clarify(
@@ -696,12 +1006,15 @@ class SecretaryOrchestrator(
     ): ToolOrchestrator.Outcome {
         if (!selection.isFresh(now())) {
             pendingContactSelection = null
+            pendingPlan = null
             _state.value = transition(SecretaryEvent.Reset)
             return handle(userMessage)
         }
 
         val chosen = contactSelectionParser.parse(userMessage, selection.candidates)
             ?: run {
+                // Unparseable — still re-asking about the same step, so any
+                // parked plan remainder is left exactly as it is.
                 val question = candidateQuestion(selection.candidates)
                 return ToolOrchestrator.Outcome.Clarify(
                     question,
@@ -716,7 +1029,7 @@ class SecretaryOrchestrator(
             lastReferencedPerson = chosen.displayName,
             updatedAtMillis = now(),
         )
-        return proceedAfterContactResolved(applyResolvedContact(selection.originalIntent, chosen))
+        return continueAfterResumedStep(proceedAfterContactResolved(applyResolvedContact(selection.originalIntent, chosen)))
     }
 
     private fun applyResolvedContactData(original: DpsIntent, data: Map<String, String>): DpsIntent {
@@ -756,6 +1069,178 @@ class SecretaryOrchestrator(
     }
 
     // -----------------------------------------------------------------
+    // Type disambiguation (Day 09, Option 1)
+    //
+    // The Calendar Delete/Update Classification Reliability investigation
+    // found the classification model unreliable specifically for non-CREATE
+    // requests naming an existing item: two independent live-device runs
+    // both showed 0/14 correct classifications, with the model frequently
+    // choosing a type (notification, call_contact) that
+    // ai.memory.ReferenceResolver has no grounding branch for at all, or a
+    // grounded type (reminder, task) whose own memory slot came up empty
+    // while a different one held exactly what the user meant. A targeted
+    // prompt change was tried and rigorously A/B tested; it produced zero
+    // improvement and introduced a new hallucination (see the Day 09
+    // report). This is the deterministic, architecture-level fix that
+    // followed: no keyword matching against the user's raw text, no
+    // overriding the model's own classification — it only ever recognises a
+    // structural signal and asks, exactly the way candidateQuestion already
+    // does for ambiguous contacts.
+    // -----------------------------------------------------------------
+
+    /**
+     * Candidates worth asking the user about before honouring [check]'s own
+     * verdict, or empty when nothing here applies.
+     *
+     * ## The two signals, both structural
+     * Never fires for [IntentAction.CREATE] or [IntentAction.LIST] — CREATE
+     * is the one path the investigation measured as fully reliable, and LIST
+     * is exempted by [ClarificationEngine.check] itself before anything else
+     * runs, for the same reason: neither names one existing item to redirect.
+     *
+     * For [SAFE_COMPLETE_TYPES] — the types [ClarificationEngine] already
+     * knows how to target directly (a resolved id, or for
+     * TASK/ACTION_ITEM a spoken title) — this only fires when [check] is
+     * [ClarificationEngine.Check.Missing] with an *empty* field set, i.e.
+     * exactly the "which one do you mean?" shape
+     * [ClarificationEngine.questionForMissingTarget] already asks. A content
+     * question ("What's the follow-up?") or an already-satisfied [Complete]
+     * is left alone — those are not evidence of anything wrong.
+     *
+     * For every other type, there is no grounding mechanism in
+     * [ReferenceResolver] at all — confirmed by reading its `when` branches,
+     * which name only REMINDER/CALENDAR_EVENT/TASK — so a non-CREATE request
+     * classified into one of them can never resolve a real target regardless
+     * of what [check] says, including a [Complete] that would otherwise
+     * proceed straight to a guaranteed [ToolResult.Failure]. Redirecting
+     * such a case toward a real, already-remembered candidate is a strict
+     * improvement: there is no scenario in the investigation's evidence
+     * where this type, non-CREATE, with no memory grounding at all, was ever
+     * going to succeed on its own.
+     *
+     * A candidate is only offered from a *different* slot than the one the
+     * classified type already owns — a type in [SAFE_COMPLETE_TYPES] whose
+     * own resolution is what's missing is not re-offered itself; that is
+     * exactly the question [check] itself already asks.
+     */
+    private fun disambiguationCandidates(intent: DpsIntent, check: ClarificationEngine.Check): List<DisambiguationCandidate> {
+        if (intent.action == IntentAction.CREATE || intent.action == IntentAction.LIST) return emptyList()
+
+        val suspicious = if (intent.type in SAFE_COMPLETE_TYPES) {
+            check is ClarificationEngine.Check.Missing && check.fields.isEmpty()
+        } else {
+            true
+        }
+        if (!suspicious) return emptyList()
+
+        val memory = _memory.value
+        return buildList {
+            if (intent.type != IntentType.CALENDAR_EVENT) {
+                memory.lastCalendarEvent?.let { add(DisambiguationCandidate(IntentType.CALENDAR_EVENT, it.id.toString(), it.title)) }
+            }
+            if (intent.type != IntentType.REMINDER) {
+                memory.lastReminder?.let { add(DisambiguationCandidate(IntentType.REMINDER, it.id.toString(), it.title)) }
+            }
+            if (intent.type != IntentType.TASK) {
+                memory.lastTask?.let { add(DisambiguationCandidate(IntentType.TASK, it.id.toString(), it.title)) }
+            }
+        }
+    }
+
+    private fun askTypeDisambiguation(intent: DpsIntent, candidates: List<DisambiguationCandidate>): ToolOrchestrator.Outcome {
+        val question = disambiguationQuestion(candidates)
+        pendingTypeDisambiguation = PendingTypeDisambiguation(intent, candidates, now())
+        _state.value = transition(SecretaryEvent.TypeDisambiguationNeeded)
+        logger.i(TAG, "Asking which of ${candidates.size} remembered item(s) a ${intent.type} ${intent.action} actually meant")
+        return ToolOrchestrator.Outcome.Clarify(
+            question,
+            IntentResolution.NeedsClarification(intent, question, emptySet(), intent.parameters),
+        )
+    }
+
+    private fun disambiguationQuestion(candidates: List<DisambiguationCandidate>): String {
+        if (candidates.size == 1) {
+            val only = candidates.single()
+            return "Do you mean the ${DISAMBIGUATION_LABELS[only.type]} \"${only.label}\"?"
+        }
+        val listed = candidates.mapIndexed { index, candidate ->
+            "${index + 1}) the ${DISAMBIGUATION_LABELS[candidate.type]} \"${candidate.label}\""
+        }.joinToString(", ")
+        return "A few things could match: $listed. Which one?"
+    }
+
+    /**
+     * Resolves the answer to [askTypeDisambiguation]'s question.
+     *
+     * A single candidate is a yes/no question, answered via
+     * [confirmationParser] exactly like [resolveConfirmation]. Several
+     * candidates need a pick, answered via a bare 1-based index — no keyword
+     * or name matching, since offering a partial-name match here would mean
+     * comparing against the user's raw text for a decision this design
+     * explicitly keeps structural.
+     *
+     * A "no", an unparseable reply, or a stale selection all fall through to
+     * [handle] as the fresh message it then genuinely is — mirroring
+     * [resolveConfirmation]'s own "declining does not mean insisting"
+     * rationale, and safe for the same reason [Track A][handleSingleStep]
+     * already established: [pendingClarification] is untouched here, so the
+     * resumed [handle] call sees no pending question of its own to
+     * contaminate with anything this redirect knew.
+     */
+    private suspend fun resolveTypeDisambiguation(
+        userMessage: String,
+        pending: PendingTypeDisambiguation,
+    ): ToolOrchestrator.Outcome {
+        if (!pending.isFresh(now())) {
+            pendingTypeDisambiguation = null
+            pendingPlan = null
+            _state.value = transition(SecretaryEvent.Reset)
+            return handle(userMessage)
+        }
+
+        val chosen = if (pending.candidates.size == 1) {
+            when (confirmationParser.parse(userMessage)) {
+                Confirmation.YES -> pending.candidates.single()
+                else -> null
+            }
+        } else {
+            indexChoice(userMessage, pending.candidates.size)?.let { pending.candidates[it] }
+        }
+
+        pendingTypeDisambiguation = null
+
+        if (chosen == null) {
+            // Declined or unparseable — the answer wasn't to this question,
+            // so whatever plan remainder was waiting behind it is abandoned
+            // too, the same as a clarification answer that turns out to be
+            // a fresh, unrelated request.
+            pendingPlan = null
+            _state.value = transition(SecretaryEvent.Reset)
+            return handle(userMessage)
+        }
+
+        _state.value = transition(SecretaryEvent.TypeDisambiguationResolved)
+        val resolved = pending.originalIntent.copy(
+            type = chosen.type,
+            parameters = pending.originalIntent.parameters.copy(targetId = chosen.targetId),
+        )
+        // Back through proceedToExecution, not straight to finishExecution —
+        // a CANCEL redirected onto CALENDAR_EVENT/TASK/REMINDER must still
+        // hit askDeleteConfirmation exactly as a correctly-classified one
+        // would; this only replaces "which type/target", never the
+        // confirmation gate downstream of it. continueAfterResumedStep then
+        // continues any parked plan remainder (M2-C) once this step
+        // genuinely finishes.
+        return continueAfterResumedStep(proceedToExecution(resolved))
+    }
+
+    /** A bare 1-based index into a list of [count] candidates, or `null`. */
+    private fun indexChoice(reply: String, count: Int): Int? {
+        val number = reply.trim().toIntOrNull() ?: return null
+        return (number - 1).takeIf { it in 0 until count }
+    }
+
+    // -----------------------------------------------------------------
     // Confirmation (destructive actions and follow-up suggestions)
     // -----------------------------------------------------------------
 
@@ -774,6 +1259,7 @@ class SecretaryOrchestrator(
     private suspend fun resolveConfirmation(userMessage: String, pending: PendingConfirmation): ToolOrchestrator.Outcome {
         if (!pending.isFresh(now())) {
             pendingConfirmation = null
+            pendingPlan = null
             _state.value = transition(SecretaryEvent.Reset)
             return handle(userMessage)
         }
@@ -782,21 +1268,33 @@ class SecretaryOrchestrator(
             Confirmation.YES -> {
                 pendingConfirmation = null
                 _state.value = transition(SecretaryEvent.ConfirmationAccepted)
-                finishExecution(pending.intent)
+                continueAfterResumedStep(finishExecution(pending.intent))
             }
 
+            // M2-C: a decline is still a step finishing (as a Cancelled,
+            // non-success result) — continueAfterResumedStep's own
+            // "not successful" branch stops any parked plan remainder here,
+            // exactly like a fresh plan's own failed step would. Declining
+            // one destructive step is deliberately not treated as consent
+            // to keep running the rest of the plan unattended.
             Confirmation.NO -> {
                 pendingConfirmation = null
                 _state.value = transition(SecretaryEvent.ConfirmationDeclined)
-                ToolOrchestrator.Outcome.Handled(
-                    reply = "Alright, I've left it as is.",
-                    intent = pending.intent,
-                    result = ToolResult.Cancelled("Declined."),
+                continueAfterResumedStep(
+                    ToolOrchestrator.Outcome.Handled(
+                        reply = "Alright, I've left it as is.",
+                        intent = pending.intent,
+                        result = ToolResult.Cancelled("Declined."),
+                    ),
                 )
             }
 
             Confirmation.UNCLEAR -> {
                 pendingConfirmation = null
+                // The user said something else entirely — not an answer to
+                // this question, so any parked plan remainder is abandoned,
+                // the same as an unrelated message during a clarification.
+                pendingPlan = null
                 _state.value = transition(SecretaryEvent.ConfirmationDeclined)
                 handle(userMessage)
             }
@@ -901,6 +1399,28 @@ class SecretaryOrchestrator(
             IntentType.CALENDAR_EVENT to "event",
             IntentType.TASK to "task",
             IntentType.REMINDER to "reminder",
+        )
+
+        /**
+         * The intent types [ClarificationEngine.check] already knows how to
+         * target directly — a resolved id (REMINDER, CALENDAR_EVENT), or for
+         * TASK/ACTION_ITEM a spoken title as the address. See
+         * [disambiguationCandidates]'s doc for how this scopes Day 09's
+         * redirect to only the "which one" shape of [ClarificationEngine.Check.Missing]
+         * for these, never a genuine content question.
+         */
+        val SAFE_COMPLETE_TYPES = setOf(
+            IntentType.REMINDER,
+            IntentType.CALENDAR_EVENT,
+            IntentType.TASK,
+            IntentType.ACTION_ITEM,
+        )
+
+        /** Noun used when asking which remembered item a redirect (Day 09) means. */
+        val DISAMBIGUATION_LABELS = mapOf(
+            IntentType.CALENDAR_EVENT to "calendar event",
+            IntentType.REMINDER to "reminder",
+            IntentType.TASK to "task",
         )
     }
 }

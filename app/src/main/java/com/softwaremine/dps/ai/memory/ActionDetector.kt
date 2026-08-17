@@ -78,6 +78,28 @@ class ActionDetector {
             "date badal do",
             "move kar do",
             "shift kar do",
+            // CAT5 (Day 09 follow-up): bare English "move"/"change" alone are
+            // deliberately NOT added here — both are common enough as
+            // ordinary CREATE *content* ("remind me to move the couch",
+            // "remind me to change the oil") that matching them bare would
+            // misroute a brand-new request, exactly the failure this class's
+            // own doc warns against. Anchoring each to "that/the
+            // meeting/event/reminder" keeps every entry a phrase that names
+            // the change explicitly, the same discipline "move kar do"/
+            // "shift kar do" already follow — see the investigation's false-
+            // positive analysis for why the anchor is required, not optional.
+            "move that meeting",
+            "move the meeting",
+            "move that event",
+            "move the event",
+            "move that reminder",
+            "move the reminder",
+            "change that meeting",
+            "change the meeting",
+            "change that event",
+            "change the event",
+            "change that reminder",
+            "change the reminder",
         )
     }
 }

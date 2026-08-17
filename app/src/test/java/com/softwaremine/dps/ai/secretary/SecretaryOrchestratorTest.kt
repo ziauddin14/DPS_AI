@@ -440,6 +440,113 @@ class SecretaryOrchestratorTest {
     }
 
     // -----------------------------------------------------------------
+    // Cross-turn clarification merge (Track A — Calendar Delete/Update
+    // Classification Reliability investigation)
+    //
+    // The merge in handleSingleStep used to fire whenever a clarification
+    // was pending, regardless of whether the new message's classified type
+    // matched what the question was actually about. A live-model
+    // investigation caught this directly: a dangling "when should I remind
+    // you?" clarification's leftover `message` field satisfied a completely
+    // unrelated NOTIFICATION request's required-field check on the next
+    // turn, letting it execute instead of asking its own question. The fix
+    // gates the merge on the new classification's type matching the pending
+    // question's type (or falling back to bare CONVERSATION, which carries
+    // no fields of its own to leak).
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `an answer classified as the same intent type still merges with the pending clarification`() = runTest {
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank"}}"""),
+            DpsResult.Success("""{"intent":"reminder","parameters":{"raw_when":"16:00"}}"""),
+        )
+        val orchestrator = secretary(engine, listOf(reminder))
+
+        val first = orchestrator.handle("remind me to call the bank")
+        assertTrue("Expected Clarify asking for a time, got $first", first is ToolOrchestrator.Outcome.Clarify)
+
+        val second = orchestrator.handle("at 16:00")
+
+        assertTrue("Expected Handled once both title and time are known, got $second", second is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, reminder.calls.size)
+        assertEquals("create_reminder", reminder.calls.single().operation)
+        assertEquals("call the bank", reminder.calls.single().arguments["title"])
+    }
+
+    @Test
+    fun `a response classified as a different intent type does not inherit the pending clarification's parameters`() = runTest {
+        val notification = RecordingTool(
+            id = ToolId.NOTIFICATION,
+            operations = setOf("notify", "cancel"),
+            behaviour = { ToolResult.Success("Done.", mapOf("notification_id" to "1")) },
+        )
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"message":"call the bank"}}"""),
+            DpsResult.Success("""{"intent":"notification","action_type":"cancel","parameters":{}}"""),
+        )
+        val orchestrator = secretary(engine, listOf(notification))
+
+        val first = orchestrator.handle("remind me to call the bank")
+        assertTrue("Expected Clarify asking for a time, got $first", first is ToolOrchestrator.Outcome.Clarify)
+
+        val second = orchestrator.handle("cancel the meeting")
+
+        // Must ask the notification's own missing-field question — never
+        // silently execute using "call the bank" left over from the
+        // abandoned reminder clarification.
+        assertTrue("Expected Clarify, got $second", second is ToolOrchestrator.Outcome.Clarify)
+        assertEquals(0, notification.calls.size)
+    }
+
+    @Test
+    fun `a reminder clarification followed by a calendar request does not inherit the reminder's title`() = runTest {
+        val reminder = reminderTool()
+        val calendar = calendarTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"the meeting"}}"""),
+            DpsResult.Success(
+                """{"intent":"calendar_event","action_type":"create","parameters":{"raw_when":"tomorrow at 1pm"}}""",
+            ),
+        )
+        val orchestrator = secretary(engine, listOf(reminder, calendar))
+
+        val first = orchestrator.handle("remind me about the meeting")
+        assertTrue("Expected Clarify asking for a time, got $first", first is ToolOrchestrator.Outcome.Clarify)
+
+        val second = orchestrator.handle("schedule lunch tomorrow at 1pm")
+
+        // Must ask for the event's own title — never silently reuse "the
+        // meeting" left over from the abandoned reminder clarification.
+        assertTrue("Expected Clarify asking for a title, got $second", second is ToolOrchestrator.Outcome.Clarify)
+        assertEquals(0, calendar.calls.size)
+        assertEquals(0, reminder.calls.size)
+    }
+
+    @Test
+    fun `a calendar clarification followed by a reminder request does not inherit the event's title`() = runTest {
+        val calendar = calendarTool()
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","action_type":"create","parameters":{"title":"team sync"}}"""),
+            DpsResult.Success("""{"intent":"reminder","action_type":"create","parameters":{"raw_when":"17:00"}}"""),
+        )
+        val orchestrator = secretary(engine, listOf(calendar, reminder))
+
+        val first = orchestrator.handle("schedule a team sync")
+        assertTrue("Expected Clarify asking for a time, got $first", first is ToolOrchestrator.Outcome.Clarify)
+
+        val second = orchestrator.handle("remind me at 5pm")
+
+        // Must ask what the reminder is about — never silently reuse "team
+        // sync" left over from the abandoned calendar clarification.
+        assertTrue("Expected Clarify, got $second", second is ToolOrchestrator.Outcome.Clarify)
+        assertEquals(0, reminder.calls.size)
+        assertEquals(0, calendar.calls.size)
+    }
+
+    // -----------------------------------------------------------------
     // Permission recovery
     // -----------------------------------------------------------------
 
@@ -1166,6 +1273,134 @@ class SecretaryOrchestratorTest {
         assertEquals(expected, reminder.calls.single().arguments["time"])
     }
 
+    // -----------------------------------------------------------------
+    // M2-A — generalized cross-step reminder offset
+    //
+    // anchorToPriorEvent's fixed 30-minute default is now only a fallback:
+    // a stated offset ("15 minutes before") on the reminder step's own
+    // raw_when is read (via ReferenceResolver.findRelativeOffsetMillis,
+    // widened to internal for this reuse) before TemporalStepAttributor
+    // strips it as an unrecognised absolute phrase, and used instead.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `an explicit 15-minute offset is used instead of the 30-minute default`() = runTest {
+        val calendar = calendarTool() // start=2026-08-07T16:00
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"meeting","raw_when":"15 minutes before"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(calendar, reminder))
+            .handle("kal 16:00 meeting bana do aur 15 minutes before reminder bhi laga do")
+
+        val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 45)
+            .atZone(zone).toInstant().toEpochMilli().toString()
+        assertEquals(expected, reminder.calls.single().arguments["time"])
+    }
+
+    /** Proves the parser reads the stated amount rather than always answering 15. */
+    @Test
+    fun `an explicit 10-minute offset is used, not hardcoded to 15`() = runTest {
+        val calendar = calendarTool() // start=2026-08-07T16:00
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"meeting","raw_when":"10 minutes before"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(calendar, reminder))
+            .handle("kal 16:00 meeting bana do aur 10 minutes before reminder bhi laga do")
+
+        val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 50)
+            .atZone(zone).toInstant().toEpochMilli().toString()
+        assertEquals(expected, reminder.calls.single().arguments["time"])
+    }
+
+    /** The Roman Urdu form ReferenceResolver already supports for single-turn rescheduling. */
+    @Test
+    fun `an explicit Roman Urdu offset (10 minutes pehle) is understood the same way`() = runTest {
+        val calendar = calendarTool() // start=2026-08-07T16:00
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"meeting","raw_when":"10 minutes pehle"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(calendar, reminder))
+            .handle("kal 16:00 meeting bana do aur 10 minutes pehle reminder bhi laga do")
+
+        val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 50)
+            .atZone(zone).toInstant().toEpochMilli().toString()
+        assertEquals(expected, reminder.calls.single().arguments["time"])
+    }
+
+    /**
+     * The isolation guarantee TemporalStepAttributor exists for (Day 08-E)
+     * must hold for offsets too: a sibling step's own, different offset
+     * phrase must never leak into this reminder's calculation.
+     */
+    @Test
+    fun `a sibling step's different offset never leaks into this reminder's own offset`() = runTest {
+        val calendar = calendarTool() // start=2026-08-07T16:00
+        val reminder = reminderTool()
+        val task = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"task","parameters":{"title":"prep notes","raw_when":"45 minutes before"}},
+                    {"intent":"reminder","parameters":{"title":"meeting","raw_when":"10 minutes before"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(calendar, task, reminder))
+            .handle("kal 16:00 meeting bana do, 45 minutes before prep notes ka task bana do, aur 10 minutes before reminder bhi laga do")
+
+        val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 50)
+            .atZone(zone).toInstant().toEpochMilli().toString()
+        assertEquals(
+            "The reminder must use its own 10-minute offset, never the task step's 45-minute phrase",
+            expected,
+            reminder.calls.single().arguments["time"],
+        )
+    }
+
+    @Test
+    fun `an unsupported offset shape falls back to the existing 30-minute default rather than inventing a value`() = runTest {
+        val calendar = calendarTool() // start=2026-08-07T16:00
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"meeting","raw_when":"shortly before"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(calendar, reminder))
+            .handle("kal 16:00 meeting bana do aur shortly before reminder bhi laga do")
+
+        val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 30)
+            .atZone(zone).toInstant().toEpochMilli().toString()
+        assertEquals(expected, reminder.calls.single().arguments["time"])
+    }
+
     @Test
     fun `a required step failing stops the plan and reports honestly rather than claiming success`() = runTest {
         val calendar = calendarTool { ToolResult.Failure("No calendar on this device accepts new events.", retryable = false) }
@@ -1757,5 +1992,730 @@ class SecretaryOrchestratorTest {
         assertTrue("Expected Handled, got $continued", continued is ToolOrchestrator.Outcome.Handled)
         assertEquals(2, engine.index)
         assertEquals("pay rent", reminder.calls.single().arguments["title"])
+    }
+
+    // -----------------------------------------------------------------
+    // Type disambiguation (Day 09, Option 1)
+    //
+    // The Calendar Delete/Update Classification Reliability investigation
+    // found the model unreliable specifically for non-CREATE requests
+    // naming an existing item — these reproduce the four example flows from
+    // the approved design against a real (scripted) classification, exactly
+    // as the live-device investigation observed them.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `delete standup meeting - a notification-cancel misclassification redirects to the remembered calendar event`() = runTest {
+        val calendar = calendarTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"notification","action_type":"cancel","parameters":{}}"""),
+        )
+        val secretary = secretary(engine, listOf(calendar))
+        secretary.handle("standup meeting tomorrow at 16:00")
+
+        val asked = secretary.handle("delete the standup meeting")
+        assertTrue("Expected a redirect question, got $asked", asked is ToolOrchestrator.Outcome.Clarify)
+        assertTrue(
+            "Question should name the remembered event, got: ${(asked as ToolOrchestrator.Outcome.Clarify).question}",
+            asked.question.contains("standup meeting"),
+        )
+        assertEquals(SecretaryState.WAITING_TYPE_DISAMBIGUATION, secretary.state.value)
+
+        val confirmedRedirect = secretary.handle("yes")
+        assertTrue(
+            "Redirect confirmed must still hit the delete-confirmation gate, got $confirmedRedirect",
+            confirmedRedirect is ToolOrchestrator.Outcome.Clarify,
+        )
+        assertEquals(0, calendar.calls.count { it.operation == "delete_event" })
+
+        val confirmedDelete = secretary.handle("yes")
+        assertTrue("Expected Handled, got $confirmedDelete", confirmedDelete is ToolOrchestrator.Outcome.Handled)
+        assertEquals("500", calendar.calls.single { it.operation == "delete_event" }.arguments["id"])
+        // Only two real inference calls: the create and the one misclassification.
+        // Both confirmations resolved deterministically, with no further model call.
+        assertEquals(2, engine.index)
+    }
+
+    @Test
+    fun `reschedule standup meeting to 11am - a reminder-update misclassification redirects to the remembered calendar event`() = runTest {
+        val calendar = calendarTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","action_type":"update","parameters":{"raw_when":"11:00"}}"""),
+        )
+        val secretary = secretary(engine, listOf(calendar))
+        secretary.handle("standup meeting tomorrow at 16:00")
+
+        val asked = secretary.handle("reschedule the standup meeting to 11:00")
+        assertTrue("Expected a redirect question, got $asked", asked is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((asked as ToolOrchestrator.Outcome.Clarify).question.contains("standup meeting"))
+
+        val confirmed = secretary.handle("yes")
+        assertTrue("Expected Handled, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        assertEquals("500", calendar.calls.single { it.operation == "update_event" }.arguments["id"])
+    }
+
+    @Test
+    fun `cancel that reminder - a notification-cancel misclassification redirects to the remembered reminder`() = runTest {
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"notification","action_type":"cancel","parameters":{}}"""),
+        )
+        val secretary = secretary(engine, listOf(reminder))
+        secretary.handle("remind me to call the bank at 16:00")
+
+        val asked = secretary.handle("cancel that reminder")
+        assertTrue("Expected a redirect question, got $asked", asked is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((asked as ToolOrchestrator.Outcome.Clarify).question.contains("call the bank"))
+
+        secretary.handle("yes")
+        val confirmedCancel = secretary.handle("yes")
+
+        assertTrue("Expected Handled, got $confirmedCancel", confirmedCancel is ToolOrchestrator.Outcome.Handled)
+        assertEquals("1001", reminder.calls.single { it.operation == "cancel_reminder" }.arguments["id"])
+    }
+
+    @Test
+    fun `delete that meeting - no memory means no candidate, and the existing generic question is unchanged`() = runTest {
+        val notification = RecordingTool(ToolId.NOTIFICATION, setOf("notify", "cancel")) {
+            ToolResult.Success("Done.", mapOf("notification_id" to "1"))
+        }
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"notification","action_type":"cancel","parameters":{}}"""))
+        val secretary = secretary(engine, listOf(notification))
+
+        val outcome = secretary.handle("delete that meeting")
+
+        // Nothing in memory to redirect toward — falls through to exactly
+        // what ClarificationEngine already asked before this design existed.
+        assertTrue("Expected Clarify, got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
+        assertEquals("What should the notification say?", (outcome as ToolOrchestrator.Outcome.Clarify).question)
+        assertEquals(SecretaryState.WAITING_MISSING_INFORMATION, secretary.state.value)
+        assertEquals(0, notification.calls.size)
+    }
+
+    @Test
+    fun `two plausible candidates are offered as a numbered choice, never guessed`() = runTest {
+        val calendar = calendarTool()
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"17:00"}}"""),
+            DpsResult.Success("""{"intent":"notification","action_type":"cancel","parameters":{}}"""),
+        )
+        val secretary = secretary(engine, listOf(calendar, reminder))
+        secretary.handle("standup meeting tomorrow at 16:00")
+        secretary.handle("remind me to call the bank at 17:00")
+
+        val asked = secretary.handle("cancel it")
+        assertTrue("Expected a numbered choice, got $asked", asked is ToolOrchestrator.Outcome.Clarify)
+        val question = (asked as ToolOrchestrator.Outcome.Clarify).question
+        assertTrue(question.contains("1)"))
+        assertTrue(question.contains("2)"))
+        assertTrue(question.contains("standup meeting"))
+        assertTrue(question.contains("call the bank"))
+
+        val picked = secretary.handle("2")
+        assertTrue("Picking the reminder must still hit its own delete confirmation, got $picked", picked is ToolOrchestrator.Outcome.Clarify)
+        secretary.handle("yes")
+
+        assertEquals(1, reminder.calls.count { it.operation == "cancel_reminder" })
+        assertEquals(0, calendar.calls.count { it.operation == "delete_event" })
+    }
+
+    @Test
+    fun `an unparseable or declined redirect falls through to the message as a fresh request`() = runTest {
+        val calendar = calendarTool()
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"notification","action_type":"cancel","parameters":{}}"""),
+            // What the fallthrough message itself classifies as — proves it
+            // actually reached the model as a fresh request, not a swallowed answer.
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"pay rent","raw_when":"18:00"}}"""),
+        )
+        val secretary = secretary(engine, listOf(calendar, reminder))
+        secretary.handle("standup meeting tomorrow at 16:00")
+        secretary.handle("delete the standup meeting")
+
+        val fallthrough = secretary.handle("actually, remind me to pay rent at 18:00")
+
+        assertTrue("Expected Handled, got $fallthrough", fallthrough is ToolOrchestrator.Outcome.Handled)
+        assertEquals(3, engine.index)
+        assertEquals("pay rent", reminder.calls.single().arguments["title"])
+        assertEquals(0, calendar.calls.count { it.operation == "delete_event" })
+    }
+
+    @Test
+    fun `a correctly resolved reminder cancel is never second-guessed even when a calendar event is also remembered`() = runTest {
+        val calendar = calendarTool()
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"17:00"}}"""),
+            // "that reminder" is an existing ReferenceResolver cue — targetId
+            // resolves correctly on its own, with no ambiguity at all.
+            DpsResult.Success("""{"intent":"reminder","action_type":"cancel"}"""),
+        )
+        val secretary = secretary(engine, listOf(calendar, reminder))
+        secretary.handle("standup meeting tomorrow at 16:00")
+        secretary.handle("remind me to call the bank at 17:00")
+
+        val asked = secretary.handle("cancel that reminder")
+
+        assertTrue("Expected the reminder's own delete confirmation, got $asked", asked is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((asked as ToolOrchestrator.Outcome.Clarify).question.contains("call the bank"))
+        assertEquals(SecretaryState.WAITING_CONFIRMATION, secretary.state.value)
+
+        secretary.handle("yes")
+        assertEquals(1, reminder.calls.count { it.operation == "cancel_reminder" })
+        assertEquals(0, calendar.calls.count { it.operation == "delete_event" })
+    }
+
+    @Test
+    fun `a fresh create is never redirected even with memory populated`() = runTest {
+        val reminder = reminderTool()
+        val calendar = calendarTool { call ->
+            when (call.operation) {
+                "create_event" -> ToolResult.Success(
+                    "Added to your calendar.",
+                    mapOf("event_id" to "501", "calendar" to "Personal", "start" to "2026-08-08T10:00", "end" to "2026-08-08T11:00"),
+                )
+                else -> ToolResult.Unsupported("not implemented")
+            }
+        }
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"17:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","action_type":"create","parameters":{"title":"lunch","raw_when":"10:00"}}"""),
+        )
+        val secretary = secretary(engine, listOf(reminder, calendar))
+        secretary.handle("remind me to call the bank at 17:00")
+
+        val outcome = secretary.handle("schedule lunch at 10:00")
+
+        assertTrue("A fresh CREATE must never be redirected, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, calendar.calls.count { it.operation == "create_event" })
+    }
+
+    @Test
+    fun `a list request is never redirected even with memory populated`() = runTest {
+        val calendar = calendarTool()
+        val task = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}}"""),
+            DpsResult.Success("""{"intent":"task","action_type":"list"}"""),
+        )
+        val secretary = secretary(engine, listOf(calendar, task))
+        secretary.handle("standup meeting tomorrow at 16:00")
+
+        val outcome = secretary.handle("show my pending tasks")
+
+        assertTrue(
+            "LIST must never be intercepted with a redirect question, got $outcome",
+            outcome !is ToolOrchestrator.Outcome.Clarify,
+        )
+    }
+
+    // -----------------------------------------------------------------
+    // CAT5 fix (Day 09 follow-up) — bare "move"/"change" corrected via
+    // ActionDetector's new anchored phrases, then redirected by the
+    // already-committed Option 1 mechanism above. This reproduces the
+    // real-device investigation's exact raw model output byte-for-byte.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `move that meeting is corrected to update and redirected to the real calendar event`() = runTest {
+        val calendar = calendarTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"10:00"}}"""),
+            // Byte-for-byte the real on-device evidence for "Move that
+            // meeting to tomorrow evening." — reminder/create, the whole
+            // sentence dumped into message, no title.
+            DpsResult.Success(
+                """{"intent":"reminder","action_type":"create","parameters":{"raw_when":"tomorrow evening","message":"Move that meeting to tomorrow evening."}}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(calendar))
+        secretary.handle("standup meeting tomorrow at 10:00")
+
+        val redirected = secretary.handle("Move that meeting to tomorrow evening.")
+
+        assertTrue("Expected a redirect to the real calendar event, got $redirected", redirected is ToolOrchestrator.Outcome.Clarify)
+        assertTrue(
+            "Question must name the real event, never ask about a nonexistent reminder, got: ${(redirected as ToolOrchestrator.Outcome.Clarify).question}",
+            redirected.question.contains("standup meeting"),
+        )
+        assertEquals(SecretaryState.WAITING_TYPE_DISAMBIGUATION, secretary.state.value)
+
+        val confirmed = secretary.handle("yes")
+
+        assertTrue("Expected Handled after confirming the redirect, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        assertEquals("500", calendar.calls.single { it.operation == "update_event" }.arguments["id"])
+    }
+
+    @Test
+    fun `change that meeting is corrected to update the same way`() = runTest {
+        val calendar = calendarTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"10:00"}}"""),
+            DpsResult.Success(
+                """{"intent":"reminder","action_type":"create","parameters":{"raw_when":"tomorrow evening","message":"Change that meeting to tomorrow evening."}}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(calendar))
+        secretary.handle("standup meeting tomorrow at 10:00")
+
+        val redirected = secretary.handle("Change that meeting to tomorrow evening.")
+
+        assertTrue("Expected a redirect to the real calendar event, got $redirected", redirected is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((redirected as ToolOrchestrator.Outcome.Clarify).question.contains("standup meeting"))
+
+        val confirmed = secretary.handle("yes")
+        assertTrue("Expected Handled after confirming the redirect, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        assertEquals("500", calendar.calls.single { it.operation == "update_event" }.arguments["id"])
+    }
+
+    @Test
+    fun `move as ordinary create content is never redirected`() = runTest {
+        val reminder = reminderTool()
+        val calendar = calendarTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"10:00"}}"""),
+            // "move" appears only as ordinary CREATE content — must stay CREATE.
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"move the couch","raw_when":"18:00"}}"""),
+        )
+        val secretary = secretary(engine, listOf(reminder, calendar))
+        secretary.handle("standup meeting tomorrow at 10:00")
+
+        val outcome = secretary.handle("remind me to move the couch at 18:00")
+
+        assertTrue("A CREATE mentioning 'move' as content must never be redirected, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, reminder.calls.count { it.operation == "create_reminder" })
+        assertEquals(0, calendar.calls.count { it.operation == "update_event" })
+    }
+
+    // -----------------------------------------------------------------
+    // M2-B — Option 1 type disambiguation reachable from multi-step plans
+    //
+    // handlePlan's per-step loop now consults the exact same
+    // disambiguationCandidates/askTypeDisambiguation Option 1 already uses
+    // from handleSingleStep — a second call site for the identical,
+    // unmodified mechanism, exercised here entirely within one compound
+    // (multi-step) message.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `an ambiguous notification-cancel step inside a plan redirects to a calendar event created earlier in the same plan`() = runTest {
+        val calendar = calendarTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}},
+                    {"intent":"notification","action_type":"cancel","parameters":{}}
+                ]}""",
+            ),
+        )
+
+        val secretary = secretary(engine, listOf(calendar))
+        val outcome = secretary.handle("standup meeting tomorrow at 16:00 aur phir delete the standup meeting")
+
+        assertTrue("Expected a redirect question, got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
+        val question = (outcome as ToolOrchestrator.Outcome.Clarify).question
+        assertTrue("Question must name the real event, got: $question", question.contains("standup meeting"))
+        assertTrue(
+            "Must never fall back to the old generic notification question inside a plan",
+            !question.contains("What should the notification say"),
+        )
+        assertEquals(0, calendar.calls.count { it.operation == "delete_event" })
+
+        // Functional proof that pendingTypeDisambiguation — not the calendar
+        // create's own leftover follow-up-suggestion confirmation — is what
+        // the next turn resolves: confirming must route into the delete
+        // confirmation for the *redirected* event, not be misread as an
+        // answer to the abandoned "add a reminder for this?" suggestion
+        // (which would silently execute a different, unwanted action).
+        val confirmedRedirect = secretary.handle("yes")
+        assertTrue(
+            "Confirming the redirect must hit the calendar event's own delete confirmation, got $confirmedRedirect",
+            confirmedRedirect is ToolOrchestrator.Outcome.Clarify,
+        )
+        assertTrue((confirmedRedirect as ToolOrchestrator.Outcome.Clarify).question.contains("standup meeting"))
+    }
+
+    @Test
+    fun `an ambiguous step inside a plan with no remembered candidate falls through to the existing generic question`() = runTest {
+        val whatsapp = whatsAppTool()
+        val notification = RecordingTool(ToolId.NOTIFICATION, setOf("notify", "cancel")) {
+            ToolResult.Success("Done.", mapOf("notification_id" to "1"))
+        }
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"whatsapp_message","parameters":{"person":"Ali","message":"on my way"}},
+                    {"intent":"notification","action_type":"cancel","parameters":{}}
+                ]}""",
+            ),
+        )
+
+        val outcome = secretary(engine, listOf(whatsapp, notification))
+            .handle("Ali ko WhatsApp kar do on my way aur phir notification cancel kar do")
+
+        // whatsapp_message never touches lastCalendarEvent/lastReminder/lastTask,
+        // so no candidate exists — Option 1 must not fabricate one.
+        assertTrue("Expected Clarify, got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
+        assertTrue(
+            "No memory candidate exists, so the pre-M2-B generic question must be unchanged " +
+                "(prefixed with step 1's own reply, exactly like every other handlePlan block already does)",
+            (outcome as ToolOrchestrator.Outcome.Clarify).question.endsWith("What should the notification say?"),
+        )
+        assertEquals(0, notification.calls.size)
+    }
+
+    @Test
+    fun `a title-addressed task step inside a plan is executed normally and never second-guessed`() = runTest {
+        val calendar = calendarTool()
+        // taskTool()'s shared helper only declares "create_task" — this
+        // step needs "complete_task" recognised by the registry, so it is
+        // built directly rather than reusing that CREATE-only default.
+        val task = RecordingTool(ToolId.TASK, setOf("create_task", "complete_task")) {
+            ToolResult.Success("Task \"${it.arguments["title"]}\" completed.", mapOf("task_id" to "1"))
+        }
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}},
+                    {"intent":"task","action_type":"complete","parameters":{"title":"DBPMS wala kaam"}}
+                ]}""",
+            ),
+        )
+
+        val outcome = secretary(engine, listOf(calendar, task))
+            .handle("standup meeting tomorrow at 16:00 aur DBPMS wala kaam complete kar do")
+
+        assertTrue(
+            "A title-addressed, already-complete task step must run normally, got $outcome",
+            outcome is ToolOrchestrator.Outcome.Handled,
+        )
+        assertEquals(
+            "DBPMS wala kaam",
+            task.calls.single { it.operation == "complete_task" }.arguments["title"],
+        )
+        assertEquals(0, calendar.calls.count { it.operation == "update_event" || it.operation == "delete_event" })
+    }
+
+    @Test
+    fun `two plausible candidates inside a plan still use the existing numbered-choice mechanism`() = runTest {
+        val calendar = calendarTool()
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank","raw_when":"17:00"}}"""),
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}},
+                    {"intent":"notification","action_type":"cancel","parameters":{}}
+                ]}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(calendar, reminder))
+        // A prior, separate turn remembers a reminder...
+        secretary.handle("remind me to call the bank at 17:00")
+        // ...then a plan created in this turn also remembers a calendar event.
+        val asked = secretary.handle("standup meeting tomorrow at 16:00 aur phir cancel it")
+
+        assertTrue("Expected a numbered choice, got $asked", asked is ToolOrchestrator.Outcome.Clarify)
+        val question = (asked as ToolOrchestrator.Outcome.Clarify).question
+        assertTrue(question.contains("1)"))
+        assertTrue(question.contains("2)"))
+        assertTrue(question.contains("standup meeting"))
+        assertTrue(question.contains("call the bank"))
+
+        // Reuses the existing, unmodified numbered-index parser (resolveTypeDisambiguation) — no new matching logic.
+        val picked = secretary.handle("2")
+        assertTrue("Picking the reminder must still hit its own delete confirmation, got $picked", picked is ToolOrchestrator.Outcome.Clarify)
+        secretary.handle("yes")
+
+        assertEquals(1, reminder.calls.count { it.operation == "cancel_reminder" })
+        assertEquals(0, calendar.calls.count { it.operation == "delete_event" })
+    }
+
+    // -----------------------------------------------------------------
+    // M2-C — PendingPlan and multi-step plan resumption
+    //
+    // Before M2-C, a block mid-plan resumed only the one blocked step;
+    // everything after it was silently dropped. These prove the remainder
+    // now survives a clarification, a confirmation, a contact selection,
+    // and a Day 09 Option 1 redirect — including re-blocking a second time
+    // — and that a fully completed plan leaves nothing behind to leak into
+    // an unrelated later message.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `clarification mid-plan resumes the preserved remainder`() = runTest {
+        // A reminder step is deliberately NOT used to block here — placed
+        // immediately after a calendar_event step, a bodiless reminder is
+        // auto-completed by the pre-existing anchorToPriorEvent default
+        // (M2-A), never actually reaching Missing. whatsapp_message with a
+        // person but no message text blocks for a genuinely unrelated
+        // reason, with no such interaction.
+        val calendar = calendarTool()
+        val whatsapp = whatsAppTool()
+        val task = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}},
+                    {"intent":"whatsapp_message","parameters":{"person":"Ali"}},
+                    {"intent":"task","parameters":{"title":"send agenda"}}
+                ]}""",
+            ),
+            // The answer to step 2's "what would you like the message to say?" question.
+            DpsResult.Success("""{"intent":"whatsapp_message","parameters":{"message":"on my way"}}"""),
+        )
+        val secretary = secretary(engine, listOf(calendar, whatsapp, task))
+
+        val blocked = secretary.handle("standup meeting tomorrow at 16:00, Ali ko WhatsApp kar do, aur agenda bhejne ka task bana do")
+
+        assertTrue("Expected Clarify asking about step 2's message, got $blocked", blocked is ToolOrchestrator.Outcome.Clarify)
+        assertEquals(1, calendar.calls.count { it.operation == "create_event" })
+        assertEquals(0, whatsapp.calls.size)
+        assertEquals(0, task.calls.size)
+
+        val resumed = secretary.handle("on my way")
+
+        assertTrue("Expected Handled once step 2 is answered, got $resumed", resumed is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, whatsapp.calls.size)
+        assertEquals(
+            "Step 3 must run after the resumed step 2, not be silently dropped",
+            1,
+            task.calls.count { it.operation == "create_task" },
+        )
+    }
+
+    @Test
+    fun `confirmation mid-plan resumes the preserved remainder`() = runTest {
+        val calendar = calendarTool()
+        // taskTool()'s shared helper only declares "create_task" (see the
+        // M2-B lesson) — this step needs "cancel_task" recognised too.
+        val task = RecordingTool(ToolId.TASK, setOf("create_task", "cancel_task")) {
+            ToolResult.Success("Task \"${it.arguments["title"]}\" cancelled.", mapOf("task_id" to (it.arguments["id"] ?: "1")))
+        }
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}},
+                    {"intent":"task","action_type":"cancel","parameters":{"title":"old task"}},
+                    {"intent":"reminder","parameters":{"title":"followup","raw_when":"18:00"}}
+                ]}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(calendar, task, reminder))
+
+        val blocked = secretary.handle("standup meeting tomorrow at 16:00, cancel the old task, aur followup reminder 18:00 pe laga do")
+
+        assertTrue("Expected the delete confirmation for step 2, got $blocked", blocked is ToolOrchestrator.Outcome.Clarify)
+        assertEquals(0, task.calls.count { it.operation == "cancel_task" })
+        assertEquals(0, reminder.calls.size)
+
+        val resumed = secretary.handle("yes")
+
+        assertTrue("Expected Handled once the confirmation is answered, got $resumed", resumed is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, task.calls.count { it.operation == "cancel_task" })
+        assertEquals(
+            "Step 3 must run after the confirmed step 2, not be silently dropped",
+            1,
+            reminder.calls.count { it.operation == "create_reminder" },
+        )
+    }
+
+    @Test
+    fun `declining a confirmation mid-plan stops the plan rather than continuing unattended`() = runTest {
+        val calendar = calendarTool()
+        val task = taskTool()
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}},
+                    {"intent":"task","action_type":"cancel","parameters":{"title":"old task"}},
+                    {"intent":"reminder","parameters":{"title":"followup","raw_when":"18:00"}}
+                ]}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(calendar, task, reminder))
+        secretary.handle("standup meeting tomorrow at 16:00, cancel the old task, aur followup reminder 18:00 pe laga do")
+
+        val declined = secretary.handle("no")
+
+        assertTrue("Expected Handled reporting the decline, got $declined", declined is ToolOrchestrator.Outcome.Handled)
+        assertEquals(0, task.calls.count { it.operation == "cancel_task" })
+        assertEquals(
+            "A declined destructive step must not be followed by unattended further execution",
+            0,
+            reminder.calls.count { it.operation == "create_reminder" },
+        )
+    }
+
+    @Test
+    fun `contact selection mid-plan resumes the preserved remainder`() = runTest {
+        val calendar = calendarTool()
+        val whatsapp = whatsAppTool()
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}},
+                    {"intent":"whatsapp_message","parameters":{"person":"Abdul","message":"on my way"}},
+                    {"intent":"reminder","parameters":{"title":"followup","raw_when":"18:00"}}
+                ]}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(calendar, ambiguousContactsTool(), whatsapp, reminder))
+
+        val blocked = secretary.handle("standup meeting tomorrow at 16:00, Abdul ko WhatsApp kar do on my way, aur followup reminder 18:00 pe laga do")
+
+        assertTrue("Expected the contact-selection question, got $blocked", blocked is ToolOrchestrator.Outcome.Clarify)
+        assertEquals(0, whatsapp.calls.size)
+        assertEquals(0, reminder.calls.size)
+
+        val resumed = secretary.handle("1")
+
+        assertTrue("Expected Handled once a contact is picked, got $resumed", resumed is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, whatsapp.calls.size)
+        assertEquals(
+            "Step 3 must run after the resolved step 2, not be silently dropped",
+            1,
+            reminder.calls.count { it.operation == "create_reminder" },
+        )
+    }
+
+    @Test
+    fun `type disambiguation mid-plan resumes the preserved remainder, through its own re-block into a delete confirmation`() = runTest {
+        val calendar = calendarTool()
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}},
+                    {"intent":"notification","action_type":"cancel","parameters":{}},
+                    {"intent":"reminder","parameters":{"title":"followup","raw_when":"18:00"}}
+                ]}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(calendar, reminder))
+
+        val redirect = secretary.handle("standup meeting tomorrow at 16:00, delete the standup meeting, aur followup reminder 18:00 pe laga do")
+
+        assertTrue("Expected the Option 1 redirect for step 2, got $redirect", redirect is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((redirect as ToolOrchestrator.Outcome.Clarify).question.contains("standup meeting"))
+
+        // Confirming the redirect still hits the calendar event's own
+        // delete-confirmation gate (M2-B's existing behaviour) — a
+        // re-block, not a completion; step 3 must not run yet.
+        val reBlocked = secretary.handle("yes")
+        assertTrue("Expected the delete confirmation, got $reBlocked", reBlocked is ToolOrchestrator.Outcome.Clarify)
+        assertEquals(0, reminder.calls.size)
+        assertEquals(0, calendar.calls.count { it.operation == "delete_event" })
+
+        val resumed = secretary.handle("yes")
+
+        assertTrue("Expected Handled once the delete is confirmed, got $resumed", resumed is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, calendar.calls.count { it.operation == "delete_event" })
+        assertEquals(
+            "Step 3 must run after the redirected-and-confirmed step 2, not be silently dropped",
+            1,
+            reminder.calls.count { it.operation == "create_reminder" },
+        )
+    }
+
+    @Test
+    fun `re-blocking twice in the same plan resumes correctly both times with nothing skipped or duplicated`() = runTest {
+        // Step 2 uses whatsapp_message rather than a bodiless reminder — see
+        // the "clarification mid-plan" test's comment for why a reminder
+        // directly after a calendar_event step would be auto-completed by
+        // anchorToPriorEvent (M2-A) instead of genuinely blocking.
+        val calendar = calendarTool()
+        val whatsapp = whatsAppTool()
+        val reminder = reminderTool()
+        // taskTool()'s shared helper only declares "create_task" — this
+        // step needs "cancel_task" recognised too (see the M2-B lesson).
+        val task = RecordingTool(ToolId.TASK, setOf("create_task", "cancel_task")) {
+            ToolResult.Success("Task \"${it.arguments["title"]}\" cancelled.", mapOf("task_id" to (it.arguments["id"] ?: "1")))
+        }
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}},
+                    {"intent":"whatsapp_message","parameters":{"person":"Ali"}},
+                    {"intent":"task","action_type":"cancel","parameters":{"title":"old task"}},
+                    {"intent":"reminder","parameters":{"title":"followup2","raw_when":"19:00"}}
+                ]}""",
+            ),
+            DpsResult.Success("""{"intent":"whatsapp_message","parameters":{"message":"on my way"}}"""),
+        )
+        val secretary = secretary(engine, listOf(calendar, whatsapp, reminder, task))
+
+        val firstBlock = secretary.handle(
+            "standup meeting tomorrow at 16:00, Ali ko WhatsApp kar do, cancel the old task, aur followup2 reminder 19:00 pe laga do",
+        )
+        assertTrue("Expected step 2's clarification, got $firstBlock", firstBlock is ToolOrchestrator.Outcome.Clarify)
+
+        val secondBlock = secretary.handle("on my way")
+        assertTrue("Expected step 3's delete confirmation, got $secondBlock", secondBlock is ToolOrchestrator.Outcome.Clarify)
+        // Step 2 ran exactly once resolving the first block; step 3 has not run yet.
+        assertEquals(1, whatsapp.calls.size)
+        assertEquals(0, task.calls.size)
+
+        val completed = secretary.handle("yes")
+
+        assertTrue("Expected Handled once step 3 is confirmed, got $completed", completed is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, task.calls.count { it.operation == "cancel_task" })
+        assertEquals(
+            "Step 4 must run after the second re-block resolves, not be silently dropped",
+            1,
+            reminder.calls.count { it.operation == "create_reminder" && it.arguments["title"] == "followup2" },
+        )
+        // Nothing ran twice across the two resumptions.
+        assertEquals(1, calendar.calls.count { it.operation == "create_event" })
+        assertEquals(1, whatsapp.calls.size)
+        assertEquals(1, reminder.calls.count { it.operation == "create_reminder" })
+        assertEquals(1, task.calls.count { it.operation == "cancel_task" })
+    }
+
+    @Test
+    fun `a fully completed plan leaves no pending state for an unrelated later message to continue`() = runTest {
+        // Deliberately neither CALENDAR_EVENT nor REMINDER creates here —
+        // both trigger FollowUpSuggestionGenerator's own, pre-existing,
+        // unrelated follow-up suggestion on success, which would leave its
+        // own dangling pendingConfirmation and defeat this test's actual
+        // point (verifying PendingPlan itself leaves nothing behind).
+        val task = taskTool()
+        val whatsapp = whatsAppTool()
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"task","parameters":{"title":"kickoff"}},
+                    {"intent":"whatsapp_message","parameters":{"person":"Ali","message":"on my way"}}
+                ]}""",
+            ),
+            // An entirely unrelated single-step request sent afterward.
+            DpsResult.Success("""{"intent":"reminder","parameters":{"title":"buy milk","raw_when":"20:00"}}"""),
+        )
+        val secretary = secretary(engine, listOf(task, whatsapp, reminder))
+
+        val completed = secretary.handle("kickoff ka task bana do aur Ali ko WhatsApp kar do on my way")
+        assertTrue("Expected the plan to complete fully, got $completed", completed is ToolOrchestrator.Outcome.Handled)
+        assertNull("Nothing should be pending once a plan fully completes", secretary.pendingQuestion())
+
+        val unrelated = secretary.handle("remind me to buy milk at 20:00")
+
+        assertTrue("Expected the unrelated request to run on its own, got $unrelated", unrelated is ToolOrchestrator.Outcome.Handled)
+        // Exactly one reminder — the unrelated message's own — never a
+        // phantom continuation of the already-finished plan (which had no
+        // reminder step at all).
+        assertEquals(1, reminder.calls.count { it.operation == "create_reminder" })
+        assertEquals("buy milk", reminder.calls.single().arguments["title"])
     }
 }

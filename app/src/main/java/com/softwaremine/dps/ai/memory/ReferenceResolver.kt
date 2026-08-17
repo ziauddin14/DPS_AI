@@ -127,8 +127,15 @@ class ReferenceResolver(
      * Finds a spoken time delta — "30 minute pehle", "2 hours later" — and
      * returns it in milliseconds, negative for "earlier/pehle", positive for
      * "later/baad". `null` when [normalized] names no such delta.
+     *
+     * `internal` rather than `private` (M2-A) so
+     * [com.softwaremine.dps.ai.secretary.SecretaryOrchestrator] can reuse
+     * this exact, already-tested parser for a cross-step reminder offset
+     * ("remind me 15 minutes before" following a calendar-event step)
+     * rather than duplicating the same regex/vocabulary a second time. Pure
+     * visibility change — no behaviour here is different.
      */
-    private fun findRelativeOffsetMillis(normalized: String): Long? {
+    internal fun findRelativeOffsetMillis(normalized: String): Long? {
         val match = OFFSET_PATTERN.find(normalized) ?: return null
         val amount = match.groupValues[1].toLongOrNull() ?: return null
         val unit = match.groupValues[2]

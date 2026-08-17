@@ -89,6 +89,54 @@ class ToolSelectorTest {
     }
 
     @Test
+    fun `a notification create routes to notify`() {
+        val call = selector.select(
+            intent(
+                IntentType.NOTIFICATION,
+                IntentParameters(title = "stand up"),
+                action = IntentAction.CREATE,
+            ),
+        )!!
+
+        assertEquals(ToolId.NOTIFICATION, call.toolId)
+        assertEquals("notify", call.operation)
+        assertEquals("stand up", call.arguments["title"])
+    }
+
+    @Test
+    fun `a notification cancel routes to cancel, never to notify`() {
+        val call = selector.select(
+            intent(
+                IntentType.NOTIFICATION,
+                IntentParameters(targetId = "42"),
+                action = IntentAction.CANCEL,
+            ),
+        )!!
+
+        assertEquals(ToolId.NOTIFICATION, call.toolId)
+        assertEquals("cancel", call.operation)
+        assertEquals("42", call.arguments["id"])
+    }
+
+    @Test
+    fun `an unsupported notification update never falls through to notify`() {
+        val call = selector.select(
+            intent(
+                IntentType.NOTIFICATION,
+                IntentParameters(title = "stand up"),
+                action = IntentAction.UPDATE,
+            ),
+        )!!
+
+        assertEquals(ToolId.NOTIFICATION, call.toolId)
+        // "update" is deliberately not an operation AndroidNotificationTool
+        // implements — the executor's own Unsupported fallback reports that
+        // honestly. What matters here is what it must never be: "notify",
+        // which would silently post something the user never asked for.
+        assertTrue(call.operation != "notify")
+    }
+
+    @Test
     fun `a contact lookup routes to the contacts tool`() {
         val call = selector.select(
             intent(IntentType.CONTACT_LOOKUP, IntentParameters(person = "Abdul")),

@@ -27,6 +27,8 @@ class SecretaryStateMachineTest {
         SecretaryEvent.PermissionDenied,
         SecretaryEvent.ContactAmbiguous,
         SecretaryEvent.ContactSelected,
+        SecretaryEvent.TypeDisambiguationNeeded,
+        SecretaryEvent.TypeDisambiguationResolved,
         SecretaryEvent.ConfirmationRequested,
         SecretaryEvent.ConfirmationAccepted,
         SecretaryEvent.ConfirmationDeclined,
@@ -68,6 +70,7 @@ class SecretaryStateMachineTest {
             SecretaryEvent.ClarificationNeeded to SecretaryState.WAITING_MISSING_INFORMATION,
             SecretaryEvent.PermissionNeeded to SecretaryState.WAITING_PERMISSION,
             SecretaryEvent.ContactAmbiguous to SecretaryState.WAITING_CONTACT_SELECTION,
+            SecretaryEvent.TypeDisambiguationNeeded to SecretaryState.WAITING_TYPE_DISAMBIGUATION,
             SecretaryEvent.ConfirmationRequested to SecretaryState.WAITING_CONFIRMATION,
             SecretaryEvent.ExecutionSucceeded to SecretaryState.COMPLETED,
             SecretaryEvent.ExecutionFailed to SecretaryState.FAILED,
@@ -88,6 +91,7 @@ class SecretaryStateMachineTest {
             SecretaryState.WAITING_MISSING_INFORMATION to SecretaryEvent.InformationProvided,
             SecretaryState.WAITING_PERMISSION to SecretaryEvent.PermissionGranted,
             SecretaryState.WAITING_CONTACT_SELECTION to SecretaryEvent.ContactSelected,
+            SecretaryState.WAITING_TYPE_DISAMBIGUATION to SecretaryEvent.TypeDisambiguationResolved,
             SecretaryState.WAITING_CONFIRMATION to SecretaryEvent.ConfirmationAccepted,
         )
 
@@ -174,6 +178,7 @@ class SecretaryStateMachineTest {
             put(SecretaryState.EXECUTING to SecretaryEvent.ClarificationNeeded, SecretaryState.WAITING_MISSING_INFORMATION)
             put(SecretaryState.EXECUTING to SecretaryEvent.PermissionNeeded, SecretaryState.WAITING_PERMISSION)
             put(SecretaryState.EXECUTING to SecretaryEvent.ContactAmbiguous, SecretaryState.WAITING_CONTACT_SELECTION)
+            put(SecretaryState.EXECUTING to SecretaryEvent.TypeDisambiguationNeeded, SecretaryState.WAITING_TYPE_DISAMBIGUATION)
             put(SecretaryState.EXECUTING to SecretaryEvent.ConfirmationRequested, SecretaryState.WAITING_CONFIRMATION)
             put(SecretaryState.EXECUTING to SecretaryEvent.ExecutionSucceeded, SecretaryState.COMPLETED)
             put(SecretaryState.EXECUTING to SecretaryEvent.ExecutionFailed, SecretaryState.FAILED)
@@ -181,6 +186,7 @@ class SecretaryStateMachineTest {
             put(SecretaryState.WAITING_PERMISSION to SecretaryEvent.PermissionGranted, SecretaryState.EXECUTING)
             put(SecretaryState.WAITING_PERMISSION to SecretaryEvent.PermissionDenied, SecretaryState.FAILED)
             put(SecretaryState.WAITING_CONTACT_SELECTION to SecretaryEvent.ContactSelected, SecretaryState.EXECUTING)
+            put(SecretaryState.WAITING_TYPE_DISAMBIGUATION to SecretaryEvent.TypeDisambiguationResolved, SecretaryState.EXECUTING)
             put(SecretaryState.WAITING_CONFIRMATION to SecretaryEvent.ConfirmationAccepted, SecretaryState.EXECUTING)
             put(SecretaryState.WAITING_CONFIRMATION to SecretaryEvent.ConfirmationDeclined, SecretaryState.COMPLETED)
             put(SecretaryState.COMPLETED to SecretaryEvent.MessageReceived, SecretaryState.EXECUTING)

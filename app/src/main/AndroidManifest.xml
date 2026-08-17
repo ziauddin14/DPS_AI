@@ -12,7 +12,7 @@
 
     Deliberately NOT declared today — these arrive with the day that uses them:
       CALENDAR, CONTACTS, RECORD_AUDIO, POST_NOTIFICATIONS,
-      SCHEDULE_EXACT_ALARM, FOREGROUND_SERVICE, RECEIVE_BOOT_COMPLETED
+      SCHEDULE_EXACT_ALARM, FOREGROUND_SERVICE
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -47,6 +47,14 @@
         violation, and the graceful fallback removes any need for it.
     -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!--
+        Reminder reboot survival. AlarmManager clears every alarm on restart
+        (confirmed empirically, not assumed); this lets ReminderBootReceiver
+        re-arm whatever ReminderStore still has on record once the device has
+        booted and credential-encrypted storage is available again.
+    -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Day 05 Phase C. Contacts lookup backs the messaging confirmation flows. -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
@@ -160,6 +168,31 @@
             android:name=".data.android.reminder.ReminderReceiver"
             android:exported="false"
             android:enabled="true" />
+
+        <!--
+            Reschedules reminders after a reboot.
+
+            exported="true" is required here, unlike ReminderReceiver above:
+            BOOT_COMPLETED is a system-sent implicit broadcast, and a manifest
+            receiver must be exported to receive one at all (mandatory from
+            targetSdk 34+). This is safe rather than a hole to close — only the
+            OS can send a protected broadcast like BOOT_COMPLETED, so no other
+            app can use this to fabricate anything the way an exported
+            ReminderReceiver would let them fabricate a reminder firing.
+
+            directBootAware is left at its default false: ReminderStore lives
+            in ordinary credential-encrypted storage, not device-protected
+            storage, so this receiver has nothing useful to do before the
+            first post-boot unlock in any case.
+        -->
+        <receiver
+            android:name=".data.android.reminder.ReminderBootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
     </application>
 

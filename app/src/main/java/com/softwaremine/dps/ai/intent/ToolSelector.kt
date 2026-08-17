@@ -64,15 +64,7 @@ class ToolSelector(
 
             IntentType.CALENDAR_EVENT -> calendarCall(intent.action, p)
 
-            IntentType.NOTIFICATION -> ToolCall(
-                toolId = ToolId.NOTIFICATION,
-                operation = "notify",
-                arguments = buildMap {
-                    put("title", p.value(IntentField.TITLE) ?: p.value(IntentField.MESSAGE).orEmpty())
-                    p.value(IntentField.MESSAGE)?.let { put("body", it) }
-                    p.value(IntentField.PRIORITY)?.let { put("channel", channelFor(it)) }
-                },
-            )
+            IntentType.NOTIFICATION -> notificationCall(intent.action, p)
 
             IntentType.CONTACT_LOOKUP -> ToolCall(
                 toolId = ToolId.CONTACTS,
@@ -342,6 +334,52 @@ class ToolSelector(
                 put("title", p.value(IntentField.TITLE) ?: p.value(IntentField.MESSAGE).orEmpty())
                 p.value(IntentField.MESSAGE)?.let { put("body", it) }
                 resolveInstant(p)?.let { put("time", it.toString()) }
+            },
+        )
+    }
+
+    /**
+     * Builds the notification call for [action].
+     *
+     * ## Why CANCEL is the only other branch, not a mirror of [reminderCall]
+     * [IntentType.NOTIFICATION] is not in [com.softwaremine.dps.ai.intent.ClarificationEngine]'s
+     * `TARGETABLE_TYPES` and has no slot in [com.softwaremine.dps.domain.memory.ConversationMemory]
+     * — nothing anywhere grounds a notification id the way
+     * [com.softwaremine.dps.ai.memory.ReferenceResolver] grounds a reminder or
+     * calendar event's. So `p.targetId` is always absent here today, and
+     * `cancel` always fails honestly with "Missing required argument 'id'"
+     * from [com.softwaremine.dps.data.android.tool.AndroidNotificationTool]
+     * itself — exactly the same "omit and let the tool say so" shape
+     * [reminderCall]'s own CANCEL branch already uses, not a new failure mode.
+     * That is still strictly better than before: a wrong or unactionable
+     * result, never a fabricated one.
+     *
+     * UPDATE, COMPLETE and LIST have no concept in
+     * [com.softwaremine.dps.data.android.tool.AndroidNotificationTool] at all
+     * — deliberately routed to an operation name it does not implement, so
+     * the executor's existing Unsupported fallback reports that honestly
+     * rather than this class guessing CREATE was meant and posting something
+     * the user never asked for (the same [reminderCall] `COMPLETE` shape).
+     */
+    private fun notificationCall(action: IntentAction, p: IntentParameters): ToolCall = when (action) {
+        IntentAction.CANCEL -> ToolCall(
+            toolId = ToolId.NOTIFICATION,
+            operation = "cancel",
+            arguments = buildMap { p.targetId?.let { put("id", it) } },
+        )
+
+        IntentAction.UPDATE, IntentAction.COMPLETE, IntentAction.LIST -> ToolCall(
+            toolId = ToolId.NOTIFICATION,
+            operation = "update",
+        )
+
+        IntentAction.CREATE -> ToolCall(
+            toolId = ToolId.NOTIFICATION,
+            operation = "notify",
+            arguments = buildMap {
+                put("title", p.value(IntentField.TITLE) ?: p.value(IntentField.MESSAGE).orEmpty())
+                p.value(IntentField.MESSAGE)?.let { put("body", it) }
+                p.value(IntentField.PRIORITY)?.let { put("channel", channelFor(it)) }
             },
         )
     }

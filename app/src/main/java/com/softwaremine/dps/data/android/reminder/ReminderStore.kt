@@ -29,11 +29,12 @@ import kotlinx.serialization.json.Json
  * secretary's data model does.
  *
  * ## Note on reboots
- * Alarms do **not** survive a device restart â€” Android clears them. This store
- * retains the records, so a future `BOOT_COMPLETED` receiver can reinstate
- * them. That receiver is deliberately not part of Phase B; without it,
- * reminders are lost on reboot, and that is recorded as a known risk rather
- * than quietly ignored.
+ * Alarms do **not** survive a device restart â€” Android clears them, confirmed
+ * empirically during the Reminder Reboot Survival investigation. This store
+ * retaining every record is what makes recovery possible:
+ * [com.softwaremine.dps.data.android.reminder.ReminderBootReceiver] reads
+ * [all] on `BOOT_COMPLETED` and re-arms whatever is still pending through
+ * [ReminderScheduler], the same path a fresh `create_reminder` call uses.
  *
  * ## Dependencies
  * `android.content.SharedPreferences`, kotlinx.serialization.
