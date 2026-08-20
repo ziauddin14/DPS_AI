@@ -1,5 +1,6 @@
 package com.softwaremine.dps.ai.secretary
 
+import android.content.SharedPreferences
 import com.softwaremine.dps.ai.intent.ClarificationEngine
 import com.softwaremine.dps.ai.intent.IntentJsonParser
 import com.softwaremine.dps.ai.intent.IntentPromptBuilder
@@ -20,6 +21,8 @@ import com.softwaremine.dps.ai.tool.DefaultToolRegistry
 import com.softwaremine.dps.core.error.DpsError
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.core.result.DpsResult
+import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
+import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
 import com.softwaremine.dps.domain.ai.AiCompletion
 import com.softwaremine.dps.domain.ai.AiEngine
 import com.softwaremine.dps.domain.ai.AiState
@@ -27,8 +30,11 @@ import com.softwaremine.dps.domain.ai.CompletionChunk
 import com.softwaremine.dps.domain.ai.CompletionRequest
 import com.softwaremine.dps.domain.ai.FinishReason
 import com.softwaremine.dps.domain.ai.TokenUsage
+import com.softwaremine.dps.domain.memory.ConversationMemory
 import com.softwaremine.dps.domain.memory.ReminderMemory
+import com.softwaremine.dps.domain.memory.TaskMemory
 import com.softwaremine.dps.domain.model.ModelConfig
+import com.softwaremine.dps.domain.preferences.UserPreferences
 import com.softwaremine.dps.domain.model.ModelDescriptor
 import com.softwaremine.dps.domain.permission.DpsPermission
 import com.softwaremine.dps.domain.permission.PermissionManager
@@ -145,6 +151,57 @@ class SecretaryOrchestratorTest {
         }
     }
 
+    /**
+     * Minimal in-memory fake of [SharedPreferences] (M3-B), mirroring the one
+     * [com.softwaremine.dps.data.android.memory.PersistentMemoryStoreTest]
+     * already uses — only what [PersistentMemoryStore] actually calls needs
+     * to behave correctly.
+     */
+    private class FakeSharedPreferences : SharedPreferences {
+        private val values = mutableMapOf<String, Any?>()
+
+        override fun getAll(): MutableMap<String, *> = values.toMutableMap()
+        override fun getString(key: String?, defValue: String?): String? = values[key] as? String ?: defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
+            @Suppress("UNCHECKED_CAST")
+            (values[key] as? MutableSet<String>) ?: defValues
+
+        override fun getInt(key: String?, defValue: Int): Int = values[key] as? Int ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long = values[key] as? Long ?: defValue
+        override fun getFloat(key: String?, defValue: Float): Float = values[key] as? Float ?: defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean = values[key] as? Boolean ?: defValue
+        override fun contains(key: String?): Boolean = values.containsKey(key)
+        override fun edit(): SharedPreferences.Editor = FakeEditor()
+        override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+
+        private inner class FakeEditor : SharedPreferences.Editor {
+            private val pending = mutableMapOf<String, Any?>()
+            private var cleared = false
+
+            override fun putString(key: String?, value: String?) = apply { if (key != null) pending[key] = value }
+            override fun putStringSet(key: String?, values: MutableSet<String>?) = apply { if (key != null) pending[key] = values }
+            override fun putInt(key: String?, value: Int) = apply { if (key != null) pending[key] = value }
+            override fun putLong(key: String?, value: Long) = apply { if (key != null) pending[key] = value }
+            override fun putFloat(key: String?, value: Float) = apply { if (key != null) pending[key] = value }
+            override fun putBoolean(key: String?, value: Boolean) = apply { if (key != null) pending[key] = value }
+            override fun remove(key: String?) = apply { if (key != null) pending[key] = REMOVE_MARKER }
+            override fun clear() = apply { cleared = true }
+            override fun commit(): Boolean { applyPending(); return true }
+            override fun apply() = applyPending()
+
+            private fun applyPending() {
+                if (cleared) values.clear()
+                pending.forEach { (key, value) -> if (value === REMOVE_MARKER) values.remove(key) else values[key] = value }
+                pending.clear()
+            }
+        }
+
+        private companion object {
+            val REMOVE_MARKER = Any()
+        }
+    }
+
     private val zone: ZoneId = ZoneId.of("Asia/Karachi")
 
     private fun secretary(
@@ -153,6 +210,8 @@ class SecretaryOrchestratorTest {
         permissions: PermissionManager = FakePermissions(),
         now: () -> Long = System::currentTimeMillis,
         temporalNow: () -> java.time.LocalDateTime = { java.time.LocalDateTime.now(zone) },
+        persistentMemoryStore: PersistentMemoryStore = PersistentMemoryStore(FakeSharedPreferences(), silentLogger),
+        persistentPreferenceStore: PersistentPreferenceStore = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger),
     ): SecretaryOrchestrator {
         val registry = DefaultToolRegistry(silentLogger).apply { tools.forEach(::register) }
         val executor = DefaultToolExecutor(
@@ -192,6 +251,8 @@ class SecretaryOrchestratorTest {
             contactSelectionParser = ContactSelectionParser(),
             confirmationParser = ConfirmationParser(),
             followUpSuggestions = FollowUpSuggestionGenerator(zone = zone),
+            persistentMemoryStore = persistentMemoryStore,
+            persistentPreferenceStore = persistentPreferenceStore,
             logger = silentLogger,
             zone = zone,
             now = now,
@@ -1395,6 +1456,139 @@ class SecretaryOrchestratorTest {
 
         secretary(engine, listOf(calendar, reminder))
             .handle("kal 16:00 meeting bana do aur shortly before reminder bhi laga do")
+
+        val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 30)
+            .atZone(zone).toInstant().toEpochMilli().toString()
+        assertEquals(expected, reminder.calls.single().arguments["time"])
+    }
+
+    // -----------------------------------------------------------------
+    // M3-C finalization — three-way default precedence for anchorToPriorEvent
+    //
+    // explicit request offset > stored user preference > 30-minute default.
+    // The explicit-offset behavior itself (tested exhaustively above) is
+    // unchanged — statedOffsetMillis still wins by construction, first in
+    // the ?: chain, before preferredLeadMillis() is ever consulted.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `an explicit request offset beats a stored preference`() = runTest {
+        val calendar = calendarTool() // start=2026-08-07T16:00
+        val reminder = reminderTool()
+        val prefs = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger)
+        prefs.save(UserPreferences(defaultReminderLeadMinutes = 15))
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"meeting","raw_when":"10 minutes before"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(calendar, reminder), persistentPreferenceStore = prefs)
+            .handle("kal 16:00 meeting bana do aur 10 minutes before reminder bhi laga do")
+
+        val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 50)
+            .atZone(zone).toInstant().toEpochMilli().toString()
+        assertEquals(expected, reminder.calls.single().arguments["time"])
+    }
+
+    @Test
+    fun `a stored default lead time is used when no explicit offset is stated`() = runTest {
+        val calendar = calendarTool() // start=2026-08-07T16:00
+        val reminder = reminderTool()
+        val prefs = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger)
+        prefs.save(UserPreferences(defaultReminderLeadMinutes = 15))
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"meeting"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(calendar, reminder), persistentPreferenceStore = prefs)
+            .handle("kal 16:00 meeting bana do aur reminder bhi laga do")
+
+        val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 45)
+            .atZone(zone).toInstant().toEpochMilli().toString()
+        assertEquals(
+            "With no explicit offset, the stored 15-minute preference must be used instead of the 30-minute default",
+            expected,
+            reminder.calls.single().arguments["time"],
+        )
+    }
+
+    @Test
+    fun `the 30-minute default applies when neither an explicit offset nor a stored preference exists`() = runTest {
+        val calendar = calendarTool() // start=2026-08-07T16:00
+        val reminder = reminderTool()
+        val prefs = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger) // EMPTY — nothing saved
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"meeting"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(calendar, reminder), persistentPreferenceStore = prefs)
+            .handle("kal 16:00 meeting bana do aur reminder bhi laga do")
+
+        val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 30)
+            .atZone(zone).toInstant().toEpochMilli().toString()
+        assertEquals(expected, reminder.calls.single().arguments["time"])
+        assertEquals(
+            "Falling back to the default must never write anything back as a user preference",
+            UserPreferences.EMPTY,
+            prefs.load(),
+        )
+    }
+
+    @Test
+    fun `an explicit 5-minute offset beats a stored 15-minute preference`() = runTest {
+        val calendar = calendarTool() // start=2026-08-07T16:00
+        val reminder = reminderTool()
+        val prefs = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger)
+        prefs.save(UserPreferences(defaultReminderLeadMinutes = 15))
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"meeting","raw_when":"5 minutes before"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(calendar, reminder), persistentPreferenceStore = prefs)
+            .handle("kal 16:00 meeting bana do aur 5 minutes before reminder bhi laga do")
+
+        val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 55)
+            .atZone(zone).toInstant().toEpochMilli().toString()
+        assertEquals(expected, reminder.calls.single().arguments["time"])
+    }
+
+    @Test
+    fun `clearing a stored preference restores the 30-minute default`() = runTest {
+        val calendar = calendarTool() // start=2026-08-07T16:00
+        val reminder = reminderTool()
+        val prefs = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger)
+        prefs.save(UserPreferences(defaultReminderLeadMinutes = 15))
+        prefs.clear()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"meeting","raw_when":"16:00"}},
+                    {"intent":"reminder","parameters":{"title":"meeting"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(calendar, reminder), persistentPreferenceStore = prefs)
+            .handle("kal 16:00 meeting bana do aur reminder bhi laga do")
 
         val expected = java.time.LocalDateTime.of(2026, 8, 7, 15, 30)
             .atZone(zone).toInstant().toEpochMilli().toString()
@@ -2717,5 +2911,107 @@ class SecretaryOrchestratorTest {
         // reminder step at all).
         assertEquals(1, reminder.calls.count { it.operation == "create_reminder" })
         assertEquals("buy milk", reminder.calls.single().arguments["title"])
+    }
+
+    // -----------------------------------------------------------------
+    // M3-B: PersistentMemoryStore wiring
+    //
+    // These assert against the *store's* contents (store.load()), not just
+    // orchestrator.memory.value — proving the write actually reached durable
+    // storage, not merely the in-memory StateFlow every other test above
+    // already exercises.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `startup loads whatever memory was already persisted`() = runTest {
+        val prefs = FakeSharedPreferences()
+        val store = PersistentMemoryStore(prefs, silentLogger)
+        val existing = ConversationMemory(
+            lastTask = TaskMemory(id = 7, title = "kickoff"),
+            lastReferencedPerson = "Ali",
+            updatedAtMillis = 500L,
+        )
+        store.save(existing)
+
+        val orchestrator = secretary(
+            ScriptedEngine(DpsResult.Success("""{"intent":"conversation"}""")),
+            listOf(taskTool()),
+            persistentMemoryStore = store,
+        )
+
+        assertEquals(existing, orchestrator.memory.value)
+    }
+
+    @Test
+    fun `a successful action persists the updated memory to the store`() = runTest {
+        val prefs = FakeSharedPreferences()
+        val store = PersistentMemoryStore(prefs, silentLogger)
+        val task = taskTool()
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"task","parameters":{"title":"kickoff"}}"""))
+        val orchestrator = secretary(engine, listOf(task), persistentMemoryStore = store)
+
+        orchestrator.handle("kickoff ka task bana do")
+
+        assertEquals(1, store.load().lastTask?.id)
+        assertEquals("kickoff", store.load().lastTask?.title)
+    }
+
+    @Test
+    fun `a failed action leaves the persisted memory untouched`() = runTest {
+        val prefs = FakeSharedPreferences()
+        val store = PersistentMemoryStore(prefs, silentLogger)
+        val known = ConversationMemory(lastTask = TaskMemory(id = 1, title = "kickoff"), updatedAtMillis = 1L)
+        store.save(known)
+
+        val failingReminder = reminderTool { ToolResult.Failure("boom", retryable = false) }
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","raw_when":"16:00"}}"""))
+        val orchestrator = secretary(engine, listOf(failingReminder), persistentMemoryStore = store)
+
+        val outcome = orchestrator.handle("remind me at 16:00")
+
+        assertTrue("Expected the tool failure to surface as Handled, got $outcome", outcome is ToolOrchestrator.Outcome.Handled)
+        assertEquals("A failed action must not change what's durably remembered", known, store.load())
+    }
+
+    @Test
+    fun `a declined confirmation leaves the persisted memory untouched`() = runTest {
+        val prefs = FakeSharedPreferences()
+        val store = PersistentMemoryStore(prefs, silentLogger)
+        val calendar = calendarTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"calendar_event","parameters":{"title":"standup","raw_when":"09:00"}}"""),
+            DpsResult.Success("""{"intent":"calendar_event","action_type":"cancel","parameters":{}}"""),
+        )
+        val orchestrator = secretary(engine, listOf(calendar), persistentMemoryStore = store)
+
+        orchestrator.handle("standup tomorrow at 09:00")
+        val afterCreate = store.load()
+        orchestrator.handle("us meeting ko delete kar do")
+        val declined = orchestrator.handle("nahi")
+
+        assertTrue("Expected Handled reporting the decline, got $declined", declined is ToolOrchestrator.Outcome.Handled)
+        assertTrue("Declining must not delete anything", calendar.calls.none { it.operation == "delete_event" })
+        assertEquals(
+            "A declined destructive action must leave durable memory exactly as it was before the decline",
+            afterCreate,
+            store.load(),
+        )
+    }
+
+    @Test
+    fun `reset clears the persisted memory, not merely the in-memory copy`() = runTest {
+        val prefs = FakeSharedPreferences()
+        val store = PersistentMemoryStore(prefs, silentLogger)
+        val task = taskTool()
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"task","parameters":{"title":"kickoff"}}"""))
+        val orchestrator = secretary(engine, listOf(task), persistentMemoryStore = store)
+
+        orchestrator.handle("kickoff ka task bana do")
+        assertEquals(1, store.load().lastTask?.id)
+
+        orchestrator.reset()
+
+        assertEquals(ConversationMemory.EMPTY, orchestrator.memory.value)
+        assertEquals(ConversationMemory.EMPTY, store.load())
     }
 }

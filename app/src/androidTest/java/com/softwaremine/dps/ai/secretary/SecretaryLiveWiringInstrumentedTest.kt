@@ -1,5 +1,6 @@
 package com.softwaremine.dps.ai.secretary
 
+import android.content.SharedPreferences
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.softwaremine.dps.ai.intent.ClarificationEngine
@@ -20,6 +21,8 @@ import com.softwaremine.dps.ai.plan.ContactSelectionParser
 import com.softwaremine.dps.ai.plan.FollowUpSuggestionGenerator
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.core.result.DpsResult
+import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
+import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
 import com.softwaremine.dps.di.AiContainer
 import com.softwaremine.dps.domain.ai.AiCompletion
 import com.softwaremine.dps.domain.ai.AiEngine
@@ -34,6 +37,7 @@ import com.softwaremine.dps.domain.intent.IntentParameters
 import com.softwaremine.dps.domain.intent.IntentType
 import com.softwaremine.dps.domain.model.ModelConfig
 import com.softwaremine.dps.domain.model.ModelDescriptor
+import com.softwaremine.dps.domain.preferences.UserPreferences
 import com.softwaremine.dps.domain.tool.ToolCall
 import com.softwaremine.dps.domain.tool.ToolId
 import com.softwaremine.dps.domain.tool.ToolResult
@@ -116,7 +120,23 @@ class SecretaryLiveWiringInstrumentedTest {
         override suspend fun shutdown() = Unit
     }
 
-    private fun secretary(vararg classifications: String): SecretaryOrchestrator {
+    /**
+     * @param persistentMemoryStore (M3-B) defaults to a throwaway, in-memory-
+     *   only fake — every pre-existing test in this file was written
+     *   assuming memory starts EMPTY and touches no real device state, and
+     *   that must stay true for all of them. The one test that needs the
+     *   *real*, on-disk store passes it explicitly by name; see
+     *   [aFreshCompositionRootLoadsPersistedMemoryFromRealDurableStorage].
+     * @param persistentPreferenceStore (M3-C finalization) same reasoning —
+     *   defaults to an isolated fake so every pre-existing test keeps
+     *   getting the unmodified 30-minute `anchorToPriorEvent` default; see
+     *   [aRealStoredLeadTimePreferenceIsUsedAndAnExplicitOffsetStillWinsOverIt].
+     */
+    private fun secretary(
+        vararg classifications: String,
+        persistentMemoryStore: PersistentMemoryStore = PersistentMemoryStore(FakeSharedPreferences(), silentLogger),
+        persistentPreferenceStore: PersistentPreferenceStore = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger),
+    ): SecretaryOrchestrator {
         val toolOrchestrator = ToolOrchestrator(
             engine = ScriptedEngine(*classifications),
             executor = container.toolExecutor,
@@ -141,8 +161,63 @@ class SecretaryLiveWiringInstrumentedTest {
             contactSelectionParser = ContactSelectionParser(),
             confirmationParser = ConfirmationParser(),
             followUpSuggestions = FollowUpSuggestionGenerator(),
+            persistentMemoryStore = persistentMemoryStore,
+            persistentPreferenceStore = persistentPreferenceStore,
             logger = silentLogger,
         )
+    }
+
+    /**
+     * Minimal in-memory fake of [SharedPreferences] (M3-B) — the default
+     * backing for [secretary]'s [PersistentMemoryStore], so the ~30
+     * pre-existing tests in this file keep touching zero real device state
+     * for memory persistence, exactly as before this milestone. Mirrors the
+     * fake [com.softwaremine.dps.data.android.memory.PersistentMemoryStoreTest]
+     * and [SecretaryOrchestratorTest] already use.
+     */
+    private class FakeSharedPreferences : SharedPreferences {
+        private val values = mutableMapOf<String, Any?>()
+
+        override fun getAll(): MutableMap<String, *> = values.toMutableMap()
+        override fun getString(key: String?, defValue: String?): String? = values[key] as? String ?: defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
+            @Suppress("UNCHECKED_CAST")
+            (values[key] as? MutableSet<String>) ?: defValues
+
+        override fun getInt(key: String?, defValue: Int): Int = values[key] as? Int ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long = values[key] as? Long ?: defValue
+        override fun getFloat(key: String?, defValue: Float): Float = values[key] as? Float ?: defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean = values[key] as? Boolean ?: defValue
+        override fun contains(key: String?): Boolean = values.containsKey(key)
+        override fun edit(): SharedPreferences.Editor = FakeEditor()
+        override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+
+        private inner class FakeEditor : SharedPreferences.Editor {
+            private val pending = mutableMapOf<String, Any?>()
+            private var cleared = false
+
+            override fun putString(key: String?, value: String?) = apply { if (key != null) pending[key] = value }
+            override fun putStringSet(key: String?, values: MutableSet<String>?) = apply { if (key != null) pending[key] = values }
+            override fun putInt(key: String?, value: Int) = apply { if (key != null) pending[key] = value }
+            override fun putLong(key: String?, value: Long) = apply { if (key != null) pending[key] = value }
+            override fun putFloat(key: String?, value: Float) = apply { if (key != null) pending[key] = value }
+            override fun putBoolean(key: String?, value: Boolean) = apply { if (key != null) pending[key] = value }
+            override fun remove(key: String?) = apply { if (key != null) pending[key] = REMOVE_MARKER }
+            override fun clear() = apply { cleared = true }
+            override fun commit(): Boolean { applyPending(); return true }
+            override fun apply() = applyPending()
+
+            private fun applyPending() {
+                if (cleared) values.clear()
+                pending.forEach { (key, value) -> if (value === REMOVE_MARKER) values.remove(key) else values[key] = value }
+                pending.clear()
+            }
+        }
+
+        private companion object {
+            val REMOVE_MARKER = Any()
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1052,6 +1127,227 @@ class SecretaryLiveWiringInstrumentedTest {
                 .keys
                 .mapNotNull { key -> cleanupData[key.replace("_title", "_id")] }
                 .forEach { id -> container.toolExecutor.execute(ToolCall(ToolId.TASK, "cancel_task", mapOf("id" to id))) }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // M3-B — PersistentMemoryStore against real, on-disk SharedPreferences
+    // -----------------------------------------------------------------
+
+    /**
+     * The strongest process-boundary evidence this test infrastructure can
+     * legitimately produce for M3-B.
+     *
+     * ## What this does NOT prove
+     * Android instrumentation tests run inside the same process as the app
+     * under test, and no harness in this codebase can force-stop and relaunch
+     * that process from within a running instrumentation session — doing so
+     * would kill the instrumentation itself. So this is not evidence of
+     * literal process death; claiming otherwise would be exactly the
+     * fragile, overstated claim the M3-B brief warns against.
+     *
+     * ## What this DOES prove
+     * A **second, independently constructed** [SecretaryOrchestrator] —
+     * built via the same [secretary] factory every other test in this file
+     * uses, but pointed at the real, `Context`-backed
+     * [PersistentMemoryStore.create] instead of the default in-memory fake —
+     * has its own [SecretaryOrchestrator]'s `_memory` field seeded, at
+     * construction, from whatever a *prior, separate* orchestrator actually
+     * wrote to real `SharedPreferences` on disk. Nothing but that on-disk
+     * file is shared between the two orchestrators; the second never reads
+     * the first's in-memory `StateFlow`. That is the genuine
+     * `write → durable storage → fresh object graph loads it` boundary M3-B
+     * exists to prove, short of an actual process kill.
+     *
+     * Uses [com.softwaremine.dps.domain.intent.IntentType.TASK] — the one
+     * type in this suite whose real tool needs no runtime permission (see
+     * the M2-C section's own doc above) — so this test's result does not
+     * depend on which permissions happen to be granted on this device.
+     */
+    @Test
+    fun aFreshCompositionRootLoadsPersistedMemoryFromRealDurableStorage(): Unit = runBlocking {
+        val realStore = PersistentMemoryStore.create(context, silentLogger)
+        realStore.clear() // isolate from whatever a previous run/session left behind
+
+        var taskId: Int? = null
+        try {
+            val firstOrchestrator = secretary(
+                """{"intent":"task","parameters":{"title":"M3-B persistence test"}}""",
+                persistentMemoryStore = realStore,
+            )
+            val created = firstOrchestrator.handle("M3-B persistence test ka task bana do")
+            assertTrue("Expected Handled, got $created", created is ToolOrchestrator.Outcome.Handled)
+            taskId = firstOrchestrator.memory.value.lastTask?.id
+            assertNotNull("Memory did not record the created task", taskId)
+            assertEquals(
+                "The real store must already reflect the just-created task",
+                taskId,
+                realStore.load().lastTask?.id,
+            )
+
+            // A second, independent orchestrator — a fresh object graph that
+            // never saw firstOrchestrator's in-memory state, only what
+            // PersistentMemoryStore.create(context, ...) loads from the same
+            // real, on-disk SharedPreferences file.
+            val secondOrchestrator = secretary(
+                """{"intent":"task","action_type":"complete"}""",
+                persistentMemoryStore = PersistentMemoryStore.create(context, silentLogger),
+            )
+
+            assertEquals(
+                "A fresh SecretaryOrchestrator must load the same task from durable storage, not start EMPTY",
+                taskId,
+                secondOrchestrator.memory.value.lastTask?.id,
+            )
+
+            // ReferenceResolver resolving "it" purely from memory this
+            // orchestrator loaded from disk, not memory it computed itself.
+            val resolved = secondOrchestrator.handle("complete that task")
+            assertTrue(
+                "The task named only by persisted memory must resolve and execute, got $resolved",
+                resolved is ToolOrchestrator.Outcome.Handled,
+            )
+        } finally {
+            taskId?.let {
+                container.toolExecutor.execute(ToolCall(ToolId.TASK, "cancel_task", mapOf("id" to it.toString())))
+            }
+            realStore.clear()
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // M3-C finalization — three-way default precedence for
+    // anchorToPriorEvent, against a real, on-disk PersistentPreferenceStore
+    // and real CalendarProvider/AlarmManager+ReminderStore state.
+    // -----------------------------------------------------------------
+
+    /**
+     * The strongest legitimate on-device proof of M3-C's three-way
+     * precedence: a real, `Context`-backed [PersistentPreferenceStore] (the
+     * same real prefs file [AiContainer.persistentPreferenceStore] would use
+     * in production) actually changes the reminder time `anchorToPriorEvent`
+     * computes — not just a JVM-scripted clock — and an explicit request
+     * offset still wins over it, exactly as it did before M3-C existed.
+     *
+     * Runs all three precedence cases in one test against one real device to
+     * keep on-device runtime bounded, rather than three separate
+     * events/reminders each needing their own permission-guard and cleanup:
+     * (1) the stored preference is used as the default when the request
+     * states no offset of its own, (2) an explicit request offset still
+     * overrides that same stored preference, (3) clearing the preference
+     * restores the original 30-minute default. Cleans up every real
+     * event/reminder created along the way in `finally`, and clears the real
+     * preference store both before (isolating from anything a previous
+     * run/session left behind) and after.
+     */
+    @Test
+    fun theRealStoredPreferenceThreeWayPrecedenceHoldsAgainstRealDeviceState(): Unit = runBlocking {
+        val realPrefs = PersistentPreferenceStore.create(context, silentLogger)
+        realPrefs.clear()
+
+        val createdEventIds = mutableListOf<String>()
+        val createdReminderIds = mutableListOf<String>()
+
+        try {
+            // --- Case 1: no explicit offset — the real stored 15-minute preference wins over the 30-minute default ---
+            realPrefs.save(UserPreferences(defaultReminderLeadMinutes = 15))
+            val orchestrator1 = secretary(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"M3-C precedence check 1","raw_when":"14:00"}},
+                    {"intent":"reminder","parameters":{"title":"M3-C precedence check 1"}}
+                ]}""",
+                persistentPreferenceStore = realPrefs,
+            )
+            val outcome1 = orchestrator1.handle("M3-C precedence check 1 at 14:00 aur usse pehle mujhe yaad dila dena")
+            assertTrue(
+                "Expected Handled or NeedsPermission, got $outcome1",
+                outcome1 is ToolOrchestrator.Outcome.Handled || outcome1 is ToolOrchestrator.Outcome.NeedsPermission,
+            )
+            if (outcome1 !is ToolOrchestrator.Outcome.Handled) return@runBlocking // calendar/reminder permission not granted on this run
+
+            val eventId1 = orchestrator1.memory.value.lastCalendarEvent?.id
+            val eventStart1 = orchestrator1.memory.value.lastCalendarEvent?.startMillis
+            val reminderId1 = orchestrator1.memory.value.lastReminder?.id
+            val reminderTrigger1 = orchestrator1.memory.value.lastReminder?.triggerAtMillis
+            assertNotNull("Memory did not record the created event (case 1)", eventId1)
+            assertNotNull("Memory did not record the created reminder (case 1)", reminderId1)
+            createdEventIds += eventId1.toString()
+            createdReminderIds += reminderId1.toString()
+
+            assertEquals(
+                "With no explicit offset, the real stored 15-minute preference must be used instead of the 30-minute default",
+                eventStart1!! - 15 * 60 * 1000L,
+                reminderTrigger1,
+            )
+
+            // --- Case 2: an explicit 5-minute request offset still wins over the same stored 15-minute preference ---
+            val orchestrator2 = secretary(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"M3-C precedence check 2","raw_when":"15:00"}},
+                    {"intent":"reminder","parameters":{"title":"M3-C precedence check 2","raw_when":"5 minutes before"}}
+                ]}""",
+                persistentPreferenceStore = realPrefs,
+            )
+            val outcome2 = orchestrator2.handle("M3-C precedence check 2 at 15:00, remind me 5 minutes before it.")
+            assertTrue(
+                "Expected Handled or NeedsPermission, got $outcome2",
+                outcome2 is ToolOrchestrator.Outcome.Handled || outcome2 is ToolOrchestrator.Outcome.NeedsPermission,
+            )
+            if (outcome2 !is ToolOrchestrator.Outcome.Handled) return@runBlocking
+
+            val eventId2 = orchestrator2.memory.value.lastCalendarEvent?.id
+            val eventStart2 = orchestrator2.memory.value.lastCalendarEvent?.startMillis
+            val reminderId2 = orchestrator2.memory.value.lastReminder?.id
+            val reminderTrigger2 = orchestrator2.memory.value.lastReminder?.triggerAtMillis
+            assertNotNull("Memory did not record the created event (case 2)", eventId2)
+            assertNotNull("Memory did not record the created reminder (case 2)", reminderId2)
+            createdEventIds += eventId2.toString()
+            createdReminderIds += reminderId2.toString()
+
+            assertEquals(
+                "An explicit 5-minute request offset must still win over the stored 15-minute preference",
+                eventStart2!! - 5 * 60 * 1000L,
+                reminderTrigger2,
+            )
+
+            // --- Case 3: clearing the real preference restores the original 30-minute default ---
+            realPrefs.clear()
+            val orchestrator3 = secretary(
+                """{"steps":[
+                    {"intent":"calendar_event","parameters":{"title":"M3-C precedence check 3","raw_when":"17:00"}},
+                    {"intent":"reminder","parameters":{"title":"M3-C precedence check 3"}}
+                ]}""",
+                persistentPreferenceStore = realPrefs,
+            )
+            val outcome3 = orchestrator3.handle("M3-C precedence check 3 at 17:00 aur usse pehle mujhe yaad dila dena")
+            assertTrue(
+                "Expected Handled or NeedsPermission, got $outcome3",
+                outcome3 is ToolOrchestrator.Outcome.Handled || outcome3 is ToolOrchestrator.Outcome.NeedsPermission,
+            )
+            if (outcome3 !is ToolOrchestrator.Outcome.Handled) return@runBlocking
+
+            val eventId3 = orchestrator3.memory.value.lastCalendarEvent?.id
+            val eventStart3 = orchestrator3.memory.value.lastCalendarEvent?.startMillis
+            val reminderId3 = orchestrator3.memory.value.lastReminder?.id
+            val reminderTrigger3 = orchestrator3.memory.value.lastReminder?.triggerAtMillis
+            assertNotNull("Memory did not record the created event (case 3)", eventId3)
+            assertNotNull("Memory did not record the created reminder (case 3)", reminderId3)
+            createdEventIds += eventId3.toString()
+            createdReminderIds += reminderId3.toString()
+
+            assertEquals(
+                "Clearing the real preference must restore the original 30-minute default",
+                eventStart3!! - 30 * 60 * 1000L,
+                reminderTrigger3,
+            )
+        } finally {
+            createdReminderIds.forEach { id ->
+                container.toolExecutor.execute(ToolCall(ToolId.REMINDER, "cancel_reminder", mapOf("id" to id)))
+            }
+            createdEventIds.forEach { id ->
+                container.toolExecutor.execute(ToolCall(ToolId.CALENDAR, "delete_event", mapOf("id" to id)))
+            }
+            realPrefs.clear()
         }
     }
 }

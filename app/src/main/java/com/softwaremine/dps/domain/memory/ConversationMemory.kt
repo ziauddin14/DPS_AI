@@ -1,6 +1,7 @@
 package com.softwaremine.dps.domain.memory
 
 import com.softwaremine.dps.domain.contact.Contact
+import kotlinx.serialization.Serializable
 
 /**
  * What DPS remembers about the current conversation, beyond the raw message list.
@@ -27,7 +28,15 @@ import com.softwaremine.dps.domain.contact.Contact
  * ## Dependencies
  * [Contact]. Pure Kotlin — no Android, no tool or intent types, so this can be
  * read and tested without either.
+ *
+ * ## Serializable (M3-A)
+ * Annotated so this structure — and it alone, unchanged in shape — can round-trip
+ * through [com.softwaremine.dps.data.android.memory.PersistentMemoryStore], the
+ * same way [com.softwaremine.dps.data.android.reminder.StoredReminder] already
+ * does. No new field was added for this; persistence is a storage concern, not a
+ * reason to grow the shape.
  */
+@Serializable
 data class ConversationMemory(
     /** The most recently resolved or discussed person. */
     val lastContact: Contact? = null,
@@ -74,6 +83,7 @@ data class ConversationMemory(
  * details — [AndroidReminderTool][com.softwaremine.dps.data.android.tool.AndroidReminderTool]'s
  * `update_reminder`/`cancel_reminder` operations are addressed by [id] alone.
  */
+@Serializable
 data class ReminderMemory(
     val id: Int,
     val title: String,
@@ -83,6 +93,7 @@ data class ReminderMemory(
 /**
  * Enough to update or cancel a calendar event by [id], mirroring [ReminderMemory].
  */
+@Serializable
 data class CalendarEventMemory(
     val id: Long,
     val title: String,
@@ -91,6 +102,7 @@ data class CalendarEventMemory(
 )
 
 /** What was last emailed, so "usko" after composing an email resolves sensibly. */
+@Serializable
 data class EmailMemory(
     val recipientName: String?,
     val recipientAddress: String?,
@@ -98,6 +110,7 @@ data class EmailMemory(
 )
 
 /** What was last drafted for WhatsApp. Nothing here implies anything was sent. */
+@Serializable
 data class WhatsAppMemory(
     val recipientName: String?,
     val recipientPhone: String?,
@@ -108,12 +121,14 @@ data class WhatsAppMemory(
  * Enough to update, complete or cancel a task by [id] without repeating its
  * title (Day 06), mirroring [ReminderMemory].
  */
+@Serializable
 data class TaskMemory(
     val id: Int,
     val title: String,
 )
 
 /** The most recently discussed meeting, so a follow-up question can name which one (Day 06). */
+@Serializable
 data class MeetingMemory(
     val id: Int,
     val title: String,

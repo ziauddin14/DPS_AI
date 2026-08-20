@@ -14,6 +14,8 @@ import com.softwaremine.dps.ai.plan.ContactSelectionParser
 import com.softwaremine.dps.ai.plan.FollowUpSuggestionGenerator
 import com.softwaremine.dps.ai.plan.contactCandidatesFrom
 import com.softwaremine.dps.core.logging.DpsLogger
+import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
+import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
 import com.softwaremine.dps.domain.contact.Contact
 import com.softwaremine.dps.domain.intent.DpsIntent
 import com.softwaremine.dps.domain.intent.IntentAction
@@ -70,8 +72,14 @@ import java.time.format.DateTimeFormatter
  * classes it composes.
  *
  * ## Dependencies
- * [ToolOrchestrator] and the pure `ai/memory` and `ai/plan` components. No
- * Android.
+ * [ToolOrchestrator] and the pure `ai/memory` and `ai/plan` components. The
+ * exceptions are [PersistentMemoryStore] (M3-B) and [PersistentPreferenceStore]
+ * (M3-C finalization): this class still runs unmodified on the JVM (every
+ * existing test needs no Android runtime — see [PersistentMemoryStore]'s own
+ * doc for why its constructor takes `SharedPreferences` rather than `Context`
+ * for exactly this reason, which [PersistentPreferenceStore] mirrors), but
+ * both types live in `data/android`, the only Android-adjacent names this
+ * file imports.
  */
 class SecretaryOrchestrator(
     private val toolOrchestrator: ToolOrchestrator,
@@ -85,6 +93,8 @@ class SecretaryOrchestrator(
     private val contactSelectionParser: ContactSelectionParser,
     private val confirmationParser: ConfirmationParser,
     private val followUpSuggestions: FollowUpSuggestionGenerator,
+    private val persistentMemoryStore: PersistentMemoryStore,
+    private val persistentPreferenceStore: PersistentPreferenceStore,
     private val logger: DpsLogger,
     private val zone: ZoneId = ZoneId.systemDefault(),
     private val now: () -> Long = System::currentTimeMillis,
@@ -93,7 +103,11 @@ class SecretaryOrchestrator(
     private val _state = MutableStateFlow(SecretaryState.IDLE)
     val state: StateFlow<SecretaryState> = _state.asStateFlow()
 
-    private val _memory = MutableStateFlow(ConversationMemory.EMPTY)
+    // M3-B: seeded from durable storage rather than always starting EMPTY,
+    // so "usko"/"that reminder" still resolves after a process restart.
+    // PersistentMemoryStore.load() already falls back to EMPTY itself (on
+    // first run or corrupt storage), so no fallback is duplicated here.
+    private val _memory = MutableStateFlow(persistentMemoryStore.load())
     val memory: StateFlow<ConversationMemory> = _memory.asStateFlow()
 
     /** The follow-up DPS last asked, and what it already understood. Local to this class. */
@@ -335,6 +349,23 @@ class SecretaryOrchestrator(
         toolOrchestrator.reset()
         _state.value = transition(SecretaryEvent.Reset)
         _memory.value = ConversationMemory.EMPTY
+        // M3-B: an explicit "forget the conversation" action, not an
+        // ordinary write — clears the durable copy outright rather than
+        // going through updateMemory/save(EMPTY), mirroring the distinction
+        // the M3-B spec draws between the two.
+        persistentMemoryStore.clear()
+    }
+
+    /**
+     * The one place [_memory] is ever written to with a genuinely new value
+     * (M3-B) — [reset] is deliberately separate, see its own comment. Every
+     * call site already computed [memory] itself (via [memoryUpdater] or a
+     * resolved contact); this only ever adds "and persist it", never a
+     * second opinion on whether the change should happen at all.
+     */
+    private fun updateMemory(memory: ConversationMemory) {
+        _memory.value = memory
+        persistentMemoryStore.save(memory)
     }
 
     /** The follow-up currently awaiting an answer, if any. */
@@ -728,8 +759,24 @@ class SecretaryOrchestrator(
      * @param statedOffsetMillis a signed delta read from this step's own
      *   `raw_when` before attribution stripped it (M2-A) — negative for
      *   "before"/"pehle" — via [reminderOffsetMillis]. `null` when the step
-     *   named no explicit offset, in which case the original fixed
-     *   30-minutes-before default applies unchanged.
+     *   named no explicit offset, in which case the three-way precedence
+     *   below (M3-C finalization) applies.
+     *
+     * ## Three-way precedence (M3-C finalization)
+     * ```
+     * explicitly stated offset on this request
+     *         ↓ (if absent)
+     * stored user preference (defaultReminderLeadMinutes)
+     *         ↓ (if absent)
+     * the original fixed 30-minutes-before default
+     * ```
+     * [statedOffsetMillis] already wins first by construction — it is only
+     * ever `null` here when the request stated none — so this only chooses
+     * between [preferredLeadMillis] and [DEFAULT_REMINDER_LEAD_MILLIS].
+     * [PersistentPreferenceStore] is read, never written, from this path:
+     * the fallback default must never be persisted back as though it were a
+     * choice the user made (see [UserPreferences][com.softwaremine.dps.domain.preferences.UserPreferences]'s
+     * own doc).
      */
     private fun anchorToPriorEvent(step: DpsIntent, priorEventStartMillis: Long?, statedOffsetMillis: Long?): DpsIntent {
         if (priorEventStartMillis == null) return step
@@ -738,7 +785,7 @@ class SecretaryOrchestrator(
             return step
         }
 
-        val offsetMillis = statedOffsetMillis ?: -DEFAULT_REMINDER_LEAD_MILLIS
+        val offsetMillis = statedOffsetMillis ?: preferredLeadMillis() ?: -DEFAULT_REMINDER_LEAD_MILLIS
         val zoned = Instant.ofEpochMilli(priorEventStartMillis + offsetMillis).atZone(zone)
         return step.copy(
             parameters = step.parameters.copy(
@@ -747,6 +794,17 @@ class SecretaryOrchestrator(
             ),
         )
     }
+
+    /**
+     * The user's stored default lead time (M3-C finalization), as a
+     * negative millisecond delta matching [reminderOffsetMillis]'s own sign
+     * convention — always "before", the same direction
+     * [DEFAULT_REMINDER_LEAD_MILLIS] itself always applies. `null` when no
+     * preference is stored, in which case [anchorToPriorEvent] falls back to
+     * that fixed default instead.
+     */
+    private fun preferredLeadMillis(): Long? =
+        persistentPreferenceStore.load().defaultReminderLeadMinutes?.let { -(it * 60_000L) }
 
     /**
      * The signed offset [step] itself named ("15 minutes before", "10 min
@@ -977,12 +1035,14 @@ class SecretaryOrchestrator(
             }
 
             success != null && success.data["contact_id"] != null -> {
-                _memory.value = memoryUpdater.remember(
-                    memory = _memory.value,
-                    intent = DpsIntent(IntentType.CONTACT_LOOKUP, IntentParameters(person = original.parameters.value(IntentField.PERSON))),
-                    toolId = ToolId.CONTACTS,
-                    result = success,
-                    nowMillis = now(),
+                updateMemory(
+                    memoryUpdater.remember(
+                        memory = _memory.value,
+                        intent = DpsIntent(IntentType.CONTACT_LOOKUP, IntentParameters(person = original.parameters.value(IntentField.PERSON))),
+                        toolId = ToolId.CONTACTS,
+                        result = success,
+                        nowMillis = now(),
+                    ),
                 )
                 proceedAfterContactResolved(applyResolvedContactData(original, success.data))
             }
@@ -1024,10 +1084,12 @@ class SecretaryOrchestrator(
 
         pendingContactSelection = null
         _state.value = transition(SecretaryEvent.ContactSelected)
-        _memory.value = _memory.value.copy(
-            lastContact = chosen,
-            lastReferencedPerson = chosen.displayName,
-            updatedAtMillis = now(),
+        updateMemory(
+            _memory.value.copy(
+                lastContact = chosen,
+                lastReferencedPerson = chosen.displayName,
+                updatedAtMillis = now(),
+            ),
         )
         return continueAfterResumedStep(proceedAfterContactResolved(applyResolvedContact(selection.originalIntent, chosen)))
     }
@@ -1311,12 +1373,14 @@ class SecretaryOrchestrator(
         when (outcome) {
             is ToolOrchestrator.Outcome.Handled -> {
                 outcome.intent.type.toolId?.let { toolId ->
-                    _memory.value = memoryUpdater.remember(
-                        memory = _memory.value,
-                        intent = outcome.intent,
-                        toolId = toolId,
-                        result = outcome.result,
-                        nowMillis = now(),
+                    updateMemory(
+                        memoryUpdater.remember(
+                            memory = _memory.value,
+                            intent = outcome.intent,
+                            toolId = toolId,
+                            result = outcome.result,
+                            nowMillis = now(),
+                        ),
                     )
                 }
                 _state.value = transition(

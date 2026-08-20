@@ -1,5 +1,6 @@
 package com.softwaremine.dps.ai.session
 
+import android.content.SharedPreferences
 import com.softwaremine.dps.ai.conversation.ConversationManager
 import com.softwaremine.dps.ai.intent.ClarificationEngine
 import com.softwaremine.dps.ai.intent.IntentJsonParser
@@ -26,6 +27,8 @@ import com.softwaremine.dps.ai.tool.DefaultToolRegistry
 import com.softwaremine.dps.core.concurrency.DispatcherProvider
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.core.result.DpsResult
+import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
+import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
 import com.softwaremine.dps.data.model.ModelCatalog
 import com.softwaremine.dps.domain.ai.AiCompletion
 import com.softwaremine.dps.domain.ai.AiEngine
@@ -177,6 +180,39 @@ class AiSessionManagerReplyShortcutTest {
             ToolResult.Success("Reminder set.", mapOf("reminder_id" to "1001", "trigger_at" to "1000000", "exact" to "true"))
     }
 
+    /**
+     * M3-B: this file tests the same-pass reply shortcut, not persistence,
+     * so [SecretaryOrchestrator]'s now-required [PersistentMemoryStore] is
+     * backed by a no-op fake — reads always miss (memory starts EMPTY, as
+     * before this milestone) and writes go nowhere.
+     */
+    private class NoOpSharedPreferences : SharedPreferences {
+        override fun getAll(): MutableMap<String, *> = mutableMapOf<String, Any?>()
+        override fun getString(key: String?, defValue: String?): String? = defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? = defValues
+        override fun getInt(key: String?, defValue: Int): Int = defValue
+        override fun getLong(key: String?, defValue: Long): Long = defValue
+        override fun getFloat(key: String?, defValue: Float): Float = defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean = defValue
+        override fun contains(key: String?): Boolean = false
+        override fun edit(): SharedPreferences.Editor = NoOpEditor
+        override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+
+        private object NoOpEditor : SharedPreferences.Editor {
+            override fun putString(key: String?, value: String?) = this
+            override fun putStringSet(key: String?, values: MutableSet<String>?) = this
+            override fun putInt(key: String?, value: Int) = this
+            override fun putLong(key: String?, value: Long) = this
+            override fun putFloat(key: String?, value: Float) = this
+            override fun putBoolean(key: String?, value: Boolean) = this
+            override fun remove(key: String?) = this
+            override fun clear() = this
+            override fun commit() = true
+            override fun apply() = Unit
+        }
+    }
+
     private fun sessionManager(
         engine: AiEngine,
         scope: kotlinx.coroutines.CoroutineScope,
@@ -211,6 +247,8 @@ class AiSessionManagerReplyShortcutTest {
             contactSelectionParser = ContactSelectionParser(),
             confirmationParser = ConfirmationParser(),
             followUpSuggestions = FollowUpSuggestionGenerator(zone = zone),
+            persistentMemoryStore = PersistentMemoryStore(NoOpSharedPreferences(), silentLogger),
+            persistentPreferenceStore = PersistentPreferenceStore(NoOpSharedPreferences(), silentLogger),
             logger = silentLogger,
             zone = zone,
         )

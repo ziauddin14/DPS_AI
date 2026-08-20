@@ -21,6 +21,8 @@ import com.softwaremine.dps.ai.plan.ContactSelectionParser
 import com.softwaremine.dps.ai.plan.FollowUpSuggestionGenerator
 import com.softwaremine.dps.ai.secretary.SecretaryOrchestrator
 import com.softwaremine.dps.core.logging.DpsLogger
+import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
+import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
 import com.softwaremine.dps.data.model.ModelCatalog
 import com.softwaremine.dps.di.AiContainer
 import com.softwaremine.dps.domain.ai.AiCompletion
@@ -707,6 +709,8 @@ class GgufInferenceInstrumentedTest {
             contactSelectionParser = ContactSelectionParser(),
             confirmationParser = ConfirmationParser(),
             followUpSuggestions = FollowUpSuggestionGenerator(),
+            persistentMemoryStore = PersistentMemoryStore.create(context, diagnosticLogger),
+            persistentPreferenceStore = PersistentPreferenceStore.create(context, diagnosticLogger),
             logger = diagnosticLogger,
         )
     }
@@ -909,6 +913,8 @@ class GgufInferenceInstrumentedTest {
             contactSelectionParser = ContactSelectionParser(),
             confirmationParser = ConfirmationParser(),
             followUpSuggestions = FollowUpSuggestionGenerator(),
+            persistentMemoryStore = PersistentMemoryStore.create(context, diagnosticLogger),
+            persistentPreferenceStore = PersistentPreferenceStore.create(context, diagnosticLogger),
             logger = diagnosticLogger,
         )
 

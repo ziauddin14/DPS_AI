@@ -20,6 +20,8 @@ import com.softwaremine.dps.ai.plan.ContactSelectionParser
 import com.softwaremine.dps.ai.plan.FollowUpSuggestionGenerator
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.core.result.DpsResult
+import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
+import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
 import com.softwaremine.dps.data.model.ModelCatalog
 import com.softwaremine.dps.di.AiContainer
 import com.softwaremine.dps.domain.ai.AiCompletion
@@ -109,6 +111,8 @@ class CalendarClassificationInvestigationTest {
             contactSelectionParser = ContactSelectionParser(),
             confirmationParser = ConfirmationParser(),
             followUpSuggestions = FollowUpSuggestionGenerator(),
+            persistentMemoryStore = PersistentMemoryStore.create(context, silentLogger),
+            persistentPreferenceStore = PersistentPreferenceStore.create(context, silentLogger),
             logger = silentLogger,
         )
     }

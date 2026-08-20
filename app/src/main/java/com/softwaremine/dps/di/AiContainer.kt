@@ -33,8 +33,10 @@ import com.softwaremine.dps.ai.tool.DefaultToolRegistry
 import com.softwaremine.dps.data.android.calendar.CalendarWriter
 import com.softwaremine.dps.data.android.contacts.AndroidContactRepository
 import com.softwaremine.dps.data.android.intent.IntentLauncher
+import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.notification.NotificationPresenter
 import com.softwaremine.dps.data.android.permission.AndroidPermissionManager
+import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
 import com.softwaremine.dps.data.android.productivity.AndroidActionItemStore
 import com.softwaremine.dps.data.android.productivity.AndroidMeetingNoteStore
 import com.softwaremine.dps.data.android.productivity.AndroidTaskStore
@@ -288,6 +290,28 @@ class AiContainer(private val applicationContext: Context) {
     // SharedPreferences-plus-JSON, mirroring ReminderStore (see AndroidTaskStore's
     // doc for why this is the smallest reliable solution for this data volume).
 
+    /**
+     * Durable backing for [SecretaryOrchestrator]'s
+     * [com.softwaremine.dps.domain.memory.ConversationMemory] (M3-B) — same
+     * `SharedPreferences`-plus-JSON pattern as the stores below it, via the
+     * `create(context, logger)` factory [PersistentMemoryStore]'s own doc
+     * describes.
+     */
+    private val persistentMemoryStore by lazy { PersistentMemoryStore.create(applicationContext, logger) }
+
+    /**
+     * Durable user configuration (M3-C) — deliberately separate from
+     * [persistentMemoryStore]; see [PersistentPreferenceStore]'s own doc for
+     * why. Public, unlike [persistentMemoryStore]: consumed by
+     * [secretaryOrchestrator] (for `anchorToPriorEvent`'s three-way default
+     * precedence, M3-C finalization), but no automatic preference extraction
+     * writes to it — only an explicit future write path (e.g. a settings UI
+     * or command) would ever call [PersistentPreferenceStore.save].
+     */
+    val persistentPreferenceStore: PersistentPreferenceStore by lazy {
+        PersistentPreferenceStore.create(applicationContext, logger)
+    }
+
     private val taskStore by lazy { AndroidTaskStore(applicationContext, logger) }
     private val workLogStore by lazy { AndroidWorkLogStore(applicationContext, logger) }
     private val meetingNoteStore by lazy { AndroidMeetingNoteStore(applicationContext, logger) }
@@ -394,6 +418,8 @@ class AiContainer(private val applicationContext: Context) {
             contactSelectionParser = ContactSelectionParser(),
             confirmationParser = ConfirmationParser(),
             followUpSuggestions = FollowUpSuggestionGenerator(),
+            persistentMemoryStore = persistentMemoryStore,
+            persistentPreferenceStore = persistentPreferenceStore,
             logger = logger,
         )
     }
