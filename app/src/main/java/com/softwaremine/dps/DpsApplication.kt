@@ -2,6 +2,7 @@ package com.softwaremine.dps
 
 import android.app.Application
 import android.content.ComponentCallbacks2
+import com.softwaremine.dps.data.android.proactive.ProactiveCheckWorker
 import com.softwaremine.dps.di.AiContainer
 import kotlinx.coroutines.launch
 
@@ -35,12 +36,28 @@ import kotlinx.coroutines.launch
  * survives, and resuming costs one model load.
  *
  * ## Dependencies
- * [AiContainer].
+ * [AiContainer]. [ProactiveCheckWorker] (M4-A) is a second, deliberately
+ * separate dependency: it is enqueued here because [onCreate] is the one
+ * place guaranteed to run once per process, but it shares nothing with
+ * [container] — no AI subsystem class is constructed, loaded, or touched by
+ * scheduling it, and [ProactiveCheckWorker.schedule] does not read [container]
+ * at all.
  */
 class DpsApplication : Application() {
 
     /** The object graph. Constructed lazily on first access. */
     val container: AiContainer by lazy { AiContainer(applicationContext) }
+
+    override fun onCreate() {
+        super.onCreate()
+
+        // M4-A: registers the periodic overdue-task check, once. Safe to call
+        // on every process start — ExistingPeriodicWorkPolicy.KEEP (inside
+        // ProactiveCheckWorker.schedule) makes every call after the first a
+        // no-op against the already-registered unique work, so this never
+        // creates a second scheduled check and never loads the AI model.
+        ProactiveCheckWorker.schedule(this)
+    }
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)

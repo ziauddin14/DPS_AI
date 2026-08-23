@@ -168,6 +168,10 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.activity.compose)
+    // M4-A: periodic, deferrable, non-exact background check for overdue
+    // tasks. Deliberately not AlarmManager — that stays dedicated to exact,
+    // user-created reminders (see ReminderScheduler's own doc).
+    implementation(libs.androidx.work.runtime.ktx)
 
     // --- Compose ---
     implementation(platform(libs.androidx.compose.bom))
