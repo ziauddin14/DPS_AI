@@ -37,6 +37,7 @@ import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.notification.NotificationPresenter
 import com.softwaremine.dps.data.android.permission.AndroidPermissionManager
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.data.android.productivity.AndroidActionItemStore
 import com.softwaremine.dps.data.android.productivity.AndroidMeetingNoteStore
 import com.softwaremine.dps.data.android.productivity.AndroidTaskStore
@@ -312,6 +313,16 @@ class AiContainer(private val applicationContext: Context) {
         PersistentPreferenceStore.create(applicationContext, logger)
     }
 
+    /**
+     * Durable execution-recovery record (M5-B) — deliberately its own
+     * store, its own prefs file; see [PersistentRecoveryStore]'s own doc
+     * for why. Public for the same reason [persistentPreferenceStore] is:
+     * consumed by [secretaryOrchestrator] alone.
+     */
+    val persistentRecoveryStore: PersistentRecoveryStore by lazy {
+        PersistentRecoveryStore.create(applicationContext, logger)
+    }
+
     private val taskStore by lazy { AndroidTaskStore(applicationContext, logger) }
     private val workLogStore by lazy { AndroidWorkLogStore(applicationContext, logger) }
     private val meetingNoteStore by lazy { AndroidMeetingNoteStore(applicationContext, logger) }
@@ -330,8 +341,8 @@ class AiContainer(private val applicationContext: Context) {
                 implemented = listOf(
                     // Phase B
                     AndroidNotificationTool(notificationPresenter),
-                    AndroidCalendarTool(calendarWriter),
-                    AndroidReminderTool(reminderScheduler, reminderStore),
+                    AndroidCalendarTool(calendarWriter, persistentRecoveryStore),
+                    AndroidReminderTool(reminderScheduler, reminderStore, persistentRecoveryStore),
                     // Phase C â€” all three share one resolver and one launcher
                     AndroidContactsTool(contactRepository, contactResolver),
                     PrepareWhatsAppMessageTool(contactRepository, contactResolver, intentLauncher),
@@ -340,7 +351,7 @@ class AiContainer(private val applicationContext: Context) {
                     // ACTION_DIAL only, never ACTION_CALL. See AndroidCallTool's doc.
                     AndroidCallTool(contactRepository, contactResolver, intentLauncher),
                     // Day 06 â€” productivity secretary
-                    AndroidTaskTool(taskStore),
+                    AndroidTaskTool(taskStore, persistentRecoveryStore),
                     AndroidWorkLogTool(workLogStore),
                     AndroidMeetingNoteTool(meetingNoteStore),
                     AndroidActionItemTool(actionItemStore),
@@ -420,6 +431,7 @@ class AiContainer(private val applicationContext: Context) {
             followUpSuggestions = FollowUpSuggestionGenerator(),
             persistentMemoryStore = persistentMemoryStore,
             persistentPreferenceStore = persistentPreferenceStore,
+            persistentRecoveryStore = persistentRecoveryStore,
             logger = logger,
         )
     }

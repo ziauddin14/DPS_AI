@@ -23,6 +23,7 @@ import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.core.result.DpsResult
 import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.domain.ai.AiCompletion
 import com.softwaremine.dps.domain.ai.AiEngine
 import com.softwaremine.dps.domain.ai.AiState
@@ -39,6 +40,9 @@ import com.softwaremine.dps.domain.model.ModelDescriptor
 import com.softwaremine.dps.domain.permission.DpsPermission
 import com.softwaremine.dps.domain.permission.PermissionManager
 import com.softwaremine.dps.domain.permission.PermissionState
+import com.softwaremine.dps.domain.secretary.OperationCheckpoint
+import com.softwaremine.dps.domain.secretary.OperationType
+import com.softwaremine.dps.domain.secretary.PersistedPendingState
 import com.softwaremine.dps.domain.secretary.SecretaryState
 import com.softwaremine.dps.domain.tool.AndroidTool
 import com.softwaremine.dps.domain.tool.ToolCall
@@ -52,6 +56,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -212,6 +217,7 @@ class SecretaryOrchestratorTest {
         temporalNow: () -> java.time.LocalDateTime = { java.time.LocalDateTime.now(zone) },
         persistentMemoryStore: PersistentMemoryStore = PersistentMemoryStore(FakeSharedPreferences(), silentLogger),
         persistentPreferenceStore: PersistentPreferenceStore = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger),
+        persistentRecoveryStore: PersistentRecoveryStore = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger),
     ): SecretaryOrchestrator {
         val registry = DefaultToolRegistry(silentLogger).apply { tools.forEach(::register) }
         val executor = DefaultToolExecutor(
@@ -253,6 +259,7 @@ class SecretaryOrchestratorTest {
             followUpSuggestions = FollowUpSuggestionGenerator(zone = zone),
             persistentMemoryStore = persistentMemoryStore,
             persistentPreferenceStore = persistentPreferenceStore,
+            persistentRecoveryStore = persistentRecoveryStore,
             logger = silentLogger,
             zone = zone,
             now = now,
@@ -3013,5 +3020,253 @@ class SecretaryOrchestratorTest {
 
         assertEquals(ConversationMemory.EMPTY, orchestrator.memory.value)
         assertEquals(ConversationMemory.EMPTY, store.load())
+    }
+
+    // -----------------------------------------------------------------
+    // M5-B: persisted, user-gated execution recovery
+    //
+    // Every test below constructs TWO separate SecretaryOrchestrator
+    // instances sharing the same backing FakeSharedPreferences for
+    // persistentRecoveryStore (and, where a durable side effect matters,
+    // the same tool instances) — the JVM-level analogue of "a fresh process
+    // reads what an earlier process wrote," exactly like this codebase's
+    // other stores are proven at this level (see PersistentMemoryStoreTest,
+    // ProactiveStateStoreTest). The genuine adb-force-stop version of this
+    // is the instrumented suite's own job.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `a single-step clarification block survives a fresh orchestrator, prompts before executing, and completes only after an explicit yes`() = runTest {
+        val recoveryPrefs = FakeSharedPreferences()
+        val recoveryStore = PersistentRecoveryStore(recoveryPrefs, silentLogger)
+        val reminder = reminderTool()
+
+        val first = secretary(
+            ScriptedEngine(DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank"}}""")),
+            listOf(reminder),
+            persistentRecoveryStore = recoveryStore,
+        )
+        val blocked = first.handle("remind me to call the bank")
+        assertTrue("Expected a clarification asking for a time, got $blocked", blocked is ToolOrchestrator.Outcome.Clarify)
+        assertEquals(0, reminder.calls.size)
+        assertNotNull("A blocked clarification must reach durable storage", recoveryStore.load())
+
+        // A fresh SecretaryOrchestrator, sharing only the persisted store
+        // and the same tool instance (so a duplicate call would be
+        // detectable) — simulates the process having died and restarted.
+        val second = secretary(
+            ScriptedEngine(DpsResult.Success("""{"intent":"reminder","parameters":{"raw_when":"18:00"}}""")),
+            listOf(reminder),
+            persistentRecoveryStore = recoveryStore,
+        )
+
+        // Turn 1 of a fresh process cannot possibly be an answer to a
+        // question the user has not seen yet — it is replaced with the
+        // recovery question itself, regardless of what was actually typed.
+        val prompt = second.handle("anything")
+        assertTrue("Expected the recovery question, got $prompt", prompt is ToolOrchestrator.Outcome.Conversational)
+        assertEquals("A recovery prompt must never execute the interrupted step", 0, reminder.calls.size)
+
+        val resumedQuestion = second.handle("yes")
+        assertTrue("A yes must re-ask the original question, not execute anything yet", resumedQuestion is ToolOrchestrator.Outcome.Clarify)
+        assertEquals("Restoring the pending state must not itself execute anything", 0, reminder.calls.size)
+
+        val completed = second.handle("18:00")
+        assertTrue("Expected the reminder to finally be created, got $completed", completed is ToolOrchestrator.Outcome.Handled)
+        assertEquals("The interrupted request must run exactly once", 1, reminder.calls.size)
+
+        // A successful reminder create triggers its own, pre-existing,
+        // unrelated follow-up suggestion ("set a calendar event too?") —
+        // itself now a genuinely new, real pending confirmation, correctly
+        // persisted in its own right. Declining it (unrelated to the
+        // recovered request, which already finished) must leave the store
+        // fully empty again.
+        val declinedSuggestion = second.handle("no")
+        assertTrue(declinedSuggestion is ToolOrchestrator.Outcome.Handled)
+        assertNull("Once the trailing follow-up suggestion is declined, nothing should remain pending", recoveryStore.load())
+    }
+
+    @Test
+    fun `declining a restored recovery record discards it without ever executing, and a fresh request afterward works normally`() = runTest {
+        val recoveryPrefs = FakeSharedPreferences()
+        val recoveryStore = PersistentRecoveryStore(recoveryPrefs, silentLogger)
+        val reminder = reminderTool()
+        val task = taskTool()
+
+        val first = secretary(
+            ScriptedEngine(DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank"}}""")),
+            listOf(reminder, task),
+            persistentRecoveryStore = recoveryStore,
+        )
+        first.handle("remind me to call the bank")
+        assertNotNull(recoveryStore.load())
+
+        val second = secretary(
+            ScriptedEngine(DpsResult.Success("""{"intent":"task","parameters":{"title":"buy milk"}}""")),
+            listOf(reminder, task),
+            persistentRecoveryStore = recoveryStore,
+        )
+
+        val prompt = second.handle("hello")
+        assertTrue("Expected the recovery question first, got $prompt", prompt is ToolOrchestrator.Outcome.Conversational)
+
+        val declined = second.handle("no")
+        assertTrue(declined is ToolOrchestrator.Outcome.Conversational)
+        assertEquals(0, reminder.calls.size)
+        assertNull("Declining must clear the persisted record", recoveryStore.load())
+
+        val fresh = second.handle("buy milk ka task bana do")
+        assertTrue("An unrelated request after declining must work exactly as normal", fresh is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, task.calls.count { it.operation == "create_task" })
+        assertEquals("Declining the old request must never create it", 0, reminder.calls.size)
+    }
+
+    @Test
+    fun `a plan remainder blocked on a confirmation survives a fresh orchestrator and resumes without duplicating the already-completed step`() = runTest {
+        val recoveryPrefs = FakeSharedPreferences()
+        val recoveryStore = PersistentRecoveryStore(recoveryPrefs, silentLogger)
+        // Shared across both orchestrator instances — a real AndroidTaskStore/
+        // CalendarWriter would likewise durably survive process death, so
+        // step 1's own call count must never move again after the "restart".
+        val calendar = calendarTool()
+        val task = RecordingTool(ToolId.TASK, setOf("create_task", "cancel_task")) {
+            ToolResult.Success("Task \"${it.arguments["title"]}\" cancelled.", mapOf("task_id" to (it.arguments["id"] ?: "1")))
+        }
+        // Deliberately WHATSAPP_MESSAGE, not REMINDER, for step 3 — a
+        // reminder create triggers FollowUpSuggestionGenerator's own,
+        // pre-existing, unrelated follow-up suggestion on success (see "a
+        // fully completed plan leaves no pending state" above for the same
+        // reasoning), which would leave its own genuine, unrelated
+        // pendingConfirmation behind and defeat this test's actual point.
+        val whatsapp = whatsAppTool()
+
+        val first = secretary(
+            ScriptedEngine(
+                DpsResult.Success(
+                    """{"steps":[
+                        {"intent":"calendar_event","parameters":{"title":"standup meeting","raw_when":"16:00"}},
+                        {"intent":"task","action_type":"cancel","parameters":{"title":"old task"}},
+                        {"intent":"whatsapp_message","parameters":{"person":"Ali","message":"see you at standup"}}
+                    ]}""",
+                ),
+            ),
+            listOf(calendar, task, whatsapp),
+            persistentRecoveryStore = recoveryStore,
+        )
+        val blocked = first.handle("standup meeting tomorrow at 16:00, cancel the old task, aur Ali ko WhatsApp kar do see you at standup")
+        assertTrue("Expected the delete confirmation for step 2, got $blocked", blocked is ToolOrchestrator.Outcome.Clarify)
+        assertEquals(1, calendar.calls.count { it.operation == "create_event" })
+        assertEquals(0, task.calls.count { it.operation == "cancel_task" })
+        assertEquals(0, whatsapp.calls.size)
+
+        val second = secretary(
+            ScriptedEngine(DpsResult.Success("""{"intent":"conversation"}""")),
+            listOf(calendar, task, whatsapp),
+            persistentRecoveryStore = recoveryStore,
+        )
+
+        val prompt = second.handle("hi")
+        assertTrue("Expected the recovery question first, got $prompt", prompt is ToolOrchestrator.Outcome.Conversational)
+
+        val reAsked = second.handle("yes")
+        assertTrue("The first yes answers the recovery prompt, re-asking the delete confirmation", reAsked is ToolOrchestrator.Outcome.Clarify)
+        assertEquals("Restoring must not itself cancel the task", 0, task.calls.count { it.operation == "cancel_task" })
+
+        val resumed = second.handle("yes")
+        assertTrue("The second yes answers the re-asked delete confirmation", resumed is ToolOrchestrator.Outcome.Handled)
+        assertEquals("Step 2 must run exactly once", 1, task.calls.count { it.operation == "cancel_task" })
+        assertEquals(
+            "Step 3 must run after the resumed step 2, not be silently dropped",
+            1,
+            whatsapp.calls.size,
+        )
+        assertEquals(
+            "Step 1's already-completed side effect must never be duplicated across the restart",
+            1,
+            calendar.calls.count { it.operation == "create_event" },
+        )
+        assertNull("A fully resumed plan must clear the persisted record", recoveryStore.load())
+    }
+
+    @Test
+    fun `a stale persisted recovery record is silently discarded rather than surfaced as a prompt`() = runTest {
+        val recoveryPrefs = FakeSharedPreferences()
+        val recoveryStore = PersistentRecoveryStore(recoveryPrefs, silentLogger)
+        val reminder = reminderTool()
+        val sixMinutesAgo = { System.currentTimeMillis() - 6 * 60 * 1000L }
+
+        val first = secretary(
+            ScriptedEngine(DpsResult.Success("""{"intent":"reminder","parameters":{"title":"call the bank"}}""")),
+            listOf(reminder),
+            now = sixMinutesAgo,
+            persistentRecoveryStore = recoveryStore,
+        )
+        first.handle("remind me to call the bank")
+        assertNotNull(recoveryStore.load())
+
+        // A fresh orchestrator constructed "now" (the real clock) — well
+        // past the five-minute freshness window from sixMinutesAgo above.
+        val second = secretary(
+            ScriptedEngine(DpsResult.Success("""{"intent":"reminder","parameters":{"title":"buy milk"}}""")),
+            listOf(reminder),
+            persistentRecoveryStore = recoveryStore,
+        )
+
+        assertNull("A stale record must be discarded at load, not surfaced as a prompt", second.pendingQuestion())
+        val fresh = second.handle("remind me to buy milk")
+        assertTrue(
+            "A message after a stale recovery must be treated as an ordinary fresh request (asking for the missing time)",
+            fresh is ToolOrchestrator.Outcome.Clarify,
+        )
+        // The store is not empty — this *new* clarification (a genuinely
+        // fresh block, unrelated to the discarded stale one) is correctly
+        // persisted in its own right. What matters is that it is the new
+        // one, not a resurrection of the old "call the bank" record.
+        val persistedAfter = recoveryStore.load()
+        assertNotNull(persistedAfter)
+        val clarification = persistedAfter!!.pending as PersistedPendingState.Clarification
+        assertEquals("buy milk", clarification.intent.parameters.title)
+    }
+
+    // -----------------------------------------------------------------
+    // M5-E — create_event checkpoint notice
+    //
+    // No reconciliation: CalendarContract.ExtendedProperties writes are a
+    // platform-enforced, sync-adapter-only operation, confirmed on a real
+    // device — see OperationCheckpoint's own doc. create_event's checkpoint
+    // therefore behaves exactly like CREATE_TASK/CREATE_REMINDER's own:
+    // detect, notify once with the same uncertain wording, clear, and
+    // (proven here) never trigger a tool call.
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `a leftover create_event checkpoint reports the same uncertain notice as task and reminder, without any tool call`() = runTest {
+        val recoveryStore = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger)
+        recoveryStore.saveCheckpoint(
+            OperationCheckpoint(
+                operationType = OperationType.CREATE_EVENT,
+                operationId = OperationCheckpoint.UNUSED_OPERATION_ID,
+                title = "Team sync",
+                requestedAtMillis = 1_000L,
+            ),
+        )
+        val calendarTool = RecordingTool(ToolId.CALENDAR, setOf("create_event")) { ToolResult.Success("unused") }
+
+        val secretary = secretary(
+            engine = ScriptedEngine(),
+            tools = listOf(calendarTool),
+            persistentRecoveryStore = recoveryStore,
+        )
+
+        val outcome = secretary.handle("hello")
+
+        assertTrue("Expected a Conversational notice, got $outcome", outcome is ToolOrchestrator.Outcome.Conversational)
+        val text = (outcome as ToolOrchestrator.Outcome.Conversational).replyText
+        assertNotNull(text)
+        assertTrue("Expected the standard uncertain notice, got: $text", text!!.contains("couldn't confirm it finished"))
+        assertTrue(text.contains("Team sync"))
+        assertTrue("Expected the reply to direct the user to check their events", text.contains("please check your events"))
+        assertTrue("A checkpoint notice must never trigger a tool call", calendarTool.calls.isEmpty())
+        assertNull("The checkpoint must be cleared after being surfaced once", recoveryStore.loadCheckpoint())
     }
 }

@@ -1,5 +1,6 @@
 package com.softwaremine.dps.ai.secretary
 
+import android.content.SharedPreferences
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.softwaremine.dps.ai.intent.ClarificationEngine
@@ -22,6 +23,7 @@ import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.core.result.DpsResult
 import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.di.AiContainer
 import com.softwaremine.dps.domain.ai.AiCompletion
 import com.softwaremine.dps.domain.ai.AiEngine
@@ -102,6 +104,67 @@ class ProcessDeathPersistenceInstrumentedTest {
         override fun e(tag: String, message: String, throwable: Throwable?) = Unit
     }
 
+    /**
+     * Minimal in-memory fake of [SharedPreferences] (M5-B) — mirrors
+     * [SecretaryLiveWiringInstrumentedTest]'s own fake exactly. Unlike
+     * [PersistentMemoryStore]/[PersistentPreferenceStore] above, this
+     * file's own tests construct several independent
+     * [SecretaryOrchestrator] instances (`caseASecretary`, `caseBSecretary`,
+     * ...) that are deliberately *not* meant to share state with one
+     * another — a real, `Context`-backed [PersistentRecoveryStore] would
+     * point every one of those instances at the same on-disk file, letting
+     * one instance's own leftover pending state (e.g. a follow-up
+     * suggestion after a successful create) silently intercept a
+     * *different* instance's very next message. This is M5-B's own concern
+     * entirely, unrelated to what M3-D's tests here actually verify, so it
+     * defaults to an isolated fake per construction, exactly like the other
+     * two stores already do.
+     */
+    private class FakeSharedPreferences : SharedPreferences {
+        private val values = mutableMapOf<String, Any?>()
+
+        override fun getAll(): MutableMap<String, *> = values.toMutableMap()
+        override fun getString(key: String?, defValue: String?): String? = values[key] as? String ?: defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
+            @Suppress("UNCHECKED_CAST")
+            (values[key] as? MutableSet<String>) ?: defValues
+
+        override fun getInt(key: String?, defValue: Int): Int = values[key] as? Int ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long = values[key] as? Long ?: defValue
+        override fun getFloat(key: String?, defValue: Float): Float = values[key] as? Float ?: defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean = values[key] as? Boolean ?: defValue
+        override fun contains(key: String?): Boolean = values.containsKey(key)
+        override fun edit(): SharedPreferences.Editor = FakeEditor()
+        override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+
+        private inner class FakeEditor : SharedPreferences.Editor {
+            private val pending = mutableMapOf<String, Any?>()
+            private var cleared = false
+
+            override fun putString(key: String?, value: String?) = apply { if (key != null) pending[key] = value }
+            override fun putStringSet(key: String?, values: MutableSet<String>?) = apply { if (key != null) pending[key] = values }
+            override fun putInt(key: String?, value: Int) = apply { if (key != null) pending[key] = value }
+            override fun putLong(key: String?, value: Long) = apply { if (key != null) pending[key] = value }
+            override fun putFloat(key: String?, value: Float) = apply { if (key != null) pending[key] = value }
+            override fun putBoolean(key: String?, value: Boolean) = apply { if (key != null) pending[key] = value }
+            override fun remove(key: String?) = apply { if (key != null) pending[key] = REMOVE_MARKER }
+            override fun clear() = apply { cleared = true }
+            override fun commit(): Boolean { applyPending(); return true }
+            override fun apply() = applyPending()
+
+            private fun applyPending() {
+                if (cleared) values.clear()
+                pending.forEach { (key, value) -> if (value === REMOVE_MARKER) values.remove(key) else values[key] = value }
+                pending.clear()
+            }
+        }
+
+        private companion object {
+            val REMOVE_MARKER = Any()
+        }
+    }
+
     /** Replays a fixed script of classifications, one per [handle] call — mirrors every other file in this suite. */
     private class ScriptedEngine(vararg replies: String) : AiEngine {
         private val replies = replies.toList()
@@ -143,6 +206,7 @@ class ProcessDeathPersistenceInstrumentedTest {
         vararg classifications: String,
         persistentMemoryStore: PersistentMemoryStore,
         persistentPreferenceStore: PersistentPreferenceStore,
+        persistentRecoveryStore: PersistentRecoveryStore = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger),
     ): SecretaryOrchestrator {
         val toolOrchestrator = ToolOrchestrator(
             engine = ScriptedEngine(*classifications),
@@ -170,6 +234,7 @@ class ProcessDeathPersistenceInstrumentedTest {
             followUpSuggestions = FollowUpSuggestionGenerator(),
             persistentMemoryStore = persistentMemoryStore,
             persistentPreferenceStore = persistentPreferenceStore,
+            persistentRecoveryStore = persistentRecoveryStore,
             logger = silentLogger,
         )
     }

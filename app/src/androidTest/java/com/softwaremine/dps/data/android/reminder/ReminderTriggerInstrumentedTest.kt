@@ -6,6 +6,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.softwaremine.dps.core.logging.AndroidDpsLogger
 import com.softwaremine.dps.data.android.permission.AndroidPermissionManager
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.data.android.tool.AndroidReminderTool
 import com.softwaremine.dps.domain.tool.ToolCall
 import com.softwaremine.dps.domain.tool.ToolId
@@ -56,7 +57,7 @@ class ReminderTriggerInstrumentedTest {
     fun scheduledReminderActuallyFiresNotifiesAndClearsItsRecord(): Unit = runBlocking {
         val scheduler = ReminderScheduler(context, logger, AndroidPermissionManager(context, logger))
         val store = ReminderStore(context, logger)
-        val tool = AndroidReminderTool(scheduler, store)
+        val tool = AndroidReminderTool(scheduler, store, PersistentRecoveryStore.create(context, logger))
         val nm = context.getSystemService(NotificationManager::class.java)
 
         // store.nextId() is a persisted, monotonically increasing counter

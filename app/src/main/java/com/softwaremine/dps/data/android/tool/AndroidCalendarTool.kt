@@ -2,7 +2,10 @@ package com.softwaremine.dps.data.android.tool
 
 import com.softwaremine.dps.data.android.calendar.CalendarWriter
 import com.softwaremine.dps.data.android.common.ToolArguments
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.domain.permission.DpsPermission
+import com.softwaremine.dps.domain.secretary.OperationCheckpoint
+import com.softwaremine.dps.domain.secretary.OperationType
 import com.softwaremine.dps.domain.tool.AndroidTool
 import com.softwaremine.dps.domain.tool.ToolCall
 import com.softwaremine.dps.domain.tool.ToolId
@@ -52,11 +55,38 @@ import java.time.ZoneId
  * useful than refusing — a model asked to "put lunch at 1pm in my calendar"
  * will routinely not supply an end.
  *
+ * ## `create_event` checkpointing (M5-E)
+ * [createEvent] durably records an [OperationCheckpoint] — via
+ * [recoveryStore] — *before* [writer]`.insertEvent()` runs, mirroring
+ * [AndroidTaskTool]/[AndroidReminderTool]'s own M5-C pattern. Unlike those
+ * two, a calendar event has no pre-existing client-side id to reuse, so the
+ * checkpoint carries a fixed, unused id
+ * ([OperationCheckpoint.UNUSED_OPERATION_ID]) — there is nothing to persist
+ * that a restart could later check *against*. An earlier version of this
+ * class also minted a correlation id and asked [writer] to tag the created
+ * event with it via `CalendarContract.ExtendedProperties`, so a leftover
+ * checkpoint could be definitively reconciled rather than merely surfaced.
+ * That write is a platform-enforced sync-adapter-only operation — confirmed
+ * on-device (`IllegalArgumentException: Only sync adapters may write using
+ * content://com.android.calendar/extendedproperties`), not merely
+ * undocumented — so no ordinary app, including this one, can ever perform
+ * it. Reconciliation was removed for that reason, not deferred as a
+ * convenience: `create_event`'s checkpoint behaves exactly like
+ * `create_task`'s/`create_reminder`'s own — detect and notify once, never
+ * reconcile, never auto-retry. See
+ * [OperationCheckpoint][com.softwaremine.dps.domain.secretary.OperationCheckpoint]'s
+ * own doc, and [com.softwaremine.dps.ai.secretary.SecretaryOrchestrator] for
+ * how a leftover checkpoint is surfaced.
+ *
  * ## Dependencies
- * [CalendarWriter], [ToolArguments]. No direct Android imports.
+ * [CalendarWriter], [PersistentRecoveryStore], [ToolArguments]. No direct
+ * Android imports — [PersistentRecoveryStore] itself is `Context`-free at
+ * the point it is injected here, exactly like every other collaborator.
  */
 class AndroidCalendarTool(
     private val writer: CalendarWriter,
+    private val recoveryStore: PersistentRecoveryStore,
+    private val now: () -> Long = System::currentTimeMillis,
 ) : AndroidTool {
 
     override val id: ToolId = ToolId.CALENDAR
@@ -123,6 +153,19 @@ class AndroidCalendarTool(
             )
         }
 
+        // M5-E: written only once findWritableCalendar() has confirmed there
+        // is somewhere to actually write — no checkpoint is left behind for
+        // a request that was always going to fail cleanly before reaching
+        // the provider at all.
+        recoveryStore.saveCheckpoint(
+            OperationCheckpoint(
+                operationType = OperationType.CREATE_EVENT,
+                operationId = OperationCheckpoint.UNUSED_OPERATION_ID,
+                title = title,
+                requestedAtMillis = now(),
+            ),
+        )
+
         val outcome = writer.insertEvent(
             calendarId = target.calendarId,
             title = title,
@@ -135,24 +178,40 @@ class AndroidCalendarTool(
         )
 
         return when (outcome) {
-            is CalendarWriter.InsertOutcome.Created -> ToolResult.Success(
-                summary = "Added \"$title\" to your calendar.",
-                data = mapOf(
-                    "event_id" to outcome.eventId.toString(),
-                    "calendar" to target.displayName,
-                    "start" to ToolArguments.describe(start, zone),
-                    "end" to ToolArguments.describe(end, zone),
-                ),
-            )
+            is CalendarWriter.InsertOutcome.Created -> {
+                // Confirmed success — the checkpoint has done its job.
+                recoveryStore.clearCheckpoint()
+                ToolResult.Success(
+                    summary = "Added \"$title\" to your calendar.",
+                    data = mapOf(
+                        "event_id" to outcome.eventId.toString(),
+                        "calendar" to target.displayName,
+                        "start" to ToolArguments.describe(start, zone),
+                        "end" to ToolArguments.describe(end, zone),
+                    ),
+                )
+            }
 
-            CalendarWriter.InsertOutcome.NoProvider -> ToolResult.Unsupported(
-                reason = "This device has no calendar app available.",
-            )
+            CalendarWriter.InsertOutcome.NoProvider -> {
+                // Confirmed: the IllegalArgumentException path means the
+                // insert never reached a provider at all — no side effect to
+                // be ambiguous about.
+                recoveryStore.clearCheckpoint()
+                ToolResult.Unsupported(
+                    reason = "This device has no calendar app available.",
+                )
+            }
 
-            is CalendarWriter.InsertOutcome.Failed -> ToolResult.Failure(
-                reason = outcome.reason,
-                retryable = true,
-            )
+            is CalendarWriter.InsertOutcome.Failed -> {
+                // Confirmed: every Failed path in CalendarWriter.insertEvent()
+                // is reached before or in place of the insert succeeding,
+                // never after — see that method's own doc.
+                recoveryStore.clearCheckpoint()
+                ToolResult.Failure(
+                    reason = outcome.reason,
+                    retryable = true,
+                )
+            }
         }
     }
 

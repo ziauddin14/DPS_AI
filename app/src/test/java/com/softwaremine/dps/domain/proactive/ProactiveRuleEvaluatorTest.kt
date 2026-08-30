@@ -200,4 +200,241 @@ class ProactiveRuleEvaluatorTest {
     fun `pruneMarkersOlderThan leaves an already-empty set empty`() {
         assertTrue(ProactiveRuleEvaluator.pruneMarkersOlderThan(emptySet(), cutoffDateKey = "2026-08-05").isEmpty())
     }
+
+    @Test
+    fun `pruneMarkersOlderThan applies identically to event markers, no change needed for M4-B`() {
+        val dateKey = ProactiveRuleEvaluator.dateKeyFor(now, zone)
+        val eventMarker = ProactiveRuleEvaluator.eventOccurrenceMarkerKey(sourceEventId = 1L, beginMillis = now, zone = zone)
+
+        val pruned = ProactiveRuleEvaluator.pruneMarkersOlderThan(setOf(eventMarker), cutoffDateKey = dateKey)
+
+        assertEquals(setOf(eventMarker), pruned)
+    }
+
+    // -----------------------------------------------------------------
+    // upcomingEvents (M4-B)
+    // -----------------------------------------------------------------
+
+    private fun occurrence(
+        sourceEventId: Long = 1L,
+        beginMillis: Long,
+        endMillis: Long = beginMillis + 3_600_000L,
+        title: String = "event $sourceEventId",
+        allDay: Boolean = false,
+    ) = UpcomingEventOccurrence(
+        sourceEventId = sourceEventId,
+        beginMillis = beginMillis,
+        endMillis = endMillis,
+        title = title,
+        allDay = allDay,
+    )
+
+    private val windowMillis = 3_600_000L // 60 minutes, matching ProactiveCheckWorker's own EVENT_WINDOW_MILLIS
+
+    @Test
+    fun `a one-time event starting within the window is eligible`() {
+        val upcoming = occurrence(beginMillis = now + 1_800_000L) // 30 minutes from now
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(upcoming), now, windowMillis, emptySet(), zone)
+
+        assertEquals(listOf(upcoming), result)
+    }
+
+    @Test
+    fun `an event starting after the window is not eligible`() {
+        val tooFar = occurrence(beginMillis = now + windowMillis + 1)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(tooFar), now, windowMillis, emptySet(), zone)
+
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `an event that has already started is not eligible`() {
+        val started = occurrence(beginMillis = now - 1_000L)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(started), now, windowMillis, emptySet(), zone)
+
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `an event that has already ended is not eligible`() {
+        val ended = occurrence(beginMillis = now - 7_200_000L, endMillis = now - 3_600_000L)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(ended), now, windowMillis, emptySet(), zone)
+
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `an event starting exactly at now is not yet upcoming`() {
+        // Documented choice, mirroring overdueTasks' own boundary: the
+        // instant belongs to "already started," not "still upcoming."
+        val startingNow = occurrence(beginMillis = now)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(startingNow), now, windowMillis, emptySet(), zone)
+
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `an event one millisecond after now is upcoming`() {
+        val justStarted = occurrence(beginMillis = now + 1)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(justStarted), now, windowMillis, emptySet(), zone)
+
+        assertEquals(listOf(justStarted), result)
+    }
+
+    @Test
+    fun `an event starting exactly at the window boundary is eligible`() {
+        // Documented choice: inclusive at the far edge, to avoid an
+        // obvious missed-event gap against the inexact ~30-minute worker cadence.
+        val atBoundary = occurrence(beginMillis = now + windowMillis)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(atBoundary), now, windowMillis, emptySet(), zone)
+
+        assertEquals(listOf(atBoundary), result)
+    }
+
+    @Test
+    fun `an event one millisecond past the window boundary is not eligible`() {
+        val pastBoundary = occurrence(beginMillis = now + windowMillis + 1)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(pastBoundary), now, windowMillis, emptySet(), zone)
+
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `an all-day event is never eligible even if it would otherwise be within the window`() {
+        val allDay = occurrence(beginMillis = now + 1_800_000L, allDay = true)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(allDay), now, windowMillis, emptySet(), zone)
+
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `an event with a blank title is never eligible`() {
+        val blank = occurrence(beginMillis = now + 1_800_000L, title = "   ")
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(blank), now, windowMillis, emptySet(), zone)
+
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `an already-notified occurrence is excluded even though it is otherwise eligible`() {
+        val upcoming = occurrence(sourceEventId = 7L, beginMillis = now + 1_800_000L)
+        val marker = ProactiveRuleEvaluator.eventOccurrenceMarkerKey(7L, now + 1_800_000L, zone)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(listOf(upcoming), now, windowMillis, setOf(marker), zone)
+
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun `two different occurrences of the same recurring event both distinguished by begin time are independently eligible`() {
+        val thisWeek = occurrence(sourceEventId = 42L, beginMillis = now + 600_000L, title = "standup")
+        val nextWeek = occurrence(sourceEventId = 42L, beginMillis = now + 604_800_000L, title = "standup")
+
+        // nextWeek is outside the 60-minute window on its own, so widen the
+        // window for this test to prove both occurrences of the SAME base
+        // event id are independently evaluated, not collapsed into one.
+        val result = ProactiveRuleEvaluator.upcomingEvents(
+            listOf(thisWeek, nextWeek),
+            now,
+            windowMillis = 604_800_000L + 1,
+            alreadyNotifiedMarkers = emptySet(),
+            zone = zone,
+        )
+
+        assertEquals(listOf(thisWeek, nextWeek), result)
+    }
+
+    @Test
+    fun `notifying this week's occurrence of a recurring event does not suppress next week's occurrence`() {
+        val thisWeek = occurrence(sourceEventId = 42L, beginMillis = now + 600_000L, title = "standup")
+        val nextWeek = occurrence(sourceEventId = 42L, beginMillis = now + 604_800_000L, title = "standup")
+        val thisWeeksMarker = ProactiveRuleEvaluator.eventOccurrenceMarkerKey(42L, now + 600_000L, zone)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(
+            listOf(thisWeek, nextWeek),
+            now,
+            windowMillis = 604_800_000L + 1,
+            alreadyNotifiedMarkers = setOf(thisWeeksMarker),
+            zone = zone,
+        )
+
+        assertEquals(
+            "Marking one occurrence notified must never suppress a sibling occurrence of the same recurring event",
+            listOf(nextWeek),
+            result,
+        )
+    }
+
+    @Test
+    fun `results are returned in chronological order regardless of input order`() {
+        val third = occurrence(sourceEventId = 1L, beginMillis = now + 3_000_000L)
+        val first = occurrence(sourceEventId = 2L, beginMillis = now + 1_000_000L)
+        val second = occurrence(sourceEventId = 3L, beginMillis = now + 2_000_000L)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(
+            listOf(third, first, second),
+            now,
+            windowMillis = 4_000_000L,
+            alreadyNotifiedMarkers = emptySet(),
+            zone = zone,
+        )
+
+        assertEquals(listOf(first, second, third), result)
+    }
+
+    @Test
+    fun `an exact duplicate occurrence in the input never produces two results`() {
+        val occurrence = occurrence(sourceEventId = 5L, beginMillis = now + 1_800_000L)
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(
+            listOf(occurrence, occurrence.copy()),
+            now,
+            windowMillis,
+            emptySet(),
+            zone,
+        )
+
+        assertEquals(
+            "The same (sourceEventId, beginMillis) occurrence must never be returned twice",
+            listOf(occurrence),
+            result,
+        )
+    }
+
+    @Test
+    fun `only eligible occurrences are returned from a mixed list`() {
+        val upcoming = occurrence(sourceEventId = 1L, beginMillis = now + 1_800_000L)
+        val started = occurrence(sourceEventId = 2L, beginMillis = now - 1_000L)
+        val tooFar = occurrence(sourceEventId = 3L, beginMillis = now + windowMillis + 1)
+        val allDay = occurrence(sourceEventId = 4L, beginMillis = now + 1_800_000L, allDay = true)
+        val blankTitle = occurrence(sourceEventId = 5L, beginMillis = now + 1_800_000L, title = "")
+
+        val result = ProactiveRuleEvaluator.upcomingEvents(
+            listOf(upcoming, started, tooFar, allDay, blankTitle),
+            now,
+            windowMillis,
+            emptySet(),
+            zone,
+        )
+
+        assertEquals(listOf(upcoming), result)
+    }
+
+    @Test
+    fun `eventOccurrenceMarkerKey distinguishes occurrences by begin time, not just source event id`() {
+        val keyA = ProactiveRuleEvaluator.eventOccurrenceMarkerKey(sourceEventId = 9L, beginMillis = now, zone = zone)
+        val keyB = ProactiveRuleEvaluator.eventOccurrenceMarkerKey(sourceEventId = 9L, beginMillis = now + 604_800_000L, zone = zone)
+
+        assertTrue("Two occurrences of the same event at different times must never share a marker key", keyA != keyB)
+    }
 }

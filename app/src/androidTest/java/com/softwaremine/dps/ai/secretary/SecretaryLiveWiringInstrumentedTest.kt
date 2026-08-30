@@ -23,6 +23,7 @@ import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.core.result.DpsResult
 import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.di.AiContainer
 import com.softwaremine.dps.domain.ai.AiCompletion
 import com.softwaremine.dps.domain.ai.AiEngine
@@ -136,6 +137,7 @@ class SecretaryLiveWiringInstrumentedTest {
         vararg classifications: String,
         persistentMemoryStore: PersistentMemoryStore = PersistentMemoryStore(FakeSharedPreferences(), silentLogger),
         persistentPreferenceStore: PersistentPreferenceStore = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger),
+        persistentRecoveryStore: PersistentRecoveryStore = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger),
     ): SecretaryOrchestrator {
         val toolOrchestrator = ToolOrchestrator(
             engine = ScriptedEngine(*classifications),
@@ -163,6 +165,7 @@ class SecretaryLiveWiringInstrumentedTest {
             followUpSuggestions = FollowUpSuggestionGenerator(),
             persistentMemoryStore = persistentMemoryStore,
             persistentPreferenceStore = persistentPreferenceStore,
+            persistentRecoveryStore = persistentRecoveryStore,
             logger = silentLogger,
         )
     }

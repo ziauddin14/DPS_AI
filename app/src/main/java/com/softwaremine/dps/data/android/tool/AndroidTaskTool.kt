@@ -1,11 +1,14 @@
 package com.softwaremine.dps.data.android.tool
 
 import com.softwaremine.dps.data.android.common.ToolArguments
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.domain.permission.DpsPermission
 import com.softwaremine.dps.domain.productivity.Task
 import com.softwaremine.dps.domain.productivity.TaskPriority
 import com.softwaremine.dps.domain.productivity.TaskRepository
 import com.softwaremine.dps.domain.productivity.TaskStatus
+import com.softwaremine.dps.domain.secretary.OperationCheckpoint
+import com.softwaremine.dps.domain.secretary.OperationType
 import com.softwaremine.dps.domain.tool.AndroidTool
 import com.softwaremine.dps.domain.tool.ToolCall
 import com.softwaremine.dps.domain.tool.ToolId
@@ -35,11 +38,24 @@ import com.softwaremine.dps.domain.tool.ToolResult
  * ## Permissions
  * None — this is local storage the app already has private access to.
  *
+ * ## `create_task` checkpointing (M5-C)
+ * [create] durably records an [OperationCheckpoint] — via [recoveryStore] —
+ * *before* [repository]`.save()` runs, and clears it immediately after.
+ * [TaskRepository.nextId] already reserves the exact id this task will have
+ * before anything else happens; the checkpoint preserves that same id
+ * rather than inventing a second identity. See [OperationCheckpoint]'s own
+ * doc for what a leftover checkpoint means, and
+ * [com.softwaremine.dps.ai.secretary.SecretaryOrchestrator] for how one is
+ * surfaced — never auto-retried — after a restart.
+ *
  * ## Dependencies
- * [TaskRepository], [ToolArguments]. No direct Android imports.
+ * [TaskRepository], [PersistentRecoveryStore], [ToolArguments]. No direct
+ * Android imports — [PersistentRecoveryStore] itself is `Context`-free at
+ * the point it is injected here, exactly like every other collaborator.
  */
 class AndroidTaskTool(
     private val repository: TaskRepository,
+    private val recoveryStore: PersistentRecoveryStore,
     private val now: () -> Long = System::currentTimeMillis,
 ) : AndroidTool {
 
@@ -67,6 +83,19 @@ class AndroidTaskTool(
         val id = repository.nextId()
         val nowMillis = now()
 
+        // M5-C: durably recorded before the actual write below — see this
+        // class's own doc and OperationCheckpoint's for why this must be
+        // the id already reserved above, and why the write here uses
+        // commit(), not apply().
+        recoveryStore.saveCheckpoint(
+            OperationCheckpoint(
+                operationType = OperationType.CREATE_TASK,
+                operationId = id,
+                title = title,
+                requestedAtMillis = nowMillis,
+            ),
+        )
+
         repository.save(
             Task(
                 id = id,
@@ -78,6 +107,9 @@ class AndroidTaskTool(
                 updatedAtMillis = nowMillis,
             ),
         )
+
+        // Confirmed success — the checkpoint has done its job.
+        recoveryStore.clearCheckpoint()
 
         return ToolResult.Success(
             summary = "Task \"$title\" added.",

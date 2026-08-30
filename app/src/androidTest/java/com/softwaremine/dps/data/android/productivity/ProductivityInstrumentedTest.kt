@@ -9,6 +9,7 @@ import com.softwaremine.dps.data.android.tool.AndroidMeetingNoteTool
 import com.softwaremine.dps.data.android.tool.AndroidReportTool
 import com.softwaremine.dps.data.android.tool.AndroidTaskTool
 import com.softwaremine.dps.data.android.tool.AndroidWorkLogTool
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.di.AiContainer
 import com.softwaremine.dps.domain.productivity.Task
 import com.softwaremine.dps.domain.productivity.TaskStatus
@@ -168,7 +169,7 @@ class ProductivityInstrumentedTest {
     @Test
     fun creatingATaskTwiceProducesTwoDistinctRecordsNeverOne() = runBlocking {
         val store = AndroidTaskStore(context, logger)
-        val tool = AndroidTaskTool(store)
+        val tool = AndroidTaskTool(store, PersistentRecoveryStore.create(context, logger))
 
         tool.execute(ToolCall(ToolId.TASK, "create_task", mapOf("title" to "DBPMS documentation")))
         tool.execute(ToolCall(ToolId.TASK, "create_task", mapOf("title" to "DBPMS documentation")))
@@ -181,7 +182,7 @@ class ProductivityInstrumentedTest {
     @Test
     fun completingAnAlreadyCompletedTaskStaysIdempotentRatherThanErroring() = runBlocking {
         val store = AndroidTaskStore(context, logger)
-        val tool = AndroidTaskTool(store)
+        val tool = AndroidTaskTool(store, PersistentRecoveryStore.create(context, logger))
 
         val created = tool.execute(ToolCall(ToolId.TASK, "create_task", mapOf("title" to "DBPMS docs")))
         val id = (created as ToolResult.Success).data.getValue("task_id")
@@ -203,7 +204,7 @@ class ProductivityInstrumentedTest {
     @Test
     fun completingATaskByTitleFindsItWithoutAnId() = runBlocking {
         val store = AndroidTaskStore(context, logger)
-        val tool = AndroidTaskTool(store)
+        val tool = AndroidTaskTool(store, PersistentRecoveryStore.create(context, logger))
 
         tool.execute(ToolCall(ToolId.TASK, "create_task", mapOf("title" to "DBPMS documentation")))
         val result = tool.execute(ToolCall(ToolId.TASK, "complete_task", mapOf("title" to "dbpms")))

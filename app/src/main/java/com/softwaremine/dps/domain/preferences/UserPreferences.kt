@@ -9,11 +9,23 @@ import kotlinx.serialization.Serializable
  * expects to persist indefinitely.
  *
  * ## Why this stays small
- * Only the one preference the current architecture actually needs a place
- * for. Every other preference category (language, notifications, arbitrary
- * key/value settings) has no existing consumer or requirement yet — adding
- * fields for them now would be exactly the speculative "generic preference
- * bag" M3-C's own brief warns against.
+ * Only the preferences the current architecture actually needs a place for.
+ * Every other preference category (language, quiet hours, per-category
+ * notification controls, arbitrary key/value settings) has no existing
+ * consumer or requirement yet — adding fields for them now would be exactly
+ * the speculative "generic preference bag" M3-C's own brief warns against.
+ *
+ * ## [proactiveAssistantEnabled] (M4-C)
+ * The one control the deterministic background checks
+ * ([com.softwaremine.dps.data.android.proactive.ProactiveCheckWorker], M4-A
+ * overdue tasks / M4-B upcoming events) read before doing anything else.
+ * Defaults to `true` — M4-A/M4-B already ship as unconditional, existing
+ * behavior; defaulting this to `false` would silently disable functionality
+ * for every install the moment this field is introduced, which is exactly
+ * what M4-C's own brief forbids. A missing field in legacy serialized JSON
+ * decodes to this same default via [PersistentPreferenceStore][com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore]'s
+ * `ignoreUnknownKeys` `Json` config plus this property's own default value —
+ * no migration code needed.
  *
  * ## [defaultReminderLeadMinutes]
  * `null` means "the user has not explicitly configured a default lead
@@ -37,6 +49,7 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class UserPreferences(
     val defaultReminderLeadMinutes: Int? = null,
+    val proactiveAssistantEnabled: Boolean = true,
 ) {
     companion object {
         /** No preference explicitly configured yet. */

@@ -16,6 +16,7 @@ import com.softwaremine.dps.ai.plan.contactCandidatesFrom
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.domain.contact.Contact
 import com.softwaremine.dps.domain.intent.DpsIntent
 import com.softwaremine.dps.domain.intent.IntentAction
@@ -27,10 +28,16 @@ import com.softwaremine.dps.domain.intent.PendingPermissionAction
 import com.softwaremine.dps.domain.intent.toolId
 import com.softwaremine.dps.domain.memory.ConversationMemory
 import com.softwaremine.dps.domain.secretary.DisambiguationCandidate
+import com.softwaremine.dps.domain.secretary.ExecutionRecoveryState
+import com.softwaremine.dps.domain.secretary.OperationCheckpoint
+import com.softwaremine.dps.domain.secretary.OperationType
 import com.softwaremine.dps.domain.secretary.PendingConfirmation
 import com.softwaremine.dps.domain.secretary.PendingContactSelection
 import com.softwaremine.dps.domain.secretary.PendingPlan
 import com.softwaremine.dps.domain.secretary.PendingTypeDisambiguation
+import com.softwaremine.dps.domain.secretary.PersistedDisambiguationCandidate
+import com.softwaremine.dps.domain.secretary.PersistedPendingPlan
+import com.softwaremine.dps.domain.secretary.PersistedPendingState
 import com.softwaremine.dps.domain.secretary.SecretaryEvent
 import com.softwaremine.dps.domain.secretary.SecretaryState
 import com.softwaremine.dps.domain.secretary.SecretaryStateMachine
@@ -95,6 +102,7 @@ class SecretaryOrchestrator(
     private val followUpSuggestions: FollowUpSuggestionGenerator,
     private val persistentMemoryStore: PersistentMemoryStore,
     private val persistentPreferenceStore: PersistentPreferenceStore,
+    private val persistentRecoveryStore: PersistentRecoveryStore,
     private val logger: DpsLogger,
     private val zone: ZoneId = ZoneId.systemDefault(),
     private val now: () -> Long = System::currentTimeMillis,
@@ -141,11 +149,99 @@ class SecretaryOrchestrator(
     private var pendingIntentAwaitingContactPermission: DpsIntent? = null
 
     /**
+     * A durable recovery record restored from [persistentRecoveryStore] at
+     * construction (M5-B) — a request one of the four `pending*` fields
+     * above was blocking when an earlier process died, still awaiting the
+     * user's explicit yes/no before anything is restored into those live
+     * fields. `null` once resolved either way, or from construction when
+     * nothing was pending or what was pending had already gone stale.
+     *
+     * ## Never a trigger for execution
+     * Its mere presence causes [handle] to ask a question
+     * ([resolveRecoveryPrompt]) — never to call [proceedToExecution] or any
+     * tool. See [ExecutionRecoveryState]'s own doc for the full safety
+     * reasoning.
+     */
+    private var restoredRecovery: ExecutionRecoveryState? = loadFreshRecoveryOrNull()
+
+    /**
+     * Whether the recovery question itself has already been shown for
+     * [restoredRecovery] — distinguishes "the user's next message is an
+     * answer to that question" from "this is the very first message of the
+     * fresh process, which cannot possibly be one." See [handle]'s own doc.
+     */
+    private var recoveryPromptShown: Boolean = false
+
+    /**
+     * Loads a persisted recovery record, discarding it outright (and
+     * clearing the store) if it has already gone stale — a record surviving
+     * on disk for days before the app is reopened must never surface a
+     * "continue where you left off?" prompt about something the user has
+     * long since moved on from. Reuses [PendingPlan.FRESHNESS_WINDOW_MILLIS]
+     * (five minutes) rather than inventing a second constant, applied here
+     * to the moment the record was last synced to disk — see
+     * [ExecutionRecoveryState]'s own doc for why this is a genuine,
+     * intentional difference from the live `pendingClarification` field,
+     * which has no freshness check of its own at all.
+     */
+    private fun loadFreshRecoveryOrNull(): ExecutionRecoveryState? {
+        val state = persistentRecoveryStore.load() ?: return null
+        val requestedAtMillis = when (val pending = state.pending) {
+            is PersistedPendingState.Clarification -> pending.requestedAtMillis
+            is PersistedPendingState.ContactSelection -> pending.requestedAtMillis
+            is PersistedPendingState.TypeDisambiguation -> pending.requestedAtMillis
+            is PersistedPendingState.Confirmation -> pending.requestedAtMillis
+        }
+        if (now() - requestedAtMillis > PendingPlan.FRESHNESS_WINDOW_MILLIS) {
+            logger.i(TAG, "Discarding a stale persisted recovery record")
+            persistentRecoveryStore.clear()
+            return null
+        }
+        return state
+    }
+
+    /**
+     * An outstanding [OperationCheckpoint] restored from
+     * [persistentRecoveryStore] at construction (M5-C; extended to
+     * `create_event` in M5-E) — a `create_task`, `create_reminder`, or
+     * `create_event` dispatch whose outcome is genuinely unknown because an
+     * earlier process died between the checkpoint being written and it being
+     * cleared. `null` once surfaced to the user, or from construction when
+     * no create was ever left mid-flight.
+     *
+     * ## Never a trigger for execution, and never expires
+     * Unlike [restoredRecovery], this carries no freshness check: there is
+     * no safe default to fall back to for "did this create actually
+     * happen" the way there is for "is this stale question worth re-asking"
+     * — silently discarding an old checkpoint would just as silently drop
+     * the one honest signal that an operation's outcome is unresolved. It
+     * is always surfaced exactly once (see [handle]'s own precedence over
+     * [restoredRecovery]) and then cleared — never re-executed, never
+     * re-shown. See [OperationCheckpoint]'s own doc for the full reasoning.
+     */
+    private var pendingCheckpoint: OperationCheckpoint? = persistentRecoveryStore.loadCheckpoint()
+
+    /**
      * Handles one user message.
      *
      * Never throws — every path resolves to a [ToolOrchestrator.Outcome],
      * mirroring [ToolOrchestrator.handle]'s own guarantee, since a thrown
      * exception here would surface to the user as a crash.
+     *
+     * ## M5-B: the recovery prompt comes first
+     * When [restoredRecovery] is non-null — a persisted record survived from
+     * an earlier process — this message is never classified as a fresh
+     * request at all. It is offered to [resolveRecoveryPrompt] instead,
+     * which asks a plain yes/no question and does not touch
+     * [toolOrchestrator] or any tool until a later turn's explicit "yes"
+     * restores the exact pending state that was interrupted. See
+     * [ExecutionRecoveryState]'s own doc for the full scope and safety
+     * reasoning.
+     *
+     * Every other line below is exactly [handleInternal]'s pre-M5-B body,
+     * with one addition: [syncRecoveryPersistence] at the very end, so
+     * whichever `pending*` field this turn leaves set (if any) reaches disk
+     * before this suspend function returns control to the caller.
      *
      * @param recentContext see [com.softwaremine.dps.ai.intent.IntentPromptBuilder.build]
      *   (Day 08-B) — the last exchange, pre-rendered as plain text, or `null`
@@ -154,6 +250,44 @@ class SecretaryOrchestrator(
      *   conversation; nothing else here reads it.
      */
     suspend fun handle(userMessage: String, recentContext: String? = null): ToolOrchestrator.Outcome {
+        // M5-C: takes precedence over M5-B's own recovery prompt — an
+        // operation whose outcome is unknown must never be silently
+        // resumed or asked to "continue", the way a merely-blocked
+        // question can be. It is surfaced once, unconditionally, and
+        // cleared — userMessage is never classified or inspected here
+        // either, for the identical reason restoredRecovery's own
+        // first-turn branch below never inspects it.
+        pendingCheckpoint?.let { checkpoint ->
+            pendingCheckpoint = null
+            persistentRecoveryStore.clearCheckpoint()
+            return outstandingCheckpointNotice(checkpoint)
+        }
+        restoredRecovery?.let { restored ->
+            return if (recoveryPromptShown) {
+                // This message is the user's actual answer to the question
+                // shown below, on some earlier turn.
+                resolveRecoveryPrompt(userMessage, restored)
+            } else {
+                // The very first message of a fresh process cannot possibly
+                // be an answer to a question the user has not seen yet —
+                // there is no proactive, unprompted way to show anything in
+                // this app's existing UI (no settings screen, no on-launch
+                // banner), so the *first* real message after restart is
+                // intercepted and replaced with the recovery question
+                // itself, exactly as this milestone's own brief describes.
+                // userMessage is deliberately never classified or otherwise
+                // inspected here.
+                recoveryPromptShown = true
+                recoveryQuestionOutcome(restored)
+            }
+        }
+        val outcome = handleInternal(userMessage, recentContext)
+        syncRecoveryPersistence()
+        return outcome
+    }
+
+    /** [handle]'s own pre-M5-B body — see that function's doc for why this split exists. */
+    private suspend fun handleInternal(userMessage: String, recentContext: String? = null): ToolOrchestrator.Outcome {
         pendingContactSelection?.let { return resolveContactSelection(userMessage, it) }
         pendingConfirmation?.let { return resolveConfirmation(userMessage, it) }
         pendingTypeDisambiguation?.let { return resolveTypeDisambiguation(userMessage, it) }
@@ -319,6 +453,14 @@ class SecretaryOrchestrator(
      * Resumes an action that was held on [ToolOrchestrator] pending a
      * permission — either the original request, or a `find_contact`
      * pre-resolution step run ahead of it (see [resolveContactThenExecute]).
+     *
+     * A permission block never parks a [PendingPlan] and is not itself
+     * covered by M5-B's persisted recovery (see [ExecutionRecoveryState]'s
+     * own doc for that scope boundary) — but resuming here can still lead
+     * to [continueAfterContactLookup]/[attachSuggestionIfApplicable] setting
+     * [pendingConfirmation] (a follow-up suggestion after a successful
+     * create), which *is* covered, so [syncRecoveryPersistence] runs here
+     * too rather than only after [handle].
      */
     suspend fun onPermissionResult(): ToolOrchestrator.Outcome? {
         _state.value = transition(SecretaryEvent.PermissionGranted)
@@ -330,12 +472,14 @@ class SecretaryOrchestrator(
             }
 
         val awaitingContact = pendingIntentAwaitingContactPermission
-        return if (awaitingContact != null && outcome is ToolOrchestrator.Outcome.Handled) {
+        val result = if (awaitingContact != null && outcome is ToolOrchestrator.Outcome.Handled) {
             pendingIntentAwaitingContactPermission = null
             continueAfterContactLookup(awaitingContact, outcome)
         } else {
             recordOutcome(outcome)
         }
+        syncRecoveryPersistence()
+        return result
     }
 
     /** Discards any pending question or held action, and forgets the conversation so far. */
@@ -346,6 +490,14 @@ class SecretaryOrchestrator(
         pendingConfirmation = null
         pendingPlan = null
         pendingIntentAwaitingContactPermission = null
+        restoredRecovery = null
+        recoveryPromptShown = false
+        // M5-C: pendingCheckpoint is deliberately NOT cleared here. It
+        // represents a real-world ambiguity about whether a create
+        // operation actually happened — not conversational context — and
+        // "forget the conversation" must not also silently forget that a
+        // task or reminder might need checking. It still surfaces on the
+        // next handle() call, exactly as it would have without this reset.
         toolOrchestrator.reset()
         _state.value = transition(SecretaryEvent.Reset)
         _memory.value = ConversationMemory.EMPTY
@@ -354,6 +506,10 @@ class SecretaryOrchestrator(
         // going through updateMemory/save(EMPTY), mirroring the distinction
         // the M3-B spec draws between the two.
         persistentMemoryStore.clear()
+        // M5-B: mirrors persistentMemoryStore's own clear() above exactly —
+        // an explicit "forget everything" action must also discard any
+        // interrupted request still waiting to be resumed.
+        persistentRecoveryStore.clear()
     }
 
     /**
@@ -1361,6 +1517,288 @@ class SecretaryOrchestrator(
                 handle(userMessage)
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // M5-B — persisted, user-gated execution recovery
+    //
+    // Everything below this line is new for M5-B. Nothing here executes a
+    // tool, classifies a request, or calls proceedToExecution — the sole
+    // job of this section is to (a) mirror the four pending*/pendingPlan
+    // fields to durable storage as they change, and (b) on a fresh process
+    // that finds one, ask the user a plain yes/no question before restoring
+    // it back into those exact same fields. A "yes" only re-asks the
+    // question that was already pending; the user's *next* message answers
+    // it through the ordinary resolveContactSelection/resolveConfirmation/
+    // resolveTypeDisambiguation/handleSingleStep paths above, unchanged.
+    //
+    // Scope boundary, documented not silent: a permission block
+    // (ToolOrchestrator's own pendingPermission) is not covered here — see
+    // ExecutionRecoveryState's own doc for why. Also not covered: a process
+    // death between two plan steps that were never blocked at all (nothing
+    // is ever parked for "step 2 is up next," only for "step N is blocked
+    // on the user") — PendingPlan itself has never modeled that case, on
+    // any process, and M5-B does not change what PendingPlan represents.
+    // -----------------------------------------------------------------
+
+    /**
+     * Answers the recovery prompt raised for [restored] — the one thing
+     * [handle] does before anything else once a fresh process has detected
+     * persisted execution-recovery state. Reuses [confirmationParser]
+     * exactly like [resolveConfirmation] does for every other yes/no this
+     * class asks, rather than inventing new parsing.
+     *
+     * ## No execution before an explicit yes
+     * A "yes" only calls [restorePendingState] — which sets exactly one of
+     * [pendingClarification]/[pendingContactSelection]/[pendingTypeDisambiguation]/
+     * [pendingConfirmation] (plus [pendingPlan] when the record carried one)
+     * — and re-asks the same question via [pendingQuestion]. It never calls
+     * [proceedToExecution], [finishExecution], or [toolOrchestrator] at all.
+     * The tool layer is only ever reached by the user's *next* message,
+     * through the exact same resume paths that already exist.
+     *
+     * ## Declining or an unclear reply
+     * Both discard the persisted record and the [restoredRecovery] field
+     * outright — no operation ever runs — mirroring
+     * [resolveConfirmation]'s own established "not an answer, so it never
+     * gets to insist" philosophy for [Confirmation.UNCLEAR]: the user's
+     * message is processed as the fresh request it then genuinely is.
+     */
+    private suspend fun resolveRecoveryPrompt(
+        userMessage: String,
+        restored: ExecutionRecoveryState,
+    ): ToolOrchestrator.Outcome {
+        return when (confirmationParser.parse(userMessage)) {
+            Confirmation.YES -> {
+                restoredRecovery = null
+                restorePendingState(restored)
+                val question = pendingQuestion()
+                syncRecoveryPersistence()
+                if (question == null) {
+                    // Defensive: restorePendingState always sets exactly one
+                    // of the four fields pendingQuestion() reads directly
+                    // afterward, so this branch is unreachable in practice.
+                    logger.w(TAG, "Recovery restored but produced no question to re-ask")
+                    ToolOrchestrator.Outcome.Conversational(
+                        reason = "recovery restore produced nothing to ask",
+                        replyText = "Something went wrong resuming that — could you repeat the request?",
+                    )
+                } else {
+                    val prefixed = "Continuing where we left off. $question"
+                    ToolOrchestrator.Outcome.Clarify(
+                        prefixed,
+                        IntentResolution.NeedsClarification(restoredIntent(restored), prefixed, emptySet(), restoredIntent(restored).parameters),
+                    )
+                }
+            }
+
+            Confirmation.NO -> {
+                restoredRecovery = null
+                persistentRecoveryStore.clear()
+                logger.i(TAG, "User declined to resume a persisted recovery record; discarding")
+                ToolOrchestrator.Outcome.Conversational(
+                    reason = "user declined execution recovery",
+                    replyText = "Alright, I've dropped that.",
+                )
+            }
+
+            Confirmation.UNCLEAR -> {
+                restoredRecovery = null
+                persistentRecoveryStore.clear()
+                handle(userMessage, null)
+            }
+        }
+    }
+
+    /**
+     * The recovery question itself — shown exactly once, on the first
+     * message of a fresh process that restored a persisted record, before
+     * that message (or anything else) is ever classified.
+     */
+    /**
+     * The one-time, informational notice shown when [pendingCheckpoint]
+     * survived from an earlier process (M5-C). Deliberately not a yes/no
+     * question — there is no safe "yes" here, since re-running the create
+     * could duplicate an operation that already succeeded. The user is
+     * told plainly what may have happened and left to check for
+     * themselves; nothing in this class attempts to verify it on their
+     * behalf, matching the milestone's own explicit "no content-based
+     * reconciliation" boundary.
+     */
+    /**
+     * ## `create_event` (M5-E): the same notice, no reconciliation
+     * An earlier version of this milestone reconciled a `create_event`
+     * checkpoint against the real Calendar Provider before composing this
+     * reply, so a confirmed match could report success instead of
+     * uncertainty. That required tagging the created event via
+     * `CalendarContract.ExtendedProperties`, which is a platform-enforced,
+     * sync-adapter-only write no ordinary app — including this one — can
+     * ever perform (confirmed on-device, not merely undocumented). See
+     * [OperationCheckpoint]'s own doc for the full account. `create_event`
+     * therefore falls through to exactly the same uncertain notice
+     * [OperationType.CREATE_TASK]/[OperationType.CREATE_REMINDER] already
+     * use, unchanged.
+     */
+    private fun outstandingCheckpointNotice(checkpoint: OperationCheckpoint): ToolOrchestrator.Outcome.Conversational {
+        val kind = when (checkpoint.operationType) {
+            OperationType.CREATE_TASK -> "task"
+            OperationType.CREATE_REMINDER -> "reminder"
+            OperationType.CREATE_EVENT -> "event"
+        }
+        return ToolOrchestrator.Outcome.Conversational(
+            reason = "surfacing an outstanding operation checkpoint",
+            replyText = "Before this restarted, I may have started creating a $kind (\"${checkpoint.title}\") " +
+                "but couldn't confirm it finished. I haven't repeated it automatically — " +
+                "please check your ${kind}s, and let me know if you'd still like me to create it.",
+        )
+    }
+
+    private fun recoveryQuestionOutcome(restored: ExecutionRecoveryState): ToolOrchestrator.Outcome.Conversational {
+        val what = when (val pending = restored.pending) {
+            is PersistedPendingState.Clarification -> describeIntent(pending.intent)
+            is PersistedPendingState.ContactSelection -> describeIntent(pending.originalIntent)
+            is PersistedPendingState.TypeDisambiguation -> describeIntent(pending.originalIntent)
+            is PersistedPendingState.Confirmation -> describeIntent(pending.intent)
+        }
+        return ToolOrchestrator.Outcome.Conversational(
+            reason = "offering execution recovery",
+            replyText = "A previous request was interrupted$what. Would you like to continue it?",
+        )
+    }
+
+    /** A short, optional " (...)" clause naming what the interrupted request was, when a title is known. */
+    private fun describeIntent(intent: DpsIntent): String =
+        intent.parameters.value(IntentField.TITLE)?.let { " (\"$it\")" } ?: ""
+
+    /** The intent inside [state]'s pending record, regardless of which of the four it is. */
+    private fun restoredIntent(state: ExecutionRecoveryState): DpsIntent = when (val pending = state.pending) {
+        is PersistedPendingState.Clarification -> pending.intent
+        is PersistedPendingState.ContactSelection -> pending.originalIntent
+        is PersistedPendingState.TypeDisambiguation -> pending.originalIntent
+        is PersistedPendingState.Confirmation -> pending.intent
+    }
+
+    /**
+     * Restores [restored] into the exact live fields it was snapshotted
+     * from, stamping a fresh [now] as each restored field's own
+     * `requestedAtMillis` — re-asking the question right now is, from the
+     * user's side, indistinguishable from the assistant asking it for the
+     * first time, so it earns a fresh freshness window rather than
+     * inheriting however much of the original five minutes happened to
+     * remain when the process died.
+     */
+    private fun restorePendingState(restored: ExecutionRecoveryState) {
+        val nowMillis = now()
+        when (val pending = restored.pending) {
+            is PersistedPendingState.Clarification -> {
+                pendingClarification = IntentResolution.NeedsClarification(
+                    intent = pending.intent,
+                    question = pending.question,
+                    missing = pending.missing,
+                    partial = pending.partial,
+                )
+                _state.value = transition(SecretaryEvent.MessageReceived)
+                _state.value = transition(SecretaryEvent.ClarificationNeeded)
+            }
+
+            is PersistedPendingState.ContactSelection -> {
+                pendingContactSelection = PendingContactSelection(pending.originalIntent, pending.candidates, nowMillis)
+                _state.value = transition(SecretaryEvent.MessageReceived)
+                _state.value = transition(SecretaryEvent.ContactAmbiguous)
+            }
+
+            is PersistedPendingState.TypeDisambiguation -> {
+                pendingTypeDisambiguation = PendingTypeDisambiguation(
+                    pending.originalIntent,
+                    pending.candidates.map { DisambiguationCandidate(it.type, it.targetId, it.label) },
+                    nowMillis,
+                )
+                _state.value = transition(SecretaryEvent.MessageReceived)
+                _state.value = transition(SecretaryEvent.TypeDisambiguationNeeded)
+            }
+
+            is PersistedPendingState.Confirmation -> {
+                pendingConfirmation = PendingConfirmation(pending.intent, nowMillis)
+                _state.value = transition(SecretaryEvent.MessageReceived)
+                _state.value = transition(SecretaryEvent.ConfirmationRequested)
+            }
+        }
+        pendingPlan = restored.plan?.let {
+            PendingPlan(
+                remainingSteps = it.remainingSteps,
+                remainingOffsets = it.remainingOffsets,
+                completedReplies = it.completedReplies,
+                lastEventStartMillis = it.lastEventStartMillis,
+                requestedAtMillis = nowMillis,
+            )
+        }
+    }
+
+    /**
+     * Mirrors whichever of [pendingClarification]/[pendingContactSelection]/
+     * [pendingTypeDisambiguation]/[pendingConfirmation] is currently set —
+     * plus [pendingPlan] when present — to [persistentRecoveryStore], or
+     * clears the store when none of the four is set. Called once, at the
+     * end of [handle] and [onPermissionResult], rather than at each of the
+     * several call sites that individually set or clear one of those
+     * fields — by the time either of those two functions returns, the live
+     * model has already settled into its final shape for this turn, so one
+     * synchronization point covers every call site without duplicating
+     * logic at each of them.
+     *
+     * Never called while [restoredRecovery] is still awaiting the user's
+     * own yes/no — that record is [resolveRecoveryPrompt]'s concern alone,
+     * and [handle] returns before reaching this function in that case.
+     */
+    private fun syncRecoveryPersistence() {
+        val pending = currentPersistablePendingState()
+        if (pending == null) {
+            persistentRecoveryStore.clear()
+            return
+        }
+        persistentRecoveryStore.save(
+            ExecutionRecoveryState(
+                pending = pending,
+                plan = pendingPlan?.let {
+                    PersistedPendingPlan(
+                        remainingSteps = it.remainingSteps,
+                        remainingOffsets = it.remainingOffsets,
+                        completedReplies = it.completedReplies,
+                        lastEventStartMillis = it.lastEventStartMillis,
+                        requestedAtMillis = it.requestedAtMillis,
+                    )
+                },
+            ),
+        )
+    }
+
+    /**
+     * A persistable snapshot of whichever of the four `pending*` fields is
+     * currently set, or `null` when none is. [pendingClarification] is
+     * stamped with [now] here — unlike the other three, its live type
+     * carries no `requestedAtMillis` of its own at all (a genuine,
+     * intentional asymmetry — see [ExecutionRecoveryState]'s own doc), so
+     * "as of this synchronization point, it was still active" is the most
+     * accurate timestamp available for it.
+     */
+    private fun currentPersistablePendingState(): PersistedPendingState? {
+        pendingClarification?.let {
+            return PersistedPendingState.Clarification(it.intent, it.question, it.missing, it.partial, now())
+        }
+        pendingContactSelection?.let {
+            return PersistedPendingState.ContactSelection(it.originalIntent, it.candidates, it.requestedAtMillis)
+        }
+        pendingTypeDisambiguation?.let {
+            return PersistedPendingState.TypeDisambiguation(
+                it.originalIntent,
+                it.candidates.map { candidate -> PersistedDisambiguationCandidate(candidate.type, candidate.targetId, candidate.label) },
+                it.requestedAtMillis,
+            )
+        }
+        pendingConfirmation?.let {
+            return PersistedPendingState.Confirmation(it.intent, it.requestedAtMillis)
+        }
+        return null
     }
 
     // -----------------------------------------------------------------

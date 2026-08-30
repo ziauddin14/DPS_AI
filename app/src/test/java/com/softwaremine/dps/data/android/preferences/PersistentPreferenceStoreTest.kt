@@ -44,6 +44,66 @@ class PersistentPreferenceStoreTest {
     }
 
     // -----------------------------------------------------------------
+    // M4-C — proactiveAssistantEnabled
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `EMPTY defaults proactiveAssistantEnabled to true, preserving existing M4-A-slash-M4-B behavior`() {
+        assertEquals(true, UserPreferences.EMPTY.proactiveAssistantEnabled)
+    }
+
+    @Test
+    fun `an explicit false for proactiveAssistantEnabled survives a save-then-load round-trip`() {
+        val store = freshStore()
+        val original = UserPreferences(proactiveAssistantEnabled = false)
+
+        store.save(original)
+
+        assertEquals(false, store.load().proactiveAssistantEnabled)
+    }
+
+    @Test
+    fun `an explicit true for proactiveAssistantEnabled survives a save-then-load round-trip`() {
+        val store = freshStore()
+        val original = UserPreferences(defaultReminderLeadMinutes = 15, proactiveAssistantEnabled = true)
+
+        store.save(original)
+
+        assertEquals(original, store.load())
+    }
+
+    @Test
+    fun `legacy serialized data lacking proactiveAssistantEnabled loads as true, not a crash or false`() {
+        val prefs = FakeSharedPreferences()
+        // Exactly the JSON shape M3-C would have persisted before M4-C existed.
+        prefs.edit().putString("preferences", """{"defaultReminderLeadMinutes":15}""").apply()
+        val store = PersistentPreferenceStore(prefs, silentLogger)
+
+        val loaded = store.load()
+
+        assertEquals(15, loaded.defaultReminderLeadMinutes)
+        assertEquals(
+            "A pre-M4-C install must not be silently opted out of proactive notifications by an upgrade",
+            true,
+            loaded.proactiveAssistantEnabled,
+        )
+    }
+
+    @Test
+    fun `disabling proactiveAssistantEnabled survives a fresh PersistentPreferenceStore reconstruction over the same SharedPreferences`() {
+        val prefs = FakeSharedPreferences()
+        PersistentPreferenceStore(prefs, silentLogger).save(UserPreferences(proactiveAssistantEnabled = false))
+
+        // A brand-new store instance over the same backing SharedPreferences —
+        // the object-level analogue of "a fresh process reads what an earlier
+        // process wrote," mirroring this codebase's own established
+        // reconstruction-test convention (see ProactiveStateStoreTest).
+        val reconstructed = PersistentPreferenceStore(prefs, silentLogger)
+
+        assertEquals(false, reconstructed.load().proactiveAssistantEnabled)
+    }
+
+    // -----------------------------------------------------------------
     // Test 2 — full round-trip
     // -----------------------------------------------------------------
 

@@ -11,6 +11,7 @@ import com.softwaremine.dps.data.android.permission.AndroidPermissionManager
 import com.softwaremine.dps.data.android.notification.NotificationPresenter
 import com.softwaremine.dps.data.android.reminder.ReminderScheduler
 import com.softwaremine.dps.data.android.reminder.ReminderStore
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.di.AiContainer
 import com.softwaremine.dps.domain.permission.DpsPermission
 import com.softwaremine.dps.domain.permission.PermissionState
@@ -490,7 +491,7 @@ class AndroidToolsInstrumentedTest {
     fun reminderIsScheduledWhetherOrNotExactAlarmsArePermitted(): Unit = runBlocking {
         val scheduler = ReminderScheduler(context, logger, permissions())
         val store = ReminderStore(context, logger)
-        val tool = AndroidReminderTool(scheduler, store)
+        val tool = AndroidReminderTool(scheduler, store, PersistentRecoveryStore.create(context, logger))
 
         val triggerAt = System.currentTimeMillis() + 6L * 60 * 60 * 1000
         val result = tool.execute(
@@ -530,7 +531,11 @@ class AndroidToolsInstrumentedTest {
 
     @Test
     fun reminderInThePastIsRejected(): Unit = runBlocking {
-        val tool = AndroidReminderTool(ReminderScheduler(context, logger, permissions()), ReminderStore(context, logger))
+        val tool = AndroidReminderTool(
+            ReminderScheduler(context, logger, permissions()),
+            ReminderStore(context, logger),
+            PersistentRecoveryStore.create(context, logger),
+        )
 
         val result = tool.execute(
             ToolCall(
@@ -549,7 +554,11 @@ class AndroidToolsInstrumentedTest {
 
     @Test
     fun updatingAnUnknownReminderFailsCleanly(): Unit = runBlocking {
-        val tool = AndroidReminderTool(ReminderScheduler(context, logger, permissions()), ReminderStore(context, logger))
+        val tool = AndroidReminderTool(
+            ReminderScheduler(context, logger, permissions()),
+            ReminderStore(context, logger),
+            PersistentRecoveryStore.create(context, logger),
+        )
 
         val result = tool.execute(
             ToolCall(ToolId.REMINDER, "update_reminder", mapOf("id" to "424242")),
@@ -562,7 +571,11 @@ class AndroidToolsInstrumentedTest {
     @Test
     fun reminderUpdateReschedulesAndPersists(): Unit = runBlocking {
         val store = ReminderStore(context, logger)
-        val tool = AndroidReminderTool(ReminderScheduler(context, logger, permissions()), store)
+        val tool = AndroidReminderTool(
+            ReminderScheduler(context, logger, permissions()),
+            store,
+            PersistentRecoveryStore.create(context, logger),
+        )
 
         val first = System.currentTimeMillis() + 3L * 60 * 60 * 1000
         val created = tool.execute(

@@ -77,6 +77,28 @@ class CalendarWriter(
         data class Failed(val reason: String) : QueryOutcome
     }
 
+    /**
+     * One occurrence found by [findUpcomingInstances] — deliberately its own
+     * type, not [EventSummary]: an occurrence's identity is the pair
+     * ([sourceEventId], [beginMillis]), never [sourceEventId] alone, since a
+     * recurring event's every future occurrence shares the same
+     * [sourceEventId] (M4-B).
+     */
+    data class EventOccurrence(
+        val sourceEventId: Long,
+        val beginMillis: Long,
+        val endMillis: Long,
+        val title: String,
+        val allDay: Boolean,
+    )
+
+    /** Outcome of a read-only [CalendarContract.Instances] range query — see [findUpcomingInstances]. */
+    sealed interface InstanceQueryOutcome {
+        data class Found(val occurrences: List<EventOccurrence>) : InstanceQueryOutcome
+        data object NoProvider : InstanceQueryOutcome
+        data class Failed(val reason: String) : InstanceQueryOutcome
+    }
+
     /** Outcome of an insert. */
     sealed interface InsertOutcome {
         data class Created(val eventId: Long) : InsertOutcome
@@ -310,6 +332,91 @@ class CalendarWriter(
         } catch (throwable: Throwable) {
             logger.e(TAG, "Calendar find failed", throwable)
             QueryOutcome.Failed(throwable.message ?: "Could not read the calendar.")
+        }
+    }
+
+    /**
+     * Finds calendar *occurrences* — including future occurrences of
+     * recurring events — starting in `[fromMillis, toMillis]`, capped at
+     * [limit], sorted by [EventOccurrence.beginMillis] ascending (M4-B).
+     *
+     * ## Why [CalendarContract.Instances], not [findEvents]
+     * [findEvents] queries the base `Events` table directly, whose own
+     * `DTSTART` is the *series'* first occurrence — for a recurring event
+     * whose series began before [fromMillis] (the overwhelmingly common
+     * case for an ongoing weekly meeting), that first occurrence is in the
+     * past, so a filter on `DTSTART >= fromMillis` never sees that event
+     * again regardless of how many future occurrences remain.
+     * `CalendarContract.Instances` is the platform's own documented answer
+     * to exactly this: a provider-side view that has already expanded
+     * `RRULE`/`RDATE`/`EXDATE` recurrence into one row per occurrence
+     * within the queried window, so a still-ongoing weekly meeting
+     * correctly reappears here every week. [CalendarContract.Instances.query]
+     * is the Android-recommended entry point — it builds the correct
+     * time-windowed content URI itself — rather than this class hand-rolling
+     * recurrence expansion, which the class doc above already rules out for
+     * every other method here too.
+     *
+     * ## Occurrence identity
+     * [EventOccurrence.sourceEventId] alone is **not** a unique occurrence
+     * identity — every future occurrence of the same recurring event shares
+     * it. The pair ([EventOccurrence.sourceEventId], [EventOccurrence.beginMillis])
+     * is: `EVENT_ID` is the base event's stable id (documented, the same
+     * value [findEvents] returns as [EventSummary.id]); `BEGIN` is this
+     * specific occurrence's own start instant, distinct from every sibling
+     * occurrence of the same series.
+     *
+     * ## Read-only, same conventions as every other query in this class
+     * One `Instances.query` call, nothing else — no insert, update or
+     * delete anywhere in this path. `SecurityException` and a `null` cursor
+     * are handled exactly like [findEvents]. This method requires only
+     * `READ_CALENDAR` — unlike [AndroidCalendarTool][com.softwaremine.dps.data.android.tool.AndroidCalendarTool],
+     * which bundles `WRITE_CALENDAR` too because it also creates/updates/
+     * deletes; this method never does.
+     *
+     * ## Why sorting and the limit are applied client-side
+     * [CalendarContract.Instances.query]'s convenience overload takes no
+     * `sortOrder`/limit argument (unlike the raw `ContentResolver.query`
+     * [findEvents] calls directly) and the provider gives no ordering
+     * guarantee, so every row in the window is read first and *then* sorted
+     * and capped — capping before sorting could silently drop an earlier
+     * occurrence that happened to arrive later in cursor order.
+     */
+    fun findUpcomingInstances(fromMillis: Long, toMillis: Long, limit: Int): InstanceQueryOutcome {
+        val projection = arrayOf(
+            CalendarContract.Instances.EVENT_ID,
+            CalendarContract.Instances.BEGIN,
+            CalendarContract.Instances.END,
+            CalendarContract.Instances.TITLE,
+            CalendarContract.Instances.ALL_DAY,
+        )
+
+        return try {
+            val cursor = CalendarContract.Instances.query(context.contentResolver, projection, fromMillis, toMillis)
+                ?: return InstanceQueryOutcome.NoProvider
+
+            cursor.use {
+                val occurrences = buildList {
+                    while (it.moveToNext()) {
+                        add(
+                            EventOccurrence(
+                                sourceEventId = it.getLong(it.getColumnIndexOrThrow(CalendarContract.Instances.EVENT_ID)),
+                                beginMillis = it.getLong(it.getColumnIndexOrThrow(CalendarContract.Instances.BEGIN)),
+                                endMillis = it.getLong(it.getColumnIndexOrThrow(CalendarContract.Instances.END)),
+                                title = it.getString(it.getColumnIndexOrThrow(CalendarContract.Instances.TITLE)).orEmpty(),
+                                allDay = it.getInt(it.getColumnIndexOrThrow(CalendarContract.Instances.ALL_DAY)) != 0,
+                            ),
+                        )
+                    }
+                }
+                InstanceQueryOutcome.Found(occurrences.sortedBy { occurrence -> occurrence.beginMillis }.take(limit))
+            }
+        } catch (security: SecurityException) {
+            logger.w(TAG, "Calendar instances query denied", security)
+            InstanceQueryOutcome.Failed("Calendar access was denied.")
+        } catch (throwable: Throwable) {
+            logger.e(TAG, "Calendar instances query failed", throwable)
+            InstanceQueryOutcome.Failed(throwable.message ?: "Could not read upcoming calendar occurrences.")
         }
     }
 

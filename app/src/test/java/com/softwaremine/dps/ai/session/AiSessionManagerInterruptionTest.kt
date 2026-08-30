@@ -30,6 +30,7 @@ import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.core.result.DpsResult
 import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.data.model.ModelCatalog
 import com.softwaremine.dps.domain.ai.AiCompletion
 import com.softwaremine.dps.domain.ai.AiEngine
@@ -218,6 +219,7 @@ class AiSessionManagerInterruptionTest {
             followUpSuggestions = FollowUpSuggestionGenerator(zone = zone),
             persistentMemoryStore = PersistentMemoryStore(NoOpSharedPreferences(), silentLogger),
             persistentPreferenceStore = PersistentPreferenceStore(NoOpSharedPreferences(), silentLogger),
+            persistentRecoveryStore = PersistentRecoveryStore(NoOpSharedPreferences(), silentLogger),
             logger = silentLogger,
             zone = zone,
         )

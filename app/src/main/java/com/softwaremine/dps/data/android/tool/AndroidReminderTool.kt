@@ -4,7 +4,10 @@ import com.softwaremine.dps.data.android.common.ToolArguments
 import com.softwaremine.dps.data.android.reminder.ReminderScheduler
 import com.softwaremine.dps.data.android.reminder.ReminderStore
 import com.softwaremine.dps.data.android.reminder.StoredReminder
+import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.domain.permission.DpsPermission
+import com.softwaremine.dps.domain.secretary.OperationCheckpoint
+import com.softwaremine.dps.domain.secretary.OperationType
 import com.softwaremine.dps.domain.tool.AndroidTool
 import com.softwaremine.dps.domain.tool.ToolCall
 import com.softwaremine.dps.domain.tool.ToolId
@@ -41,13 +44,27 @@ import com.softwaremine.dps.domain.tool.ToolResult
  * former while scheduling the latter is lying to the user, in a way they only
  * discover when it matters.
  *
+ * ## `create_reminder` checkpointing (M5-C)
+ * [create] durably records an [OperationCheckpoint] — via [recoveryStore] —
+ * *before* [scheduler]`.schedule()` runs, preserving the exact id
+ * [ReminderStore.nextId] already reserved. Cleared immediately on every
+ * outcome of that call — [ReminderScheduler.ScheduleOutcome.Scheduled] is a
+ * confirmed success; [ReminderScheduler.ScheduleOutcome.Unavailable]/[ReminderScheduler.ScheduleOutcome.Failed]
+ * are confirmed to have created no alarm and no stored record, so clearing
+ * on those too is safe, not merely convenient. See [OperationCheckpoint]'s
+ * own doc for what a leftover checkpoint means, and
+ * [com.softwaremine.dps.ai.secretary.SecretaryOrchestrator] for how one is
+ * surfaced — never auto-retried — after a restart.
+ *
  * ## Dependencies
- * [ReminderScheduler], [ReminderStore], [ToolArguments]. No direct Android
- * imports — platform work lives in the scheduler.
+ * [ReminderScheduler], [ReminderStore], [PersistentRecoveryStore],
+ * [ToolArguments]. No direct Android imports — platform work lives in the
+ * scheduler.
  */
 class AndroidReminderTool(
     private val scheduler: ReminderScheduler,
     private val store: ReminderStore,
+    private val recoveryStore: PersistentRecoveryStore,
     private val now: () -> Long = System::currentTimeMillis,
 ) : AndroidTool {
 
@@ -92,6 +109,19 @@ class AndroidReminderTool(
         val body = call.argumentOr(ARG_BODY, title)
         val reminderId = store.nextId()
 
+        // M5-C: durably recorded before the actual dispatch below — see
+        // this class's own doc and OperationCheckpoint's for why this must
+        // be the id already reserved above, and why the write here uses
+        // commit(), not apply().
+        recoveryStore.saveCheckpoint(
+            OperationCheckpoint(
+                operationType = OperationType.CREATE_REMINDER,
+                operationId = reminderId,
+                title = title,
+                requestedAtMillis = now(),
+            ),
+        )
+
         return when (val outcome = scheduler.schedule(reminderId, title, body, triggerAt)) {
             is ReminderScheduler.ScheduleOutcome.Scheduled -> {
                 store.put(
@@ -105,6 +135,9 @@ class AndroidReminderTool(
                     ),
                 )
                 store.pruneExpired(now())
+
+                // Confirmed success — the checkpoint has done its job.
+                recoveryStore.clearCheckpoint()
 
                 val when_ = ToolArguments.describe(triggerAt, zone)
                 ToolResult.Success(
@@ -123,14 +156,20 @@ class AndroidReminderTool(
                 )
             }
 
-            ReminderScheduler.ScheduleOutcome.Unavailable -> ToolResult.Unsupported(
-                reason = "This device cannot schedule alarms.",
-            )
+            ReminderScheduler.ScheduleOutcome.Unavailable -> {
+                // Confirmed: AlarmManager itself was unavailable before
+                // anything was armed — no side effect exists to be ambiguous about.
+                recoveryStore.clearCheckpoint()
+                ToolResult.Unsupported(reason = "This device cannot schedule alarms.")
+            }
 
-            is ReminderScheduler.ScheduleOutcome.Failed -> ToolResult.Failure(
-                reason = outcome.reason,
-                retryable = true,
-            )
+            is ReminderScheduler.ScheduleOutcome.Failed -> {
+                // Confirmed: scheduling itself failed cleanly (see
+                // ReminderScheduler's own doc — every path here either
+                // arms the alarm or reports Failed, never both).
+                recoveryStore.clearCheckpoint()
+                ToolResult.Failure(reason = outcome.reason, retryable = true)
+            }
         }
     }
 
