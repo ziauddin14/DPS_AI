@@ -10,6 +10,7 @@ import com.softwaremine.dps.ai.intent.ToolResponseGenerator
 import com.softwaremine.dps.ai.intent.ToolSelector
 import com.softwaremine.dps.ai.memory.ActionDetector
 import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
+import com.softwaremine.dps.ai.memory.EpisodicMemoryRecorder
 import com.softwaremine.dps.ai.memory.ReferenceResolver
 import com.softwaremine.dps.ai.memory.TemporalGroundingGuard
 import com.softwaremine.dps.ai.memory.TemporalPhraseSpanFinder
@@ -28,7 +29,12 @@ import com.softwaremine.dps.ai.tool.DefaultToolRegistry
 import com.softwaremine.dps.core.concurrency.DispatcherProvider
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.core.result.DpsResult
+import com.softwaremine.dps.data.android.memory.LongTermMemoryStore
 import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
+import com.softwaremine.dps.data.android.memory.episodic.EpisodicMemoryDao
+import com.softwaremine.dps.data.android.memory.episodic.EpisodicMemoryEntity
+import com.softwaremine.dps.data.android.memory.semantic.SemanticFactDao
+import com.softwaremine.dps.data.android.memory.semantic.SemanticFactEntity
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.data.model.ModelCatalog
@@ -252,6 +258,49 @@ class VoiceModeControllerTest {
         }
     }
 
+    /** M6: in-memory DAO fakes — this file tests voice mode, not persistence. */
+    private class FakeSemanticFactDao : SemanticFactDao {
+        private val facts = mutableListOf<SemanticFactEntity>()
+        private var nextId = 1L
+        override suspend fun insert(fact: SemanticFactEntity): Long {
+            val assigned = fact.copy(id = nextId++)
+            facts += assigned
+            return assigned.id
+        }
+        override suspend fun findBySubject(subjectQuery: String): List<SemanticFactEntity> =
+            facts.filter { it.subject.contains(subjectQuery, ignoreCase = true) }.sortedByDescending { it.createdAtMillis }
+        override suspend fun findAll(): List<SemanticFactEntity> = facts.sortedByDescending { it.createdAtMillis }
+        override suspend fun delete(fact: SemanticFactEntity): Int = if (facts.removeAll { it.id == fact.id }) 1 else 0
+        override suspend fun deleteById(id: Long): Int = if (facts.removeAll { it.id == id }) 1 else 0
+    }
+
+    private class FakeEpisodicMemoryDao : EpisodicMemoryDao {
+        private val entries = mutableListOf<EpisodicMemoryEntity>()
+        private var nextId = 1L
+        override suspend fun insert(entry: EpisodicMemoryEntity): Long {
+            val assigned = entry.copy(id = nextId++)
+            entries += assigned
+            return assigned.id
+        }
+        override suspend fun findInRange(fromMillis: Long, toMillis: Long, limit: Int): List<EpisodicMemoryEntity> =
+            entries.filter { it.timestampMillis in fromMillis..toMillis }.sortedByDescending { it.timestampMillis }.take(limit)
+        override suspend fun findByKeyword(keyword: String, limit: Int): List<EpisodicMemoryEntity> =
+            entries.filter { it.summary.contains(keyword, ignoreCase = true) }.sortedByDescending { it.timestampMillis }.take(limit)
+        override suspend fun count(): Int = entries.size
+        override suspend fun deleteOlderThan(cutoffMillis: Long): Int {
+            val before = entries.size
+            entries.removeAll { it.timestampMillis < cutoffMillis }
+            return before - entries.size
+        }
+        override suspend fun deleteOldestBeyond(keepNewest: Int): Int {
+            if (entries.size <= keepNewest) return 0
+            val toKeep = entries.sortedByDescending { it.id }.take(keepNewest).map { it.id }.toSet()
+            val before = entries.size
+            entries.removeAll { it.id !in toKeep }
+            return before - entries.size
+        }
+    }
+
     private fun sessionManager(engine: AiEngine, scope: kotlinx.coroutines.CoroutineScope): AiSessionManager {
         val toolOrchestrator = ToolOrchestrator(
             engine = engine,
@@ -285,6 +334,9 @@ class VoiceModeControllerTest {
             persistentMemoryStore = PersistentMemoryStore(NoOpSharedPreferences(), silentLogger),
             persistentPreferenceStore = PersistentPreferenceStore(NoOpSharedPreferences(), silentLogger),
             persistentRecoveryStore = PersistentRecoveryStore(NoOpSharedPreferences(), silentLogger),
+            episodicMemoryRecorder = EpisodicMemoryRecorder(
+                LongTermMemoryStore(FakeSemanticFactDao(), FakeEpisodicMemoryDao(), silentLogger),
+            ),
             logger = silentLogger,
             zone = zone,
         )

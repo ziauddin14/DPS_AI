@@ -158,6 +158,7 @@ class CalendarCheckpointRecoveryInstrumentedTest {
             persistentMemoryStore = PersistentMemoryStore.create(context, silentLogger),
             persistentPreferenceStore = PersistentPreferenceStore.create(context, silentLogger),
             persistentRecoveryStore = persistentRecoveryStore,
+            episodicMemoryRecorder = container.episodicMemoryRecorder,
             logger = silentLogger,
         )
     }

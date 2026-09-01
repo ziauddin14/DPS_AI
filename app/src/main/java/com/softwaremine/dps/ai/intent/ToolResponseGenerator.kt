@@ -116,6 +116,9 @@ class ToolResponseGenerator {
             IntentType.MEETING_NOTE -> "save that note"
             IntentType.ACTION_ITEM -> "track that"
             IntentType.REPORT -> "build that report"
+            // M6 tools declare no required permissions — unreachable in
+            // practice, but every case must say something.
+            IntentType.REMEMBER_FACT, IntentType.RECALL_FACT, IntentType.FORGET_FACT -> "do that"
             IntentType.CONVERSATION -> "do that"
         }
 
@@ -146,6 +149,9 @@ class ToolResponseGenerator {
         IntentType.MEETING_NOTE -> "Saved."
         IntentType.ACTION_ITEM -> "Done."
         IntentType.REPORT -> "Here you go."
+        // AndroidMemoryTool always sets a non-blank summary — unreachable in
+        // practice, but every case must say something.
+        IntentType.REMEMBER_FACT, IntentType.RECALL_FACT, IntentType.FORGET_FACT -> "Done."
         IntentType.CONVERSATION -> "Done."
     }
 }

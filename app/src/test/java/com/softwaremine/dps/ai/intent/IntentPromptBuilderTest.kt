@@ -216,10 +216,12 @@ class IntentPromptBuilderTest {
         // every call and defeated KV-cache reuse entirely, while this
         // slightly larger prompt is now byte-identical on every call —
         // each move is one deliberate, named change, not drift; a
-        // regression here should still fail loudly.
+        // regression here should still fail loudly. → 1650 (M6: three new
+        // routable intent types — remember_fact/recall_fact/forget_fact —
+        // plus one rule bullet distinguishing them from task/conversation).
         assertTrue(
             "Classification prompt has grown to ${prompt.length} characters",
-            prompt.length < 1400,
+            prompt.length < 1650,
         )
     }
 

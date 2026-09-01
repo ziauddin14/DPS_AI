@@ -117,6 +117,9 @@ enum class ToolId(val toolName: String) {
     MEETING("meeting"),
     ACTION_ITEM("action_item"),
     REPORT("report"),
+
+    /** Long-term (episodic + semantic) memory (M6). See [com.softwaremine.dps.data.android.tool.AndroidMemoryTool]. */
+    MEMORY("memory"),
     ;
 
     companion object {

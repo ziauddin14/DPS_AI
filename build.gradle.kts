@@ -12,4 +12,6 @@ plugins {
     alias(libs.plugins.kotlin.android) apply false
     alias(libs.plugins.kotlin.compose) apply false
     alias(libs.plugins.kotlin.serialization) apply false
+    // M6: generates Room's DAO implementations (episodic/semantic memory only).
+    alias(libs.plugins.ksp) apply false
 }

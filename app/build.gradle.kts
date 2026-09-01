@@ -21,6 +21,8 @@ plugins {
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
+    // M6: Room annotation processing (episodic + semantic memory only).
+    alias(libs.plugins.ksp)
 }
 
 android {
@@ -154,6 +156,14 @@ kotlin {
     }
 }
 
+// M6: Room schema history, exported so a future schema change can ship a
+// real Migration instead of DpsMemoryDatabase.kt's own explicit
+// fallbackToDestructiveMigration() ban forcing one anyway — this just makes
+// the "from" schema available to write that Migration against.
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
+
 dependencies {
     // --- Kotlin / concurrency ---
     implementation(libs.kotlinx.coroutines.core)
@@ -172,6 +182,16 @@ dependencies {
     // tasks. Deliberately not AlarmManager — that stays dedicated to exact,
     // user-created reminders (see ReminderScheduler's own doc).
     implementation(libs.androidx.work.runtime.ktx)
+
+    // --- Room (M6: episodic + semantic long-term memory only) ---
+    // Every other store in this codebase is SharedPreferences-plus-JSON,
+    // deliberately unchanged by M6 — see DpsMemoryDatabase's own doc for why
+    // long-term memory specifically needs a real, queryable, prunable store
+    // instead. Not a platform migration: exactly two tables, one database.
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
+    androidTestImplementation(libs.androidx.room.testing)
 
     // --- Compose ---
     implementation(platform(libs.androidx.compose.bom))

@@ -235,6 +235,7 @@ class ProcessDeathPersistenceInstrumentedTest {
             persistentMemoryStore = persistentMemoryStore,
             persistentPreferenceStore = persistentPreferenceStore,
             persistentRecoveryStore = persistentRecoveryStore,
+            episodicMemoryRecorder = container.episodicMemoryRecorder,
             logger = silentLogger,
         )
     }

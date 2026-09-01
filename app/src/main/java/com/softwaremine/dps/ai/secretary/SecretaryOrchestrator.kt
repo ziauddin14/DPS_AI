@@ -4,6 +4,8 @@ import com.softwaremine.dps.ai.intent.ClarificationEngine
 import com.softwaremine.dps.ai.intent.ToolOrchestrator
 import com.softwaremine.dps.ai.memory.ActionDetector
 import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
+import com.softwaremine.dps.ai.memory.EpisodicMemoryRecorder
+import com.softwaremine.dps.ai.memory.PreferenceStatementRecognizer
 import com.softwaremine.dps.ai.memory.ReferenceResolver
 import com.softwaremine.dps.ai.memory.TemporalGroundingGuard
 import com.softwaremine.dps.ai.memory.TemporalPhraseResolver
@@ -103,6 +105,7 @@ class SecretaryOrchestrator(
     private val persistentMemoryStore: PersistentMemoryStore,
     private val persistentPreferenceStore: PersistentPreferenceStore,
     private val persistentRecoveryStore: PersistentRecoveryStore,
+    private val episodicMemoryRecorder: EpisodicMemoryRecorder,
     private val logger: DpsLogger,
     private val zone: ZoneId = ZoneId.systemDefault(),
     private val now: () -> Long = System::currentTimeMillis,
@@ -288,6 +291,8 @@ class SecretaryOrchestrator(
 
     /** [handle]'s own pre-M5-B body — see that function's doc for why this split exists. */
     private suspend fun handleInternal(userMessage: String, recentContext: String? = null): ToolOrchestrator.Outcome {
+        recordDefaultLeadMinutesIfStated(userMessage)
+
         pendingContactSelection?.let { return resolveContactSelection(userMessage, it) }
         pendingConfirmation?.let { return resolveConfirmation(userMessage, it) }
         pendingTypeDisambiguation?.let { return resolveTypeDisambiguation(userMessage, it) }
@@ -317,6 +322,22 @@ class SecretaryOrchestrator(
         }
 
         return handleSingleStep(userMessage, steps.single(), awaiting)
+    }
+
+    /**
+     * M6: detects and persists an explicit "always remind me N minutes
+     * before" statement, independent of whatever [userMessage] otherwise
+     * classifies as. See [PreferenceStatementRecognizer]'s own doc for why
+     * this is narrow and deterministic — a plain one-off "remind me 15
+     * minutes before" (no "default"/"hamesha" cue) returns `null` here and
+     * leaves classification and every pending flow below completely
+     * unaffected.
+     */
+    private fun recordDefaultLeadMinutesIfStated(userMessage: String) {
+        val minutes = PreferenceStatementRecognizer.recognizeDefaultLeadMinutes(userMessage, referenceResolver)
+            ?: return
+        val current = persistentPreferenceStore.load()
+        persistentPreferenceStore.save(current.copy(defaultReminderLeadMinutes = minutes))
     }
 
     /** The single-intent path — Stage 1's flow, now feeding into the Stage 2 execution seam. */
@@ -1807,7 +1828,7 @@ class SecretaryOrchestrator(
         SecretaryStateMachine.transition(_state.value, event)
 
     /** Applies memory and state consequences for an outcome produced by [ToolOrchestrator]. */
-    private fun recordOutcome(outcome: ToolOrchestrator.Outcome): ToolOrchestrator.Outcome {
+    private suspend fun recordOutcome(outcome: ToolOrchestrator.Outcome): ToolOrchestrator.Outcome {
         when (outcome) {
             is ToolOrchestrator.Outcome.Handled -> {
                 outcome.intent.type.toolId?.let { toolId ->
@@ -1820,6 +1841,11 @@ class SecretaryOrchestrator(
                             nowMillis = now(),
                         ),
                     )
+                    // M6: episodic logging is independent of, and never gates,
+                    // ConversationMemoryUpdater's own remember() above — see
+                    // EpisodicMemoryRecorder's own doc for why a failed/
+                    // cancelled outcome leaves no episodic trace either.
+                    episodicMemoryRecorder.record(toolId, outcome.result)
                 }
                 _state.value = transition(
                     if (outcome.result.isSuccess) {

@@ -468,4 +468,42 @@ class IntentJsonParserTest {
             assertTrue("parsePlan($input) returned an empty list", steps.isNotEmpty())
         }
     }
+
+    // -----------------------------------------------------------------
+    // M6: remember_fact / recall_fact / forget_fact
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `parses a remember_fact classification`() {
+        val intent = parser.parse(
+            """{"intent":"remember_fact","parameters":{"title":"Bilal","message":"mera developer hai"}}""",
+        )
+
+        assertEquals(IntentType.REMEMBER_FACT, intent.type)
+        assertEquals("Bilal", intent.parameters.title)
+        assertEquals("mera developer hai", intent.parameters.message)
+    }
+
+    @Test
+    fun `parses a recall_fact classification`() {
+        val intent = parser.parse("""{"intent":"recall_fact","parameters":{"title":"Bilal"}}""")
+
+        assertEquals(IntentType.RECALL_FACT, intent.type)
+        assertEquals("Bilal", intent.parameters.title)
+    }
+
+    @Test
+    fun `parses a forget_fact classification`() {
+        val intent = parser.parse("""{"intent":"forget_fact","parameters":{"title":"Bilal"}}""")
+
+        assertEquals(IntentType.FORGET_FACT, intent.type)
+        assertEquals("Bilal", intent.parameters.title)
+    }
+
+    @Test
+    fun `an unrecognized intent name still falls back to conversation, not a memory type`() {
+        val intent = parser.parse("""{"intent":"remember","parameters":{"title":"Bilal"}}""")
+
+        assertEquals(IntentType.CONVERSATION, intent.type)
+    }
 }

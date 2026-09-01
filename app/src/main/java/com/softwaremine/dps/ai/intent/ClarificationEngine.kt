@@ -204,6 +204,14 @@ class ClarificationEngine {
             // requiredFields is empty for REPORT, so this never fires in practice.
             IntentType.REPORT -> "Could you say a bit more?"
 
+            IntentType.REMEMBER_FACT -> when (single) {
+                IntentField.TITLE -> "What should I remember it as?"
+                IntentField.MESSAGE -> "What should I remember about that?"
+                else -> "What would you like me to remember?"
+            }
+            IntentType.RECALL_FACT -> "What would you like me to recall?"
+            IntentType.FORGET_FACT -> "What should I forget?"
+
             // Conversation requires nothing, so this is unreachable in practice.
             IntentType.CONVERSATION -> "Could you say a bit more?"
         }

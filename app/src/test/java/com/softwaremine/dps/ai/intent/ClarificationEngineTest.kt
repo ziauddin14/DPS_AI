@@ -298,4 +298,39 @@ class ClarificationEngineTest {
             (result as ClarificationEngine.Check.Missing).question,
         )
     }
+
+    // -----------------------------------------------------------------
+    // M6: remember_fact / recall_fact / forget_fact
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `remembering a fact with subject and content is complete`() {
+        assertEquals(
+            ClarificationEngine.Check.Complete,
+            check(IntentType.REMEMBER_FACT, IntentParameters(title = "Bilal", message = "mera developer hai")),
+        )
+    }
+
+    @Test
+    fun `remembering a fact with only a subject asks for the content`() {
+        val result = check(IntentType.REMEMBER_FACT, IntentParameters(title = "Bilal"))
+
+        assertTrue(result is ClarificationEngine.Check.Missing)
+        assertEquals(
+            "What should I remember about that?",
+            (result as ClarificationEngine.Check.Missing).question,
+        )
+    }
+
+    @Test
+    fun `recalling or forgetting a fact needs only the subject`() {
+        assertEquals(
+            ClarificationEngine.Check.Complete,
+            check(IntentType.RECALL_FACT, IntentParameters(title = "Bilal")),
+        )
+        assertEquals(
+            ClarificationEngine.Check.Complete,
+            check(IntentType.FORGET_FACT, IntentParameters(title = "Bilal")),
+        )
+    }
 }

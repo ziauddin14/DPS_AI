@@ -143,6 +143,12 @@ class IntentPromptBuilder {
             )
             appendLine("- Multiple actions: use {\"steps\":[{...}]} instead of one object.")
             appendLine(
+                "- Use \"remember_fact\" for an explicit \"remember this\"/\"yaad " +
+                    "rakhna\" request (subject in title, fact in message), " +
+                    "\"recall_fact\" to ask what you remember, \"forget_fact\" to " +
+                    "have it forgotten.",
+            )
+            appendLine(
                 "- If intent is \"conversation\", put your full reply to the user in " +
                     "parameters.reply — never in parameters.message, which is only for " +
                     "text you are sending someone else. Be concise, professional and " +

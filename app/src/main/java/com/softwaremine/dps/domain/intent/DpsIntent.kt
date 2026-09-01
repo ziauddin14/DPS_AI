@@ -83,6 +83,40 @@ enum class IntentType(
     @SerialName("report")
     REPORT("report"),
 
+    // --- M6: long-term memory ---
+
+    /**
+     * "Bilal mera developer hai, yaad rakhna" — an explicit statement of a
+     * durable fact worth keeping beyond this conversation (M6).
+     *
+     * [IntentParameters.title] carries the subject ("Bilal");
+     * [IntentParameters.message] carries the fact itself ("is my
+     * developer"). Deliberately not [IntentField.PERSON]/a new field — see
+     * [com.softwaremine.dps.data.android.tool.AndroidMemoryTool]'s own doc
+     * for why reusing PERSON here would risk misfiring unrelated
+     * contact-grounding logic.
+     */
+    @SerialName("remember_fact")
+    REMEMBER_FACT("remember_fact"),
+
+    /**
+     * "Bilal kaun hai?" — an explicit request to recall what DPS remembers
+     * about a subject (M6). Never triggers a tool call to *change* anything;
+     * read-only, mirroring [IntentType.CONTACT_LOOKUP]'s own read-only shape.
+     */
+    @SerialName("recall_fact")
+    RECALL_FACT("recall_fact"),
+
+    /**
+     * "Bilal wala fact bhula do" — deletes one remembered fact (M6). The
+     * *only* deletion path for long-term memory; deliberately unrelated to
+     * [com.softwaremine.dps.ai.secretary.SecretaryOrchestrator.reset], which
+     * still only forgets the current conversation — see
+     * [com.softwaremine.dps.domain.memory.SemanticFact]'s own doc.
+     */
+    @SerialName("forget_fact")
+    FORGET_FACT("forget_fact"),
+
     /**
      * Not a request for an action — ordinary conversation.
      *
@@ -429,6 +463,26 @@ val IntentType.requiredFields: List<Set<IntentField>>
         // since showing more real data than requested causes no harm.
         IntentType.REPORT -> emptyList()
 
+        // M6: a fact with no subject or no content is not a fact — unlike
+        // TASK's single-field requirement, both TITLE (subject) and MESSAGE
+        // (the fact itself) are mandatory, with no alternative route: there
+        // is nothing else in IntentParameters a subject or a fact's content
+        // could sensibly come from.
+        IntentType.REMEMBER_FACT -> listOf(
+            setOf(IntentField.TITLE, IntentField.MESSAGE),
+        )
+
+        // Read-only lookups by subject — same single-field shape as
+        // CONTACT_LOOKUP's own PERSON-only group, using TITLE instead since
+        // a recalled subject is not necessarily a person.
+        IntentType.RECALL_FACT -> listOf(
+            setOf(IntentField.TITLE),
+        )
+
+        IntentType.FORGET_FACT -> listOf(
+            setOf(IntentField.TITLE),
+        )
+
         // Conversation needs nothing; it is not routed to a tool.
         IntentType.CONVERSATION -> emptyList()
     }
@@ -455,5 +509,8 @@ val IntentType.toolId: ToolId?
         IntentType.MEETING_NOTE -> ToolId.MEETING
         IntentType.ACTION_ITEM -> ToolId.ACTION_ITEM
         IntentType.REPORT -> ToolId.REPORT
+        IntentType.REMEMBER_FACT -> ToolId.MEMORY
+        IntentType.RECALL_FACT -> ToolId.MEMORY
+        IntentType.FORGET_FACT -> ToolId.MEMORY
         IntentType.CONVERSATION -> null
     }

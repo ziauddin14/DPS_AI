@@ -137,6 +137,7 @@ class SecretaryLiveWiringProductivityInstrumentedTest {
             persistentMemoryStore = PersistentMemoryStore(FakeSharedPreferences(), silentLogger),
             persistentPreferenceStore = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger),
             persistentRecoveryStore = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger),
+            episodicMemoryRecorder = container.episodicMemoryRecorder,
             logger = silentLogger,
         )
     }

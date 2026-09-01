@@ -8,6 +8,7 @@ import com.softwaremine.dps.ai.intent.ToolOrchestrator
 import com.softwaremine.dps.ai.intent.ToolSelector
 import com.softwaremine.dps.ai.memory.ActionDetector
 import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
+import com.softwaremine.dps.ai.memory.EpisodicMemoryRecorder
 import com.softwaremine.dps.ai.memory.ReferenceResolver
 import com.softwaremine.dps.ai.memory.TemporalGroundingGuard
 import com.softwaremine.dps.ai.memory.TemporalPhraseSpanFinder
@@ -21,9 +22,15 @@ import com.softwaremine.dps.ai.tool.DefaultToolRegistry
 import com.softwaremine.dps.core.error.DpsError
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.core.result.DpsResult
+import com.softwaremine.dps.data.android.memory.LongTermMemoryStore
 import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
+import com.softwaremine.dps.data.android.memory.episodic.EpisodicMemoryDao
+import com.softwaremine.dps.data.android.memory.episodic.EpisodicMemoryEntity
+import com.softwaremine.dps.data.android.memory.semantic.SemanticFactDao
+import com.softwaremine.dps.data.android.memory.semantic.SemanticFactEntity
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
+import com.softwaremine.dps.data.android.tool.AndroidMemoryTool
 import com.softwaremine.dps.domain.ai.AiCompletion
 import com.softwaremine.dps.domain.ai.AiEngine
 import com.softwaremine.dps.domain.ai.AiState
@@ -207,6 +214,49 @@ class SecretaryOrchestratorTest {
         }
     }
 
+    /** In-memory M6 DAO fakes — these tests exercise orchestration, not persistence, so a real Room database is unnecessary. */
+    private class FakeSemanticFactDao : SemanticFactDao {
+        private val facts = mutableListOf<SemanticFactEntity>()
+        private var nextId = 1L
+        override suspend fun insert(fact: SemanticFactEntity): Long {
+            val assigned = fact.copy(id = nextId++)
+            facts += assigned
+            return assigned.id
+        }
+        override suspend fun findBySubject(subjectQuery: String): List<SemanticFactEntity> =
+            facts.filter { it.subject.contains(subjectQuery, ignoreCase = true) }.sortedByDescending { it.createdAtMillis }
+        override suspend fun findAll(): List<SemanticFactEntity> = facts.sortedByDescending { it.createdAtMillis }
+        override suspend fun delete(fact: SemanticFactEntity): Int = if (facts.removeAll { it.id == fact.id }) 1 else 0
+        override suspend fun deleteById(id: Long): Int = if (facts.removeAll { it.id == id }) 1 else 0
+    }
+
+    private class FakeEpisodicMemoryDao : EpisodicMemoryDao {
+        val entries = mutableListOf<EpisodicMemoryEntity>()
+        private var nextId = 1L
+        override suspend fun insert(entry: EpisodicMemoryEntity): Long {
+            val assigned = entry.copy(id = nextId++)
+            entries += assigned
+            return assigned.id
+        }
+        override suspend fun findInRange(fromMillis: Long, toMillis: Long, limit: Int): List<EpisodicMemoryEntity> =
+            entries.filter { it.timestampMillis in fromMillis..toMillis }.sortedByDescending { it.timestampMillis }.take(limit)
+        override suspend fun findByKeyword(keyword: String, limit: Int): List<EpisodicMemoryEntity> =
+            entries.filter { it.summary.contains(keyword, ignoreCase = true) }.sortedByDescending { it.timestampMillis }.take(limit)
+        override suspend fun count(): Int = entries.size
+        override suspend fun deleteOlderThan(cutoffMillis: Long): Int {
+            val before = entries.size
+            entries.removeAll { it.timestampMillis < cutoffMillis }
+            return before - entries.size
+        }
+        override suspend fun deleteOldestBeyond(keepNewest: Int): Int {
+            if (entries.size <= keepNewest) return 0
+            val toKeep = entries.sortedByDescending { it.id }.take(keepNewest).map { it.id }.toSet()
+            val before = entries.size
+            entries.removeAll { it.id !in toKeep }
+            return before - entries.size
+        }
+    }
+
     private val zone: ZoneId = ZoneId.of("Asia/Karachi")
 
     private fun secretary(
@@ -218,6 +268,9 @@ class SecretaryOrchestratorTest {
         persistentMemoryStore: PersistentMemoryStore = PersistentMemoryStore(FakeSharedPreferences(), silentLogger),
         persistentPreferenceStore: PersistentPreferenceStore = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger),
         persistentRecoveryStore: PersistentRecoveryStore = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger),
+        episodicMemoryRecorder: EpisodicMemoryRecorder = EpisodicMemoryRecorder(
+            LongTermMemoryStore(FakeSemanticFactDao(), FakeEpisodicMemoryDao(), silentLogger),
+        ),
     ): SecretaryOrchestrator {
         val registry = DefaultToolRegistry(silentLogger).apply { tools.forEach(::register) }
         val executor = DefaultToolExecutor(
@@ -260,6 +313,7 @@ class SecretaryOrchestratorTest {
             persistentMemoryStore = persistentMemoryStore,
             persistentPreferenceStore = persistentPreferenceStore,
             persistentRecoveryStore = persistentRecoveryStore,
+            episodicMemoryRecorder = episodicMemoryRecorder,
             logger = silentLogger,
             zone = zone,
             now = now,
@@ -3020,6 +3074,102 @@ class SecretaryOrchestratorTest {
 
         assertEquals(ConversationMemory.EMPTY, orchestrator.memory.value)
         assertEquals(ConversationMemory.EMPTY, store.load())
+    }
+
+    // -----------------------------------------------------------------
+    // M6: long-term memory
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `a successful tool call is logged to episodic memory`() = runTest {
+        val episodicDao = FakeEpisodicMemoryDao()
+        val recorder = EpisodicMemoryRecorder(LongTermMemoryStore(FakeSemanticFactDao(), episodicDao, silentLogger))
+        val task = taskTool()
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"task","parameters":{"title":"kickoff"}}"""))
+        val orchestrator = secretary(engine, listOf(task), episodicMemoryRecorder = recorder)
+
+        orchestrator.handle("kickoff ka task bana do")
+
+        assertEquals(1, episodicDao.entries.size)
+        assertEquals(ToolId.TASK.toolName, episodicDao.entries.single().toolId)
+    }
+
+    @Test
+    fun `a failed tool call leaves no episodic trace`() = runTest {
+        val episodicDao = FakeEpisodicMemoryDao()
+        val recorder = EpisodicMemoryRecorder(LongTermMemoryStore(FakeSemanticFactDao(), episodicDao, silentLogger))
+        val failingReminder = reminderTool { ToolResult.Failure("boom", retryable = false) }
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","raw_when":"16:00"}}"""))
+        val orchestrator = secretary(engine, listOf(failingReminder), episodicMemoryRecorder = recorder)
+
+        orchestrator.handle("remind me at 16:00")
+
+        assertTrue(episodicDao.entries.isEmpty())
+    }
+
+    @Test
+    fun `remembering a fact, then recalling it, then forgetting it works end to end`() = runTest {
+        val memoryStore = LongTermMemoryStore(FakeSemanticFactDao(), FakeEpisodicMemoryDao(), silentLogger)
+        val memoryTool = AndroidMemoryTool(memoryStore)
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"remember_fact","parameters":{"title":"Bilal","message":"mera developer hai"}}"""),
+            DpsResult.Success("""{"intent":"recall_fact","parameters":{"title":"Bilal"}}"""),
+            DpsResult.Success("""{"intent":"forget_fact","parameters":{"title":"Bilal"}}"""),
+        )
+        val orchestrator = secretary(engine, listOf(memoryTool))
+
+        val remembered = orchestrator.handle("Bilal mera developer hai, yaad rakhna")
+        assertTrue("Expected the fact to be remembered, got $remembered", remembered is ToolOrchestrator.Outcome.Handled)
+
+        val recalled = orchestrator.handle("Bilal kaun hai?")
+        assertTrue(recalled is ToolOrchestrator.Outcome.Handled)
+        assertTrue(
+            "Expected the recalled reply to mention the stored fact, got ${(recalled as ToolOrchestrator.Outcome.Handled).reply}",
+            recalled.reply.contains("mera developer hai"),
+        )
+
+        val forgotten = orchestrator.handle("Bilal ke baare mein bhool jao")
+        assertTrue(forgotten is ToolOrchestrator.Outcome.Handled)
+        assertTrue(memoryStore.recallFacts("Bilal").isEmpty())
+    }
+
+    @Test
+    fun `remembering a disallowed fact fails honestly rather than storing it`() = runTest {
+        val memoryStore = LongTermMemoryStore(FakeSemanticFactDao(), FakeEpisodicMemoryDao(), silentLogger)
+        val memoryTool = AndroidMemoryTool(memoryStore)
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"remember_fact","parameters":{"title":"card","message":"the card number is 4111111111111111"}}"""),
+        )
+        val orchestrator = secretary(engine, listOf(memoryTool))
+
+        orchestrator.handle("mera card number yaad rakhna")
+
+        assertTrue(memoryStore.allFacts().isEmpty())
+    }
+
+    @Test
+    fun `an explicit default lead time statement is persisted as a preference`() = runTest {
+        val prefsPrefs = FakeSharedPreferences()
+        val preferenceStore = PersistentPreferenceStore(prefsPrefs, silentLogger)
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"conversation"}"""))
+        val orchestrator = secretary(engine, emptyList(), persistentPreferenceStore = preferenceStore)
+
+        orchestrator.handle("hamesha 15 minute pehle reminder dena")
+
+        assertEquals(15, preferenceStore.load().defaultReminderLeadMinutes)
+    }
+
+    @Test
+    fun `an ordinary one-off lead time never changes the persisted default`() = runTest {
+        val prefsPrefs = FakeSharedPreferences()
+        val preferenceStore = PersistentPreferenceStore(prefsPrefs, silentLogger)
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"reminder","parameters":{"title":"x","raw_when":"16:00"}}"""))
+        val orchestrator = secretary(engine, listOf(reminder), persistentPreferenceStore = preferenceStore)
+
+        orchestrator.handle("remind me 15 minutes before at 16:00")
+
+        assertNull(preferenceStore.load().defaultReminderLeadMinutes)
     }
 
     // -----------------------------------------------------------------

@@ -69,6 +69,14 @@ class AndroidToolsInstrumentedTest {
         assertTrue(registry.find(ToolId.REMINDER) is AndroidReminderTool)
     }
 
+    /** M6: the memory tool must be wired as a real implementation in the actual DI graph, not merely in a test-constructed instance. */
+    @Test
+    fun m6MemoryToolIsRegisteredAsARealImplementation() {
+        val registry = container().toolRegistry
+
+        assertTrue(registry.find(ToolId.MEMORY) is AndroidMemoryTool)
+    }
+
     /**
      * Tools outside every implemented phase must remain declarations.
      *

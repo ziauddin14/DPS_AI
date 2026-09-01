@@ -713,6 +713,7 @@ class GgufInferenceInstrumentedTest {
             persistentMemoryStore = PersistentMemoryStore.create(context, diagnosticLogger),
             persistentPreferenceStore = PersistentPreferenceStore.create(context, diagnosticLogger),
             persistentRecoveryStore = PersistentRecoveryStore.create(context, diagnosticLogger),
+            episodicMemoryRecorder = container.episodicMemoryRecorder,
             logger = diagnosticLogger,
         )
     }
@@ -918,6 +919,7 @@ class GgufInferenceInstrumentedTest {
             persistentMemoryStore = PersistentMemoryStore.create(context, diagnosticLogger),
             persistentPreferenceStore = PersistentPreferenceStore.create(context, diagnosticLogger),
             persistentRecoveryStore = PersistentRecoveryStore.create(context, diagnosticLogger),
+            episodicMemoryRecorder = container.episodicMemoryRecorder,
             logger = diagnosticLogger,
         )
 

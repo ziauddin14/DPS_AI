@@ -18,6 +18,7 @@ import com.softwaremine.dps.ai.intent.ToolResponseGenerator
 import com.softwaremine.dps.ai.intent.ToolSelector
 import com.softwaremine.dps.ai.memory.ActionDetector
 import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
+import com.softwaremine.dps.ai.memory.EpisodicMemoryRecorder
 import com.softwaremine.dps.ai.memory.ReferenceResolver
 import com.softwaremine.dps.ai.memory.TemporalGroundingGuard
 import com.softwaremine.dps.ai.memory.TemporalPhraseResolver
@@ -33,6 +34,8 @@ import com.softwaremine.dps.ai.tool.DefaultToolRegistry
 import com.softwaremine.dps.data.android.calendar.CalendarWriter
 import com.softwaremine.dps.data.android.contacts.AndroidContactRepository
 import com.softwaremine.dps.data.android.intent.IntentLauncher
+import com.softwaremine.dps.data.android.memory.DpsMemoryDatabase
+import com.softwaremine.dps.data.android.memory.LongTermMemoryStore
 import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.notification.NotificationPresenter
 import com.softwaremine.dps.data.android.permission.AndroidPermissionManager
@@ -49,6 +52,7 @@ import com.softwaremine.dps.data.android.tool.AndroidCalendarTool
 import com.softwaremine.dps.data.android.tool.AndroidCallTool
 import com.softwaremine.dps.data.android.tool.AndroidContactsTool
 import com.softwaremine.dps.data.android.tool.AndroidMeetingNoteTool
+import com.softwaremine.dps.data.android.tool.AndroidMemoryTool
 import com.softwaremine.dps.data.android.tool.AndroidNotificationTool
 import com.softwaremine.dps.data.android.tool.AndroidReminderTool
 import com.softwaremine.dps.data.android.tool.AndroidReportTool
@@ -323,6 +327,30 @@ class AiContainer(private val applicationContext: Context) {
         PersistentRecoveryStore.create(applicationContext, logger)
     }
 
+    /**
+     * The one Room database in this codebase (M6) — scoped entirely to
+     * long-term memory; see [DpsMemoryDatabase]'s own doc for why the ten
+     * `SharedPreferences`-backed stores above and below it are not migrated.
+     */
+    private val dpsMemoryDatabase by lazy { DpsMemoryDatabase.create(applicationContext) }
+
+    /** M6: the repository above [dpsMemoryDatabase]'s two DAOs — see its own doc. */
+    private val longTermMemoryStore by lazy {
+        LongTermMemoryStore(
+            semanticFactDao = dpsMemoryDatabase.semanticFactDao(),
+            episodicMemoryDao = dpsMemoryDatabase.episodicMemoryDao(),
+            logger = logger,
+        )
+    }
+
+    /**
+     * M6: logs every other tool's successful outcome to episodic memory.
+     * Public like [toolExecutor]/[toolRegistry] — instrumented tests that
+     * construct their own [SecretaryOrchestrator] against a scripted engine
+     * reuse this real, on-device instance rather than a second one.
+     */
+    val episodicMemoryRecorder by lazy { EpisodicMemoryRecorder(longTermMemoryStore) }
+
     private val taskStore by lazy { AndroidTaskStore(applicationContext, logger) }
     private val workLogStore by lazy { AndroidWorkLogStore(applicationContext, logger) }
     private val meetingNoteStore by lazy { AndroidMeetingNoteStore(applicationContext, logger) }
@@ -356,6 +384,8 @@ class AiContainer(private val applicationContext: Context) {
                     AndroidMeetingNoteTool(meetingNoteStore),
                     AndroidActionItemTool(actionItemStore),
                     AndroidReportTool(taskStore, workLogStore, meetingNoteStore, actionItemStore, ReportGenerator()),
+                    // M6 -- long-term memory
+                    AndroidMemoryTool(longTermMemoryStore),
                 ),
             )
         }
@@ -432,6 +462,7 @@ class AiContainer(private val applicationContext: Context) {
             persistentMemoryStore = persistentMemoryStore,
             persistentPreferenceStore = persistentPreferenceStore,
             persistentRecoveryStore = persistentRecoveryStore,
+            episodicMemoryRecorder = episodicMemoryRecorder,
             logger = logger,
         )
     }

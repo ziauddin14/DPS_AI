@@ -116,6 +116,29 @@ class ToolSelector(
             IntentType.ACTION_ITEM -> actionItemCall(intent.action, p)
             IntentType.REPORT -> reportCall(p)
 
+            // M6. `title` carries the fact's subject, `message` its content —
+            // see IntentType.REMEMBER_FACT's own doc for why not `person`.
+            IntentType.REMEMBER_FACT -> ToolCall(
+                toolId = ToolId.MEMORY,
+                operation = "remember_fact",
+                arguments = buildMap {
+                    put("title", p.value(IntentField.TITLE).orEmpty())
+                    put("message", p.value(IntentField.MESSAGE).orEmpty())
+                },
+            )
+
+            IntentType.RECALL_FACT -> ToolCall(
+                toolId = ToolId.MEMORY,
+                operation = "recall_fact",
+                arguments = buildMap { put("title", p.value(IntentField.TITLE).orEmpty()) },
+            )
+
+            IntentType.FORGET_FACT -> ToolCall(
+                toolId = ToolId.MEMORY,
+                operation = "forget_fact",
+                arguments = buildMap { put("title", p.value(IntentField.TITLE).orEmpty()) },
+            )
+
             IntentType.CONVERSATION -> null
         }
     }

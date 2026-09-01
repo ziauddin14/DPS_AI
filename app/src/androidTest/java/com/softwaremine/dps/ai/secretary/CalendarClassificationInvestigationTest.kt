@@ -115,6 +115,7 @@ class CalendarClassificationInvestigationTest {
             persistentMemoryStore = PersistentMemoryStore.create(context, silentLogger),
             persistentPreferenceStore = PersistentPreferenceStore.create(context, silentLogger),
             persistentRecoveryStore = PersistentRecoveryStore.create(context, silentLogger),
+            episodicMemoryRecorder = container.episodicMemoryRecorder,
             logger = silentLogger,
         )
     }

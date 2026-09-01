@@ -544,4 +544,43 @@ class ToolSelectorTest {
         assertEquals("list_events", call.operation)
         assertNull(call.arguments["date"])
     }
+
+    // -----------------------------------------------------------------
+    // M6: remember_fact / recall_fact / forget_fact
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `remember_fact routes to the memory tool with subject as title and content as message`() {
+        val call = selector.select(
+            intent(IntentType.REMEMBER_FACT, IntentParameters(title = "Bilal", message = "mera developer hai")),
+        )!!
+
+        assertEquals(ToolId.MEMORY, call.toolId)
+        assertEquals("remember_fact", call.operation)
+        assertEquals("Bilal", call.arguments["title"])
+        assertEquals("mera developer hai", call.arguments["message"])
+    }
+
+    @Test
+    fun `recall_fact routes to the memory tool with only the subject`() {
+        val call = selector.select(
+            intent(IntentType.RECALL_FACT, IntentParameters(title = "Bilal")),
+        )!!
+
+        assertEquals(ToolId.MEMORY, call.toolId)
+        assertEquals("recall_fact", call.operation)
+        assertEquals("Bilal", call.arguments["title"])
+        assertNull(call.arguments["message"])
+    }
+
+    @Test
+    fun `forget_fact routes to the memory tool with only the subject`() {
+        val call = selector.select(
+            intent(IntentType.FORGET_FACT, IntentParameters(title = "Bilal")),
+        )!!
+
+        assertEquals(ToolId.MEMORY, call.toolId)
+        assertEquals("forget_fact", call.operation)
+        assertEquals("Bilal", call.arguments["title"])
+    }
 }
