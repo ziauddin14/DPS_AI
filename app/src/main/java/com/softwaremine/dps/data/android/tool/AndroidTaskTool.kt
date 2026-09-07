@@ -96,24 +96,34 @@ class AndroidTaskTool(
             ),
         )
 
-        repository.save(
-            Task(
-                id = id,
-                title = title,
-                notes = call.argument(ARG_NOTES),
-                priority = parsePriority(call.argument(ARG_PRIORITY)),
-                dueAtMillis = call.argument(ARG_DUE)?.toLongOrNull(),
-                createdAtMillis = nowMillis,
-                updatedAtMillis = nowMillis,
-            ),
+        val task = Task(
+            id = id,
+            title = title,
+            notes = call.argument(ARG_NOTES),
+            priority = parsePriority(call.argument(ARG_PRIORITY)),
+            dueAtMillis = call.argument(ARG_DUE)?.toLongOrNull(),
+            createdAtMillis = nowMillis,
+            updatedAtMillis = nowMillis,
         )
+        repository.save(task)
 
         // Confirmed success — the checkpoint has done its job.
         recoveryStore.clearCheckpoint()
 
         return ToolResult.Success(
             summary = "Task \"$title\" added.",
-            data = mapOf("task_id" to id.toString()),
+            // M7: notes/priority/due are echoed back only when this create
+            // actually resolved one — never a synthesized default — so
+            // com.softwaremine.dps.data.android.secretary.ExecutionVerifier
+            // can compare against exactly the values this call itself
+            // computed, rather than recomputing parsePriority()'s mapping
+            // or the model's raw date/time strings a second time elsewhere.
+            data = buildMap {
+                put("task_id", id.toString())
+                task.notes?.let { put("notes", it) }
+                task.priority?.let { put("priority", it.name) }
+                task.dueAtMillis?.let { put("due_millis", it.toString()) }
+            },
         )
     }
 

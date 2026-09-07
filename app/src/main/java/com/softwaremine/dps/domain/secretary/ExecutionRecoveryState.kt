@@ -224,3 +224,94 @@ enum class OperationType {
     CREATE_REMINDER,
     CREATE_EVENT,
 }
+
+/**
+ * A durable record that a tool reported [com.softwaremine.dps.domain.tool.ToolResult.Success]
+ * for a create operation and the resulting real-world state has not yet
+ * been independently observed and compared (M7).
+ *
+ * ## Why this exists alongside [OperationCheckpoint], not merged into it
+ * [OperationCheckpoint] answers "did the create dispatch itself ever
+ * finish" — written *before* the tool's real side effect, cleared the
+ * instant the tool returns *any* confirmed outcome, success or failure
+ * (see [AndroidTaskTool][com.softwaremine.dps.data.android.tool.AndroidTaskTool]'s
+ * own doc). This type answers the next question, which only exists once
+ * that one is already settled: "the tool confirmed success — has that
+ * claim actually been checked against reality yet." The two windows are
+ * sequential and non-overlapping: a given create operation is covered by
+ * at most one of the two at any instant, never both.
+ *
+ * ## Why this has no freshness/expiry concept, unlike every sibling `Pending*` type
+ * [PendingConfirmation]/[PendingContactSelection]/[PendingTypeDisambiguation]/
+ * [PendingPlan] all gate a *conversational* resume that implies renewed
+ * user consent — a "yes" five minutes into an unrelated exchange no longer
+ * means what it meant when asked. Resolving a pending verification implies
+ * no consent and takes no action of its own: it is a **read-only**
+ * observation of state the create operation already, irreversibly,
+ * produced or did not produce. There is nothing about the passage of time
+ * that makes reading and comparing that state less safe or less honest, so
+ * — deliberately, per M7's own locked scope — no `isFresh()` exists here
+ * and none should be added.
+ *
+ * ## Persisted here, in [com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore],
+ * not a new store
+ * Same file (`dps_execution_recovery`), a third sibling key alongside
+ * `state`/`checkpoint` — this class already holds two different
+ * single-slot "an uncertainty exists until resolved" records; a third of
+ * the same shape belongs with them rather than in a new store built only
+ * to hold one more JSON blob.
+ */
+@Serializable
+sealed interface PendingVerification {
+    val requestedAtMillis: Long
+
+    /**
+     * A pending verification for a `create_task` call.
+     *
+     * @param taskId [com.softwaremine.dps.domain.productivity.Task.id] as
+     *   reported in [com.softwaremine.dps.domain.tool.ToolResult.Success.data]'s
+     *   `task_id` entry — the real, already-persisted identity, never a
+     *   generated or guessed one.
+     * @param expectedTitle the title the user actually asked for, read
+     *   directly from the intent's own parameters — never re-derived.
+     * @param expectedNotes/[expectedPriority]/[expectedDueMillis] `null`
+     *   means "the user did not ask for this field" — a field DPS never
+     *   asked the user for is never verified, per M7's own locked
+     *   instruction not to invent expectations. Never a synthesized
+     *   default: see [com.softwaremine.dps.data.android.tool.AndroidTaskTool]'s
+     *   own doc for exactly where each of these is echoed back into the
+     *   tool's own [com.softwaremine.dps.domain.tool.ToolResult.Success.data]
+     *   at the moment it was computed, rather than recomputed a second
+     *   time here.
+     */
+    @Serializable
+    data class Task(
+        val taskId: Int,
+        val expectedTitle: String,
+        val expectedNotes: String? = null,
+        val expectedPriority: String? = null,
+        val expectedDueMillis: Long? = null,
+        override val requestedAtMillis: Long,
+    ) : PendingVerification
+
+    /**
+     * A pending verification for a `create_event` call.
+     *
+     * @param eventId the Calendar Provider's own real, assigned id — see
+     *   [com.softwaremine.dps.data.android.tool.AndroidCalendarTool]'s doc.
+     * @param expectedStartMillis/[expectedEndMillis] the exact `Long`
+     *   values [com.softwaremine.dps.data.android.tool.AndroidCalendarTool.createEvent]
+     *   itself used for the insert, echoed back rather than recomputed —
+     *   see that class's own doc for why recomputing via
+     *   [com.softwaremine.dps.ai.intent.ToolSelector.resolveInstant] a
+     *   second time was rejected.
+     */
+    @Serializable
+    data class CalendarEvent(
+        val eventId: Long,
+        val expectedTitle: String,
+        val expectedStartMillis: Long,
+        val expectedEndMillis: Long,
+        override val requestedAtMillis: Long,
+    ) : PendingVerification
+}

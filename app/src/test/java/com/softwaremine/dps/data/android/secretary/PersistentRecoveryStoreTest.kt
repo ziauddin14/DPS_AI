@@ -11,6 +11,7 @@ import com.softwaremine.dps.domain.intent.IntentType
 import com.softwaremine.dps.domain.secretary.ExecutionRecoveryState
 import com.softwaremine.dps.domain.secretary.OperationCheckpoint
 import com.softwaremine.dps.domain.secretary.OperationType
+import com.softwaremine.dps.domain.secretary.PendingVerification
 import com.softwaremine.dps.domain.secretary.PersistedDisambiguationCandidate
 import com.softwaremine.dps.domain.secretary.PersistedPendingPlan
 import com.softwaremine.dps.domain.secretary.PersistedPendingState
@@ -501,6 +502,135 @@ class PersistentRecoveryStoreTest {
         val store = PersistentRecoveryStore(prefs, silentLogger)
 
         assertEquals(taskCheckpoint, store.loadCheckpoint())
+    }
+
+    // -----------------------------------------------------------------
+    // M7 — PendingVerification
+    // -----------------------------------------------------------------
+
+    private val taskVerification = PendingVerification.Task(
+        taskId = 7,
+        expectedTitle = "Submit report",
+        requestedAtMillis = 1_000L,
+    )
+
+    private val calendarVerification = PendingVerification.CalendarEvent(
+        eventId = 99L,
+        expectedTitle = "Team sync",
+        expectedStartMillis = 2_000L,
+        expectedEndMillis = 5_600_000L,
+        requestedAtMillis = 3_000L,
+    )
+
+    @Test
+    fun `a store with nothing saved yet has no pending verification`() {
+        val store = freshStore()
+
+        assertNull(store.loadVerification())
+    }
+
+    @Test
+    fun `a task pending verification survives a save-then-load round-trip exactly`() {
+        val store = freshStore()
+
+        store.saveVerification(taskVerification)
+
+        assertEquals(taskVerification, store.loadVerification())
+    }
+
+    @Test
+    fun `a calendar pending verification survives a save-then-load round-trip exactly`() {
+        val store = freshStore()
+
+        store.saveVerification(calendarVerification)
+
+        assertEquals(calendarVerification, store.loadVerification())
+    }
+
+    @Test
+    fun `a task pending verification with every optional field present round-trips exactly`() {
+        val store = freshStore()
+        val fullySpecified = taskVerification.copy(
+            expectedNotes = "call the vendor first",
+            expectedPriority = "HIGH",
+            expectedDueMillis = 9_000L,
+        )
+
+        store.saveVerification(fullySpecified)
+
+        assertEquals(fullySpecified, store.loadVerification())
+    }
+
+    @Test
+    fun `clearing the pending verification removes it`() {
+        val store = freshStore()
+        store.saveVerification(taskVerification)
+
+        store.clearVerification()
+
+        assertNull(store.loadVerification())
+    }
+
+    @Test
+    fun `saving a second pending verification replaces the first entirely`() {
+        val store = freshStore()
+
+        store.saveVerification(taskVerification)
+        store.saveVerification(calendarVerification)
+
+        assertEquals(calendarVerification, store.loadVerification())
+    }
+
+    @Test
+    fun `a fresh store reconstruction detects an uncleared pending verification left by an earlier instance`() {
+        val prefs = FakeSharedPreferences()
+        PersistentRecoveryStore(prefs, silentLogger).saveVerification(taskVerification)
+
+        // The object-level analogue of "a fresh process finds what an
+        // earlier process left mid-flight" — the genuine process-death
+        // version of this exact scenario is the instrumented suite's job.
+        val reconstructed = PersistentRecoveryStore(prefs, silentLogger)
+
+        assertEquals(taskVerification, reconstructed.loadVerification())
+    }
+
+    @Test
+    fun `a fresh store reconstruction after a durable clear finds no pending verification`() {
+        val prefs = FakeSharedPreferences()
+        val writer = PersistentRecoveryStore(prefs, silentLogger)
+        writer.saveVerification(taskVerification)
+        writer.clearVerification()
+
+        val reconstructed = PersistentRecoveryStore(prefs, silentLogger)
+
+        assertNull(
+            "A durably cleared pending verification must never resurface for a fresh instance",
+            reconstructed.loadVerification(),
+        )
+    }
+
+    @Test
+    fun `the pending verification is independent of the checkpoint and the pending-state record`() {
+        val store = freshStore()
+        val recoveryState = ExecutionRecoveryState(PersistedPendingState.Confirmation(sampleIntent, 1_000L), null)
+
+        store.save(recoveryState)
+        store.saveCheckpoint(taskCheckpoint)
+        store.saveVerification(taskVerification)
+
+        store.clearCheckpoint()
+
+        assertEquals("Clearing the checkpoint must not clear the pending verification", taskVerification, store.loadVerification())
+        assertEquals("Clearing the checkpoint must not clear the pending-state record", recoveryState, store.load())
+
+        store.clear()
+
+        assertNull("Clearing the pending-state record must leave the checkpoint already-cleared state as is", store.loadCheckpoint())
+        assertEquals("Clearing the pending-state record must not clear the pending verification", taskVerification, store.loadVerification())
+
+        store.clearVerification()
+
+        assertNull("The pending verification must actually clear when asked to", store.loadVerification())
     }
 
     /**

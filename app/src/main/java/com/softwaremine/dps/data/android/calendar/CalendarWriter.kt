@@ -49,7 +49,7 @@ import com.softwaremine.dps.core.logging.DpsLogger
 class CalendarWriter(
     private val context: Context,
     private val logger: DpsLogger,
-) {
+) : CalendarEventReader {
 
     /** Outcome of looking for somewhere to write. */
     sealed interface CalendarTarget {
@@ -254,6 +254,73 @@ class CalendarWriter(
         } catch (throwable: Throwable) {
             logger.w(TAG, "Could not read event id=$eventId before updating", throwable)
             null
+        }
+    }
+
+    /**
+     * Reads [eventId]'s title, start and end for M7 post-create verification.
+     *
+     * ## Why this is not [readEvent] extended
+     * [readEvent] is documented to return `null` for *either* "the event no
+     * longer exists" *or* "the provider is unavailable" — a distinction M7
+     * needs to keep ([VerificationOutcome.NotFound][com.softwaremine.dps.domain.secretary.VerificationOutcome.NotFound]
+     * versus [VerificationOutcome.ObservationFailed][com.softwaremine.dps.domain.secretary.VerificationOutcome.ObservationFailed]
+     * are different, individually honest things to tell the user). Every
+     * *other* read/write method in this file already reports a proper
+     * sealed outcome ([CalendarTarget], [InsertOutcome], [QueryOutcome],
+     * [MutationOutcome]) — this method follows that dominant convention
+     * rather than [readEvent]'s older, simpler one.
+     * [readEvent]/[EventTimes] and [AndroidCalendarTool.updateEvent]'s own
+     * reschedule-duration-preservation logic that depends on them are
+     * untouched by this addition.
+     *
+     * ## Excluding `DELETED = 1`
+     * Mirrors [findEvents]'s own exact reasoning: an application delete
+     * flags a row rather than removing it until the next sync, so a
+     * direct id lookup with no filter would still find an event DPS (or
+     * the user) already deleted. Filtered here too, so a since-deleted
+     * event correctly verifies as [CalendarEventReader.EventSnapshotOutcome.NotFound],
+     * not [CalendarEventReader.EventSnapshotOutcome.Found].
+     */
+    override fun readEventSnapshot(eventId: Long): CalendarEventReader.EventSnapshotOutcome {
+        val uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, eventId)
+        val projection = arrayOf(
+            CalendarContract.Events.TITLE,
+            CalendarContract.Events.DTSTART,
+            CalendarContract.Events.DTEND,
+        )
+
+        return try {
+            val cursor = context.contentResolver.query(
+                uri,
+                projection,
+                "${CalendarContract.Events.DELETED} != 1",
+                null,
+                null,
+            )
+                // A null cursor means no calendar provider is registered at
+                // all — genuinely different from "this event id does not
+                // exist," and per this codebase's own Failure/Error
+                // distinction, not something the model or the user caused,
+                // so it is an observation failure, never NotFound.
+                ?: return CalendarEventReader.EventSnapshotOutcome.Failed("This device has no calendar app available.")
+
+            cursor.use {
+                if (!it.moveToFirst()) return CalendarEventReader.EventSnapshotOutcome.NotFound
+
+                val snapshot = CalendarEventReader.EventSnapshot(
+                    title = it.getString(it.getColumnIndexOrThrow(CalendarContract.Events.TITLE)).orEmpty(),
+                    startMillis = it.getLong(it.getColumnIndexOrThrow(CalendarContract.Events.DTSTART)),
+                    endMillis = it.getLong(it.getColumnIndexOrThrow(CalendarContract.Events.DTEND)),
+                )
+                CalendarEventReader.EventSnapshotOutcome.Found(snapshot)
+            }
+        } catch (security: SecurityException) {
+            logger.w(TAG, "Calendar snapshot read denied", security)
+            CalendarEventReader.EventSnapshotOutcome.Failed("Calendar access was denied.")
+        } catch (throwable: Throwable) {
+            logger.e(TAG, "Calendar snapshot read failed", throwable)
+            CalendarEventReader.EventSnapshotOutcome.Failed(throwable.message ?: "Could not read the event.")
         }
     }
 

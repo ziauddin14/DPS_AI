@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.domain.secretary.ExecutionRecoveryState
 import com.softwaremine.dps.domain.secretary.OperationCheckpoint
+import com.softwaremine.dps.domain.secretary.PendingVerification
 import kotlinx.serialization.json.Json
 
 /**
@@ -157,11 +158,61 @@ class PersistentRecoveryStore(
         logger.d(TAG, "Cleared operation checkpoint (durably, committed=$committed)")
     }
 
+    /**
+     * The persisted pending verification (M7) — a tool already confirmed
+     * [com.softwaremine.dps.domain.tool.ToolResult.Success] for a create
+     * operation, and the resulting real-world state has not yet been
+     * independently observed and compared. `null` when none is
+     * outstanding or the stored value is unreadable. See
+     * [PendingVerification]'s own doc for why this is a third sibling slot
+     * in this same class/file rather than a new store.
+     */
+    fun loadVerification(): PendingVerification? {
+        val raw = prefs.getString(KEY_PENDING_VERIFICATION, null) ?: return null
+        return runCatching {
+            json.decodeFromString(PendingVerification.serializer(), raw)
+        }.getOrElse {
+            logger.w(TAG, "Persisted pending verification unreadable; discarding", it)
+            null
+        }
+    }
+
+    /**
+     * Persists [pending] *before* the observation read begins (M7) —
+     * mirrors [saveCheckpoint]'s own reasoning exactly: the entire point is
+     * to durably record "an outcome still needs checking" before that
+     * check can possibly run, so a process death between this call and the
+     * read is itself detectable on restart, not silently lost.
+     *
+     * `commit()`, not `apply()`, for the identical "window-D" reason
+     * [saveCheckpoint] already documents.
+     */
+    fun saveVerification(pending: PendingVerification) {
+        val encoded = json.encodeToString(PendingVerification.serializer(), pending)
+        val committed = prefs.edit().putString(KEY_PENDING_VERIFICATION, encoded).commit()
+        logger.d(TAG, "Persisted pending verification (durably, committed=$committed)")
+    }
+
+    /**
+     * Erases the persisted pending verification outright — called once
+     * observation and comparison have actually run and produced a
+     * [com.softwaremine.dps.domain.secretary.VerificationOutcome], whichever
+     * one it was. `commit()` for the same reason [clearCheckpoint] uses it:
+     * a lost async clear here would let a later process re-resolve an
+     * already-resolved verification, which is harmless in effect (the read
+     * is idempotent) but would defeat the point of ever clearing it.
+     */
+    fun clearVerification() {
+        val committed = prefs.edit().remove(KEY_PENDING_VERIFICATION).commit()
+        logger.d(TAG, "Cleared pending verification (durably, committed=$committed)")
+    }
+
     companion object {
         private const val TAG = "PersistentRecoveryStore"
         private const val PREFS_NAME = "dps_execution_recovery"
         private const val KEY_STATE = "state"
         private const val KEY_CHECKPOINT = "checkpoint"
+        private const val KEY_PENDING_VERIFICATION = "pending_verification"
 
         /** Real, `Context`-backed construction — matches every other store's call shape. */
         fun create(context: Context, logger: DpsLogger): PersistentRecoveryStore =

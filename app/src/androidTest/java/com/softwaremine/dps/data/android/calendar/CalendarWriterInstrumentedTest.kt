@@ -107,6 +107,76 @@ class CalendarWriterInstrumentedTest {
         }
     }
 
+    /**
+     * M7 timestamp-calibration gate — real-device evidence, not assumption.
+     *
+     * The M7 implementation plan's own instruction is explicit: do not lock
+     * a comparison tolerance for [CalendarWriter.readEventSnapshot] until a
+     * real insert-then-read-back round trip against this device's actual
+     * Calendar Provider proves whether millisecond precision on `DTSTART`/
+     * `DTEND` survives exactly. This test **is** that proof — asserting
+     * exact equality (not "close enough") is the test itself failing loudly
+     * the moment the provider does not preserve precision, which is exactly
+     * the signal M7's design needs before any tolerance decision is made.
+     *
+     * This exercises the base `Events` table directly (via
+     * [CalendarWriter.readEventSnapshot]) rather than
+     * [CalendarWriter.findUpcomingInstances]'s own `Instances` view, which
+     * [aOneTimeUpcomingEventIsFoundWithCorrectFields] above already shows
+     * preserves exact millis — `Instances` is a provider-computed
+     * expansion of `Events`, not independent evidence for the raw table
+     * `readEventSnapshot` actually reads.
+     */
+    @Test
+    fun readEventSnapshotPreservesExactStartAndEndMillisOnRealProviderRoundTrip() {
+        if (!hasCalendarPermission()) return // calendar permission not granted on this run
+
+        val target = writer.findWritableCalendar()
+        if (target !is CalendarWriter.CalendarTarget.Found) return // no writable calendar on this run
+
+        val now = System.currentTimeMillis()
+        // Deliberately not round numbers — a provider that truncates to the
+        // nearest second/minute would still pass an equality check against
+        // an already-round millis value, hiding exactly the behavior this
+        // test exists to surface.
+        val start = now + TimeUnit.MINUTES.toMillis(45) + 137L
+        val end = start + TimeUnit.MINUTES.toMillis(37) + 891L
+        val created = writer.insertEvent(
+            calendarId = target.calendarId,
+            title = "M7 timestamp calibration",
+            description = null,
+            location = null,
+            startMillis = start,
+            endMillis = end,
+            allDay = false,
+            timezone = TimeZone.getDefault().id,
+        )
+        assertTrue("Expected Created, got $created", created is CalendarWriter.InsertOutcome.Created)
+        val eventId = (created as CalendarWriter.InsertOutcome.Created).eventId
+
+        try {
+            val outcome = writer.readEventSnapshot(eventId)
+            assertTrue("Expected Found, got $outcome", outcome is CalendarEventReader.EventSnapshotOutcome.Found)
+            val snapshot = (outcome as CalendarEventReader.EventSnapshotOutcome.Found).snapshot
+
+            assertEquals("M7 timestamp calibration", snapshot.title)
+            assertEquals(
+                "Calendar Provider must preserve exact millisecond precision on DTSTART for M7's " +
+                    "exact-equality comparison to be valid — see this test's own class doc",
+                start,
+                snapshot.startMillis,
+            )
+            assertEquals(
+                "Calendar Provider must preserve exact millisecond precision on DTEND for M7's " +
+                    "exact-equality comparison to be valid — see this test's own class doc",
+                end,
+                snapshot.endMillis,
+            )
+        } finally {
+            deleteEvent(eventId)
+        }
+    }
+
     @Test
     fun anAllDayEventIsReportedAsAllDay() {
         if (!hasCalendarPermission()) return

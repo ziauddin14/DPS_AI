@@ -188,6 +188,14 @@ class AndroidCalendarTool(
                         "calendar" to target.displayName,
                         "start" to ToolArguments.describe(start, zone),
                         "end" to ToolArguments.describe(end, zone),
+                        // M7: raw millis, distinct from the display strings
+                        // above — com.softwaremine.dps.data.android.secretary.ExecutionVerifier
+                        // compares these directly rather than parsing
+                        // ToolArguments.describe()'s formatted output back,
+                        // or recomputing this class's own default-duration
+                        // logic a second time elsewhere.
+                        "start_millis" to start.toString(),
+                        "end_millis" to end.toString(),
                     ),
                 )
             }
