@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.domain.secretary.ExecutionRecoveryState
 import com.softwaremine.dps.domain.secretary.OperationCheckpoint
+import com.softwaremine.dps.domain.secretary.PendingAutomationAction
 import com.softwaremine.dps.domain.secretary.PendingVerification
 import kotlinx.serialization.json.Json
 
@@ -207,12 +208,54 @@ class PersistentRecoveryStore(
         logger.d(TAG, "Cleared pending verification (durably, committed=$committed)")
     }
 
+    /**
+     * The persisted pending automation action (M9) — a bounded UI
+     * interaction was about to be dispatched and its outcome has not yet
+     * been observed and verified. `null` when none is outstanding or the
+     * stored value is unreadable. See [PendingAutomationAction]'s own doc
+     * for why this is a fourth sibling slot rather than a new store.
+     */
+    fun loadAutomation(): PendingAutomationAction? {
+        val raw = prefs.getString(KEY_PENDING_AUTOMATION, null) ?: return null
+        return runCatching {
+            json.decodeFromString(PendingAutomationAction.serializer(), raw)
+        }.getOrElse {
+            logger.w(TAG, "Persisted pending automation action unreadable; discarding", it)
+            null
+        }
+    }
+
+    /**
+     * Persists [pending] *before* the bounded action is performed (M9) —
+     * mirrors [saveCheckpoint]/[saveVerification]'s own reasoning exactly:
+     * a process death between this call and the real action is itself
+     * detectable on restart, not silently lost. `commit()`, not `apply()`,
+     * for the identical "window-D" reason those two already document.
+     */
+    fun saveAutomation(pending: PendingAutomationAction) {
+        val encoded = json.encodeToString(PendingAutomationAction.serializer(), pending)
+        val committed = prefs.edit().putString(KEY_PENDING_AUTOMATION, encoded).commit()
+        logger.d(TAG, "Persisted pending automation action (durably, committed=$committed)")
+    }
+
+    /**
+     * Erases the persisted pending automation action outright — called
+     * once observation and verification have actually run and produced a
+     * [com.softwaremine.dps.domain.secretary.VerificationOutcome], whichever
+     * one it was. `commit()` for the same reason [clearVerification] uses it.
+     */
+    fun clearAutomation() {
+        val committed = prefs.edit().remove(KEY_PENDING_AUTOMATION).commit()
+        logger.d(TAG, "Cleared pending automation action (durably, committed=$committed)")
+    }
+
     companion object {
         private const val TAG = "PersistentRecoveryStore"
         private const val PREFS_NAME = "dps_execution_recovery"
         private const val KEY_STATE = "state"
         private const val KEY_CHECKPOINT = "checkpoint"
         private const val KEY_PENDING_VERIFICATION = "pending_verification"
+        private const val KEY_PENDING_AUTOMATION = "pending_automation"
 
         /** Real, `Context`-backed construction — matches every other store's call shape. */
         fun create(context: Context, logger: DpsLogger): PersistentRecoveryStore =

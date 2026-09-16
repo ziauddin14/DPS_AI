@@ -82,6 +82,22 @@ enum class DpsPermission(
      * app supports — no [minApiLevel] gate is needed, unlike `POST_NOTIFICATIONS`.
      */
     RECORD_AUDIO(PermissionKind.RUNTIME),
+
+    /**
+     * Accessibility-service enablement for controlled UI automation (M9).
+     *
+     * **Special access, not a runtime permission.** There is no
+     * `android.permission.*` string for this at all — see
+     * [com.softwaremine.dps.data.android.permission.AndroidPermissionMapping.androidName]'s
+     * own doc for why its mapping for this entry is `null` — state is
+     * queried via `Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES` and
+     * granted only through `Settings.ACTION_ACCESSIBILITY_SETTINGS`. See
+     * [com.softwaremine.dps.data.android.permission.AndroidPermissionManager]'s
+     * `specialAccessState()` for the query itself. No [minApiLevel]:
+     * accessibility services are available at every API level this app
+     * supports.
+     */
+    AUTOMATION_ACCESSIBILITY(PermissionKind.SPECIAL_ACCESS),
     ;
 
     /** `true` when this permission exists on the given API level. */

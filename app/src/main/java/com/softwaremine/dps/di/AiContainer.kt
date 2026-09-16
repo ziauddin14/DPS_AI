@@ -31,6 +31,7 @@ import com.softwaremine.dps.ai.secretary.SecretaryOrchestrator
 import com.softwaremine.dps.ai.session.AiSessionManager
 import com.softwaremine.dps.ai.tool.DefaultToolExecutor
 import com.softwaremine.dps.ai.tool.DefaultToolRegistry
+import com.softwaremine.dps.data.android.automation.AndroidAutomationEngine
 import com.softwaremine.dps.data.android.calendar.CalendarWriter
 import com.softwaremine.dps.data.android.contacts.AndroidContactRepository
 import com.softwaremine.dps.data.android.intent.IntentLauncher
@@ -40,6 +41,7 @@ import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.notification.NotificationPresenter
 import com.softwaremine.dps.data.android.permission.AndroidPermissionManager
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.AutomationVerifier
 import com.softwaremine.dps.data.android.secretary.ExecutionVerifier
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.data.android.productivity.AndroidActionItemStore
@@ -49,6 +51,7 @@ import com.softwaremine.dps.data.android.productivity.AndroidWorkLogStore
 import com.softwaremine.dps.data.android.reminder.ReminderScheduler
 import com.softwaremine.dps.data.android.reminder.ReminderStore
 import com.softwaremine.dps.data.android.tool.AndroidActionItemTool
+import com.softwaremine.dps.data.android.tool.AndroidAutomationTool
 import com.softwaremine.dps.data.android.tool.AndroidCalendarTool
 import com.softwaremine.dps.data.android.tool.AndroidCallTool
 import com.softwaremine.dps.data.android.tool.AndroidContactsTool
@@ -65,6 +68,7 @@ import com.softwaremine.dps.data.android.tool.PrepareWhatsAppMessageTool
 import com.softwaremine.dps.data.android.voice.AndroidSpeechRecognizer
 import com.softwaremine.dps.data.android.voice.AndroidTextToSpeech
 import com.softwaremine.dps.ai.voice.VoiceModeController
+import com.softwaremine.dps.domain.automation.AutomationEngine
 import com.softwaremine.dps.domain.contact.ContactRepository
 import com.softwaremine.dps.domain.contact.ContactResolver
 import com.softwaremine.dps.domain.productivity.report.ReportGenerator
@@ -378,6 +382,26 @@ class AiContainer(private val applicationContext: Context) {
     }
 
     /**
+     * M9: the real, `AccessibilityService`-backed automation capability.
+     * Public for the same reason [executionVerifier] is — instrumented
+     * tests that construct their own [SecretaryOrchestrator] against a
+     * scripted engine reuse this real, on-device instance.
+     */
+    val automationEngine: AutomationEngine by lazy {
+        AndroidAutomationEngine(applicationContext, intentLauncher, logger)
+    }
+
+    /** M9: independently observes and compares a bounded UI action's claimed outcome against real, re-observed UI state. */
+    val automationVerifier by lazy {
+        AutomationVerifier(
+            engine = automationEngine,
+            persistentRecoveryStore = persistentRecoveryStore,
+            dispatchers = dispatchers,
+            logger = logger,
+        )
+    }
+
+    /**
      * The tool catalogue.
      *
      * Phase B implementations are passed in and take precedence; everything
@@ -407,6 +431,8 @@ class AiContainer(private val applicationContext: Context) {
                     AndroidReportTool(taskStore, workLogStore, meetingNoteStore, actionItemStore, ReportGenerator()),
                     // M6 -- long-term memory
                     AndroidMemoryTool(longTermMemoryStore),
+                    // M9 -- controlled UI automation
+                    AndroidAutomationTool(automationEngine, persistentRecoveryStore),
                 ),
             )
         }
@@ -485,6 +511,7 @@ class AiContainer(private val applicationContext: Context) {
             persistentRecoveryStore = persistentRecoveryStore,
             episodicMemoryRecorder = episodicMemoryRecorder,
             executionVerifier = executionVerifier,
+            automationVerifier = automationVerifier,
             permissionManager = permissionManager,
             toolRegistry = toolRegistry,
             responses = ToolResponseGenerator(),

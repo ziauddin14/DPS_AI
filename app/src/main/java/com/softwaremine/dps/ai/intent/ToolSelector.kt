@@ -139,6 +139,17 @@ class ToolSelector(
                 arguments = buildMap { put("title", p.value(IntentField.TITLE).orEmpty()) },
             )
 
+            // M9: one coarse operation, mirroring how create_event already
+            // internally sequences several steps behind one ToolCall — see
+            // AndroidAutomationTool's own doc for why the five-action
+            // engine vocabulary is not exposed as five separate operations
+            // here.
+            IntentType.AUTOMATION -> ToolCall(
+                toolId = ToolId.AUTOMATION,
+                operation = "perform_interaction",
+                arguments = buildMap { put("app", p.value(IntentField.TITLE).orEmpty()) },
+            )
+
             IntentType.CONVERSATION -> null
         }
     }

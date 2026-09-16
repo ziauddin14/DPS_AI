@@ -36,6 +36,7 @@ import com.softwaremine.dps.data.android.memory.episodic.EpisodicMemoryEntity
 import com.softwaremine.dps.data.android.memory.semantic.SemanticFactDao
 import com.softwaremine.dps.data.android.memory.semantic.SemanticFactEntity
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.AutomationVerifier
 import com.softwaremine.dps.data.android.secretary.ExecutionVerifier
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.data.model.ModelCatalog
@@ -278,6 +279,13 @@ class AiSessionManagerInterruptionTest {
             executionVerifier = ExecutionVerifier(
                 taskRepository = null,
                 calendarEventReader = null,
+                persistentRecoveryStore = PersistentRecoveryStore(NoOpSharedPreferences(), silentLogger),
+                dispatchers = immediateDispatchers,
+                logger = silentLogger,
+            ),
+            // M9: same reasoning as executionVerifier's own null repository above.
+            automationVerifier = AutomationVerifier(
+                engine = null,
                 persistentRecoveryStore = PersistentRecoveryStore(NoOpSharedPreferences(), silentLogger),
                 dispatchers = immediateDispatchers,
                 logger = silentLogger,

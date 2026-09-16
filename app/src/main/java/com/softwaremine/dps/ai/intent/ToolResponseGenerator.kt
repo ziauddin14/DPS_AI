@@ -136,6 +136,7 @@ class ToolResponseGenerator {
             } -> "your calendar"
             result.permissions.contains(DpsPermission.POST_NOTIFICATIONS) -> "notifications"
             result.permissions.contains(DpsPermission.SCHEDULE_EXACT_ALARM) -> "exact alarms"
+            result.permissions.contains(DpsPermission.AUTOMATION_ACCESSIBILITY) -> "accessibility access"
             else -> "a permission"
         }
 
@@ -157,6 +158,8 @@ class ToolResponseGenerator {
             // M6 tools declare no required permissions — unreachable in
             // practice, but every case must say something.
             IntentType.REMEMBER_FACT, IntentType.RECALL_FACT, IntentType.FORGET_FACT -> "do that"
+            // M9.
+            IntentType.AUTOMATION -> "open that app for you"
             IntentType.CONVERSATION -> "do that"
         }
 
@@ -190,6 +193,9 @@ class ToolResponseGenerator {
         // AndroidMemoryTool always sets a non-blank summary — unreachable in
         // practice, but every case must say something.
         IntentType.REMEMBER_FACT, IntentType.RECALL_FACT, IntentType.FORGET_FACT -> "Done."
+        // AndroidAutomationTool always sets a non-blank summary — unreachable
+        // in practice, but every case must say something.
+        IntentType.AUTOMATION -> "Done."
         IntentType.CONVERSATION -> "Done."
     }
 }

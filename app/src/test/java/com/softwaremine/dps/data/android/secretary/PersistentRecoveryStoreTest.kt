@@ -11,6 +11,7 @@ import com.softwaremine.dps.domain.intent.IntentType
 import com.softwaremine.dps.domain.secretary.ExecutionRecoveryState
 import com.softwaremine.dps.domain.secretary.OperationCheckpoint
 import com.softwaremine.dps.domain.secretary.OperationType
+import com.softwaremine.dps.domain.secretary.PendingAutomationAction
 import com.softwaremine.dps.domain.secretary.PendingVerification
 import com.softwaremine.dps.domain.secretary.PersistedDisambiguationCandidate
 import com.softwaremine.dps.domain.secretary.PersistedPendingPlan
@@ -631,6 +632,100 @@ class PersistentRecoveryStoreTest {
         store.clearVerification()
 
         assertNull("The pending verification must actually clear when asked to", store.loadVerification())
+    }
+
+    // -----------------------------------------------------------------
+    // M9 — PendingAutomationAction
+    // -----------------------------------------------------------------
+
+    private val automationAction = PendingAutomationAction(
+        targetApp = "com.softwaremine.dps.automationtarget",
+        resourceId = "com.softwaremine.dps.automationtarget:id/automation_target_button",
+        expectedText = "Tapped",
+        requestedAtMillis = 4_000L,
+    )
+
+    @Test
+    fun `a store with nothing saved yet has no pending automation action`() {
+        val store = freshStore()
+
+        assertNull(store.loadAutomation())
+    }
+
+    @Test
+    fun `a pending automation action survives a save-then-load round-trip exactly`() {
+        val store = freshStore()
+
+        store.saveAutomation(automationAction)
+
+        assertEquals(automationAction, store.loadAutomation())
+    }
+
+    @Test
+    fun `clearing the pending automation action removes it`() {
+        val store = freshStore()
+        store.saveAutomation(automationAction)
+
+        store.clearAutomation()
+
+        assertNull(store.loadAutomation())
+    }
+
+    @Test
+    fun `saving a second pending automation action replaces the first entirely`() {
+        val store = freshStore()
+        val second = automationAction.copy(expectedText = "Second")
+
+        store.saveAutomation(automationAction)
+        store.saveAutomation(second)
+
+        assertEquals(second, store.loadAutomation())
+    }
+
+    @Test
+    fun `a fresh store reconstruction detects an uncleared pending automation action left by an earlier instance`() {
+        val prefs = FakeSharedPreferences()
+        PersistentRecoveryStore(prefs, silentLogger).saveAutomation(automationAction)
+
+        val reconstructed = PersistentRecoveryStore(prefs, silentLogger)
+
+        assertEquals(automationAction, reconstructed.loadAutomation())
+    }
+
+    @Test
+    fun `a fresh store reconstruction after a durable clear finds no pending automation action`() {
+        val prefs = FakeSharedPreferences()
+        val writer = PersistentRecoveryStore(prefs, silentLogger)
+        writer.saveAutomation(automationAction)
+        writer.clearAutomation()
+
+        val reconstructed = PersistentRecoveryStore(prefs, silentLogger)
+
+        assertNull(
+            "A durably cleared pending automation action must never resurface for a fresh instance",
+            reconstructed.loadAutomation(),
+        )
+    }
+
+    @Test
+    fun `the pending automation action is independent of the checkpoint, the pending-state record, and pending verification`() {
+        val store = freshStore()
+        val recoveryState = ExecutionRecoveryState(PersistedPendingState.Confirmation(sampleIntent, 1_000L), null)
+
+        store.save(recoveryState)
+        store.saveCheckpoint(taskCheckpoint)
+        store.saveVerification(taskVerification)
+        store.saveAutomation(automationAction)
+
+        store.clearVerification()
+
+        assertEquals("Clearing the pending verification must not clear the pending automation action", automationAction, store.loadAutomation())
+
+        store.clearAutomation()
+
+        assertNull("The pending automation action must actually clear when asked to", store.loadAutomation())
+        assertEquals("Clearing the pending automation action must not clear the checkpoint", taskCheckpoint, store.loadCheckpoint())
+        assertEquals("Clearing the pending automation action must not clear the pending-state record", recoveryState, store.load())
     }
 
     /**

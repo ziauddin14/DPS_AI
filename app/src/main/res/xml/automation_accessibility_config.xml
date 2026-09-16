@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    M9 Phase 1 accessibility service configuration.
+
+    packageNames is deliberately narrow — the one first-party test target
+    (see AutomationAppRegistry's own doc), enforced at the OS level as a
+    second, redundant layer alongside the application-level allowlist
+    check. Growing the automation surface to a new app means adding it
+    here explicitly, never leaving this blank/all-packages.
+
+    canPerformGestures is false: Phase 1's one action (tap) uses
+    performAction(ACTION_CLICK), never dispatchGesture — turned on only
+    when a locked, later-phase action vocabulary entry actually needs it.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="false"
+    android:notificationTimeout="100"
+    android:packageNames="com.softwaremine.dps.automationtarget" />

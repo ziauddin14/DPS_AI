@@ -111,6 +111,11 @@ class RiskPolicyTest {
     }
 
     @Test
+    fun `automation is confirm-required`() {
+        assertEquals(RiskLevel.CONFIRM_REQUIRED, RiskPolicy.classify(DpsIntent(IntentType.AUTOMATION)))
+    }
+
+    @Test
     fun `classification is a pure function - the same intent classifies identically every time`() {
         val intent = DpsIntent(IntentType.TASK, action = IntentAction.CANCEL)
         val first = RiskPolicy.classify(intent)

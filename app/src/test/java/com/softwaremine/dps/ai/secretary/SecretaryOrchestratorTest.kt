@@ -29,6 +29,7 @@ import com.softwaremine.dps.data.android.memory.episodic.EpisodicMemoryEntity
 import com.softwaremine.dps.data.android.memory.semantic.SemanticFactDao
 import com.softwaremine.dps.data.android.memory.semantic.SemanticFactEntity
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.AutomationVerifier
 import com.softwaremine.dps.data.android.secretary.ExecutionVerifier
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.data.android.tool.AndroidMemoryTool
@@ -56,6 +57,10 @@ import com.softwaremine.dps.domain.secretary.OperationType
 import com.softwaremine.dps.domain.secretary.PendingVerification
 import com.softwaremine.dps.domain.secretary.PersistedPendingState
 import com.softwaremine.dps.domain.secretary.SecretaryState
+import com.softwaremine.dps.data.android.tool.AndroidAutomationTool
+import com.softwaremine.dps.domain.automation.AutomationEngine
+import com.softwaremine.dps.domain.automation.AutomationOutcome
+import com.softwaremine.dps.domain.automation.ElementDescriptor
 import com.softwaremine.dps.domain.secretary.VerificationOutcome
 import com.softwaremine.dps.domain.tool.AndroidTool
 import com.softwaremine.dps.domain.tool.ToolCall
@@ -313,6 +318,16 @@ class SecretaryOrchestratorTest {
             logger = silentLogger,
             now = now,
         ),
+        // M9: this file tests classification/orchestration, not automation
+        // itself — no fake tool here has a real AutomationEngine behind
+        // it, so this is left unwired (null) rather than hand-built, for
+        // the identical reason executionVerifier's own repositories are.
+        automationVerifier: AutomationVerifier = AutomationVerifier(
+            engine = null,
+            persistentRecoveryStore = persistentRecoveryStore,
+            dispatchers = immediateDispatchers,
+            logger = silentLogger,
+        ),
     ): SecretaryOrchestrator {
         val registry = DefaultToolRegistry(silentLogger).apply { tools.forEach(::register) }
         val executor = DefaultToolExecutor(
@@ -357,6 +372,7 @@ class SecretaryOrchestratorTest {
             persistentRecoveryStore = persistentRecoveryStore,
             episodicMemoryRecorder = episodicMemoryRecorder,
             executionVerifier = executionVerifier,
+            automationVerifier = automationVerifier,
             permissionManager = permissions,
             toolRegistry = registry,
             responses = com.softwaremine.dps.ai.intent.ToolResponseGenerator(),
@@ -2410,6 +2426,133 @@ class SecretaryOrchestratorTest {
         // either way, so the reply carries the tool's own ordinary success
         // wording, not a mismatch notice.
         assertTrue((done as ToolOrchestrator.Outcome.Handled).reply.contains("Task created."))
+    }
+
+    // -----------------------------------------------------------------
+    // M9: controlled UI automation
+    // -----------------------------------------------------------------
+
+    private class FakeAutomationEngine(
+        private val tapOutcome: AutomationOutcome.Action = AutomationOutcome.Action.Performed,
+        private val verifyOutcome: VerificationOutcome = VerificationOutcome.Verified,
+    ) : AutomationEngine {
+        val tapCalls = mutableListOf<ElementDescriptor>()
+
+        override suspend fun openApp(packageName: String) = AutomationOutcome.OpenApp.Opened
+
+        override suspend fun findElement(descriptor: ElementDescriptor) = AutomationOutcome.Find.Found(descriptor)
+
+        override suspend fun tap(descriptor: ElementDescriptor): AutomationOutcome.Action {
+            tapCalls += descriptor
+            return tapOutcome
+        }
+
+        override suspend fun observeAndVerify(descriptor: ElementDescriptor, expectedText: String): VerificationOutcome =
+            verifyOutcome
+    }
+
+    /** Wires the real [AndroidAutomationTool]/[AutomationVerifier] against one shared fake engine and store. */
+    private data class AutomationSetup(
+        val tool: AndroidAutomationTool,
+        val verifier: AutomationVerifier,
+        val store: PersistentRecoveryStore,
+        val engine: FakeAutomationEngine,
+    )
+
+    private fun automationSetup(
+        verifyOutcome: VerificationOutcome = VerificationOutcome.Verified,
+    ): AutomationSetup {
+        val store = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger)
+        val engine = FakeAutomationEngine(verifyOutcome = verifyOutcome)
+        val tool = AndroidAutomationTool(engine, store)
+        val verifier = AutomationVerifier(engine, store, immediateDispatchers, silentLogger)
+        return AutomationSetup(tool, verifier, store, engine)
+    }
+
+    @Test
+    fun `automation asks before doing anything`() = runTest {
+        val (tool, verifier, store) = automationSetup()
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"automation","parameters":{"title":"test app"}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(tool), automationVerifier = verifier, persistentRecoveryStore = store)
+            .handle("test app khol kar button dabao")
+
+        assertTrue("Expected Clarify, got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((outcome as ToolOrchestrator.Outcome.Clarify).question.contains("test app"))
+        assertNull("Nothing may be tapped before confirmation", store.loadAutomation())
+    }
+
+    @Test
+    fun `confirming automation taps and reports success once verified`() = runTest {
+        val (tool, verifier, store) = automationSetup(verifyOutcome = VerificationOutcome.Verified)
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"automation","parameters":{"title":"test app"}}"""),
+        )
+        val secretary = secretary(engine, listOf(tool), automationVerifier = verifier, persistentRecoveryStore = store)
+
+        secretary.handle("test app khol kar button dabao")
+        val confirmed = secretary.handle("haan")
+
+        assertTrue("Expected Handled, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        assertNull("Verified — the pending automation action must be cleared", store.loadAutomation())
+    }
+
+    @Test
+    fun `declining automation leaves it alone`() = runTest {
+        val (tool, verifier, store, fakeEngine) = automationSetup()
+        val scripted = ScriptedEngine(
+            DpsResult.Success("""{"intent":"automation","parameters":{"title":"test app"}}"""),
+        )
+        val secretary = secretary(scripted, listOf(tool), automationVerifier = verifier, persistentRecoveryStore = store)
+
+        secretary.handle("test app khol kar button dabao")
+        val declined = secretary.handle("nahi")
+
+        assertTrue("Expected Handled, got $declined", declined is ToolOrchestrator.Outcome.Handled)
+        assertTrue("Nothing may be tapped after a decline", fakeEngine.tapCalls.isEmpty())
+        assertNull(store.loadAutomation())
+    }
+
+    @Test
+    fun `ACTION EXECUTED is not confused with ACTION VERIFIED - a mismatch is reported honestly, not as success`() = runTest {
+        val (tool, verifier, store) = automationSetup(verifyOutcome = VerificationOutcome.NotFound)
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"automation","parameters":{"title":"test app"}}"""),
+        )
+        val secretary = secretary(engine, listOf(tool), automationVerifier = verifier, persistentRecoveryStore = store)
+
+        secretary.handle("test app khol kar button dabao")
+        val confirmed = secretary.handle("haan")
+
+        assertTrue("Expected Handled, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        assertTrue(
+            "The tap was dispatched (a real ToolResult.Success occurred), but verification came back NotFound — the reply must say so honestly, never claim plain success",
+            (confirmed as ToolOrchestrator.Outcome.Handled).reply.contains("couldn't find", ignoreCase = true) ||
+                confirmed.reply.contains("confirm", ignoreCase = true),
+        )
+        assertNull("Resolved (even as NotFound) — the pending record must still clear", store.loadAutomation())
+    }
+
+    @Test
+    fun `an automation step stops a multi-step plan when verification does not come back Verified`() = runTest {
+        val (tool, verifier, store) = automationSetup(verifyOutcome = VerificationOutcome.ObservationFailed("gone"))
+        val task = taskTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"automation","parameters":{"title":"test app"}},
+                    {"intent":"task","parameters":{"title":"should not run"}}
+                ]}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(tool, task), automationVerifier = verifier, persistentRecoveryStore = store)
+
+        secretary.handle("test app khol kar button dabao, phir should not run ka task bana do")
+        secretary.handle("haan")
+
+        assertTrue("The unrelated later step must never run after an unverified automation step", task.calls.isEmpty())
     }
 
     // -----------------------------------------------------------------

@@ -117,6 +117,27 @@ enum class IntentType(
     @SerialName("forget_fact")
     FORGET_FACT("forget_fact"),
 
+    // --- M9: controlled Android UI automation ---
+
+    /**
+     * A request to perform one bounded, controlled UI interaction in a
+     * known Android app (M9) — never arbitrary device control.
+     *
+     * [IntentParameters.title] carries the target app's spoken name,
+     * exactly the same flat-bag reuse [REMEMBER_FACT]/[RECALL_FACT]/
+     * [FORGET_FACT] already established for `title` meaning "the
+     * type-specific subject" rather than only "a reminder/event/
+     * notification label." No node/element/coordinate data is ever part
+     * of this intent — see
+     * [com.softwaremine.dps.ai.secretary.SecretaryOrchestrator]'s M9
+     * automation-confirmation doc for why the LLM never sees that data at
+     * all; the deterministic target-app/element resolution
+     * ([com.softwaremine.dps.domain.automation.AutomationAppRegistry])
+     * happens entirely after classification.
+     */
+    @SerialName("automation")
+    AUTOMATION("automation"),
+
     /**
      * Not a request for an action — ordinary conversation.
      *
@@ -483,6 +504,14 @@ val IntentType.requiredFields: List<Set<IntentField>>
             setOf(IntentField.TITLE),
         )
 
+        // M9: the target app's spoken name is the only thing the model
+        // must extract — the deterministic element/action for Phase 1's
+        // one bounded interaction is resolved entirely downstream, never
+        // asked about here.
+        IntentType.AUTOMATION -> listOf(
+            setOf(IntentField.TITLE),
+        )
+
         // Conversation needs nothing; it is not routed to a tool.
         IntentType.CONVERSATION -> emptyList()
     }
@@ -512,5 +541,6 @@ val IntentType.toolId: ToolId?
         IntentType.REMEMBER_FACT -> ToolId.MEMORY
         IntentType.RECALL_FACT -> ToolId.MEMORY
         IntentType.FORGET_FACT -> ToolId.MEMORY
+        IntentType.AUTOMATION -> ToolId.AUTOMATION
         IntentType.CONVERSATION -> null
     }

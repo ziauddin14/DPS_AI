@@ -57,6 +57,12 @@ object RiskPolicy {
 
         intent.type == IntentType.CALL_CONTACT -> RiskLevel.CONFIRM_REQUIRED
 
+        // M9: every automation intent asks first, unconditionally, for
+        // Phase 1 — no target/action-aware heuristic yet (locked,
+        // evidence-based: Phase 1 has exactly one possible interaction, so
+        // building a richer classifier now would be speculative).
+        intent.type == IntentType.AUTOMATION -> RiskLevel.CONFIRM_REQUIRED
+
         else -> RiskLevel.SAFE_AUTO
     }
 

@@ -120,6 +120,12 @@ enum class ToolId(val toolName: String) {
 
     /** Long-term (episodic + semantic) memory (M6). See [com.softwaremine.dps.data.android.tool.AndroidMemoryTool]. */
     MEMORY("memory"),
+
+    /**
+     * Controlled Android UI automation (M9). See
+     * [com.softwaremine.dps.data.android.tool.AndroidAutomationTool].
+     */
+    AUTOMATION("automation"),
     ;
 
     companion object {

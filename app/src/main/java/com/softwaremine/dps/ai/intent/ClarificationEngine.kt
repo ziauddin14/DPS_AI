@@ -212,6 +212,9 @@ class ClarificationEngine {
             IntentType.RECALL_FACT -> "What would you like me to recall?"
             IntentType.FORGET_FACT -> "What should I forget?"
 
+            // M9: the only thing ever asked about is which app.
+            IntentType.AUTOMATION -> "Which app would you like me to open?"
+
             // Conversation requires nothing, so this is unreachable in practice.
             IntentType.CONVERSATION -> "Could you say a bit more?"
         }

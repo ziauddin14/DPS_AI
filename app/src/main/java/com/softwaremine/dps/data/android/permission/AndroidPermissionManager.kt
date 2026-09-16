@@ -1,13 +1,16 @@
 package com.softwaremine.dps.data.android.permission
 
 import android.app.AlarmManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
+import android.provider.Settings
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import com.softwaremine.dps.core.logging.DpsLogger
+import com.softwaremine.dps.data.android.automation.DpsAutomationService
 import com.softwaremine.dps.domain.permission.DpsPermission
 import com.softwaremine.dps.domain.permission.PermissionKind
 import com.softwaremine.dps.domain.permission.PermissionManager
@@ -141,7 +144,11 @@ class AndroidPermissionManager(
         val requestable = runtime.filter { it.existsOn(apiLevel) && !state(it).isUsable }
 
         if (requestable.isNotEmpty()) {
-            val androidNames = requestable.map { AndroidPermissionMapping.androidName(it) }
+            // mapNotNull, not map: every entry here is RUNTIME-kind (filtered
+            // from the special-access partition above), so androidName() is
+            // guaranteed non-null in practice — mapNotNull is the safe,
+            // non-crashing way to express that without a force-unwrap.
+            val androidNames = requestable.mapNotNull { AndroidPermissionMapping.androidName(it) }
             // Recorded before launching, not after: if the process dies while
             // the dialog is up, the request still happened, and forgetting that
             // would misclassify a permanent denial as never-asked forever after.
@@ -163,7 +170,13 @@ class AndroidPermissionManager(
     // -----------------------------------------------------------------
 
     private fun runtimeState(permission: DpsPermission): PermissionState {
-        val androidName = AndroidPermissionMapping.androidName(permission)
+        // Guaranteed non-null: this is only ever called for a non-SPECIAL_ACCESS
+        // permission (see state()'s own dispatch above), and every such
+        // permission has a real Android string — failing closed rather than
+        // crashing if that invariant is ever violated (M9 made this nullable
+        // for DpsPermission.AUTOMATION_ACCESSIBILITY specifically, which is
+        // SPECIAL_ACCESS and never reaches here).
+        val androidName = AndroidPermissionMapping.androidName(permission) ?: return PermissionState.UNKNOWN
         val granted = ContextCompat.checkSelfPermission(context, androidName) ==
             PackageManager.PERMISSION_GRANTED
 
@@ -191,9 +204,10 @@ class AndroidPermissionManager(
     /**
      * State of a special-access permission.
      *
-     * Only `SCHEDULE_EXACT_ALARM` exists today. Each special permission has its
-     * own query API, so this is a `when` rather than a shared code path — there
-     * is no general "check special access" call to generalise over.
+     * `SCHEDULE_EXACT_ALARM` and `AUTOMATION_ACCESSIBILITY` (M9). Each
+     * special permission has its own query API, so this is a `when` rather
+     * than a shared code path — there is no general "check special access"
+     * call to generalise over.
      */
     private fun specialAccessState(permission: DpsPermission): PermissionState =
         when (permission) {
@@ -207,6 +221,22 @@ class AndroidPermissionManager(
                     alarmManager.canScheduleExactAlarms() -> PermissionState.GRANTED
                     else -> PermissionState.REQUIRES_SETTINGS
                 }
+            }
+
+            // M9: no runtime dialog exists for this at all — queried via
+            // membership in the OS's own enabled-accessibility-services
+            // list, granted only through Settings.ACTION_ACCESSIBILITY_SETTINGS.
+            // Always a live query, never a cached app-side flag, so this is
+            // correct on every read regardless of process death or the
+            // service having been disabled after previously being enabled.
+            DpsPermission.AUTOMATION_ACCESSIBILITY -> {
+                val enabledServices = Settings.Secure.getString(
+                    context.contentResolver,
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                ).orEmpty()
+                val target = ComponentName(context, DpsAutomationService::class.java).flattenToString()
+                val enabled = enabledServices.split(':').any { it == target }
+                if (enabled) PermissionState.GRANTED else PermissionState.REQUIRES_SETTINGS
             }
 
             else -> PermissionState.UNKNOWN

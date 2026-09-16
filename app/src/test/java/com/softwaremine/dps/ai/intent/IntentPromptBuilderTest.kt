@@ -218,10 +218,13 @@ class IntentPromptBuilderTest {
         // each move is one deliberate, named change, not drift; a
         // regression here should still fail loudly. → 1650 (M6: three new
         // routable intent types — remember_fact/recall_fact/forget_fact —
-        // plus one rule bullet distinguishing them from task/conversation).
+        // plus one rule bullet distinguishing them from task/conversation)
+        // → 1900 (M9: one new routable intent type — automation — plus one
+        // rule bullet naming it and warning the model off using it for
+        // anything this app can already handle directly).
         assertTrue(
             "Classification prompt has grown to ${prompt.length} characters",
-            prompt.length < 1650,
+            prompt.length < 1900,
         )
     }
 

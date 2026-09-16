@@ -93,6 +93,12 @@
         <package android:name="com.whatsapp" />
         <package android:name="com.whatsapp.w4b" />
 
+        <!-- M9 Phase 1's own first-party, never-shipped test target — see
+             AutomationAppRegistry's own doc. Needed for
+             IntentLauncher.isPackageInstalled()/getLaunchIntentForPackage()
+             to see it under API 30+ package visibility. -->
+        <package android:name="com.softwaremine.dps.automationtarget" />
+
         <!-- WhatsApp deep links arrive as https, matching WhatsAppIntentBuilder. -->
         <intent>
             <action android:name="android.intent.action.VIEW" />
@@ -193,6 +199,36 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!--
+            M9: the one controlled UI automation capability layer. Owns no
+            natural-language understanding, risk decision, or confirmation
+            state — see DpsAutomationService's own doc.
+
+            android:permission="BIND_ACCESSIBILITY_SERVICE" is mandatory and
+            is exactly what makes exported="true" safe here: only the
+            system, never another app, may bind an accessibility service —
+            the identical "protected by a system-only permission" reasoning
+            already given above for ReminderBootReceiver's own
+            exported="true".
+
+            Enablement is never automatic: the user must explicitly turn
+            this on in Android's own Accessibility settings — DPS only ever
+            launches that settings screen with the user's consent, never
+            enables it itself. See AndroidPermissionManager's own
+            specialAccessState() doc for the query side.
+        -->
+        <service
+            android:name=".data.android.automation.DpsAutomationService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/automation_accessibility_config" />
+        </service>
 
     </application>
 

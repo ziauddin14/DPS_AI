@@ -149,6 +149,13 @@ class IntentPromptBuilder {
                     "have it forgotten.",
             )
             appendLine(
+                "- Use \"automation\" only for an explicit request to open or " +
+                    "interact with another app on the phone (the app's name in " +
+                    "title). Never use it for a request this app can already " +
+                    "handle directly (reminders, calendar, tasks, calls, " +
+                    "messages).",
+            )
+            appendLine(
                 "- If intent is \"conversation\", put your full reply to the user in " +
                     "parameters.reply — never in parameters.message, which is only for " +
                     "text you are sending someone else. Be concise, professional and " +

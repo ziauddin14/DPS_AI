@@ -33,3 +33,8 @@ dependencyResolutionManagement {
 rootProject.name = "DPS"
 
 include(":app")
+
+// M9 Phase 1's deterministic automation test target — never shipped, never
+// part of :app's own release build or Play listing. See
+// automationtarget/build.gradle.kts's own doc.
+include(":automationtarget")

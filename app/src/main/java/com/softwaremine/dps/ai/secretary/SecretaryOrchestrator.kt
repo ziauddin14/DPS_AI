@@ -19,6 +19,7 @@ import com.softwaremine.dps.ai.plan.contactCandidatesFrom
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.AutomationVerifier
 import com.softwaremine.dps.data.android.secretary.ExecutionVerifier
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.domain.contact.Contact
@@ -37,6 +38,7 @@ import com.softwaremine.dps.domain.secretary.DisambiguationCandidate
 import com.softwaremine.dps.domain.secretary.ExecutionRecoveryState
 import com.softwaremine.dps.domain.secretary.OperationCheckpoint
 import com.softwaremine.dps.domain.secretary.OperationType
+import com.softwaremine.dps.domain.secretary.PendingAutomationAction
 import com.softwaremine.dps.domain.secretary.PendingConfirmation
 import com.softwaremine.dps.domain.secretary.PendingContactSelection
 import com.softwaremine.dps.domain.secretary.PendingPlan
@@ -116,6 +118,7 @@ class SecretaryOrchestrator(
     private val persistentRecoveryStore: PersistentRecoveryStore,
     private val episodicMemoryRecorder: EpisodicMemoryRecorder,
     private val executionVerifier: ExecutionVerifier,
+    private val automationVerifier: AutomationVerifier,
     private val permissionManager: PermissionManager,
     private val toolRegistry: ToolRegistry,
     private val responses: ToolResponseGenerator,
@@ -290,6 +293,18 @@ class SecretaryOrchestrator(
     private var pendingVerification: PendingVerification? = persistentRecoveryStore.loadVerification()
 
     /**
+     * A [PendingAutomationAction] restored from [persistentRecoveryStore]
+     * at construction (M9) — a bounded UI action was dispatched, but
+     * observation and verification never ran because an earlier process
+     * died in the window between the action and
+     * [AutomationVerifier] resolving it. `null` once resolved, or from
+     * construction when nothing was left pending. Mirrors
+     * [pendingVerification]'s own shape exactly — see that field's own doc
+     * for why only the record loads eagerly here, never the resolution.
+     */
+    private var pendingAutomation: PendingAutomationAction? = persistentRecoveryStore.loadAutomation()
+
+    /**
      * Handles one user message.
      *
      * Never throws — every path resolves to a [ToolOrchestrator.Outcome],
@@ -339,6 +354,14 @@ class SecretaryOrchestrator(
         if (pendingVerification != null) {
             pendingVerification = null
             resolveOutstandingVerificationNotice()?.let { return it }
+        }
+        // M9: identical shape to the M7 check above — always fully
+        // resolvable by DPS itself (re-observe, never re-tap), so no
+        // question is asked; only a genuine mismatch/not-found/
+        // observation-failure interrupts the first message with a notice.
+        if (pendingAutomation != null) {
+            pendingAutomation = null
+            resolveOutstandingAutomationNotice()?.let { return it }
         }
         restoredRecovery?.let { restored ->
             return if (recoveryPromptShown) {
@@ -944,6 +967,21 @@ class SecretaryOrchestrator(
                     return outcome.copy(reply = prefixed(plan.completedReplies, outcome.reply))
                 }
 
+                // M9 fix: mirrors continuePlan's own per-iteration
+                // verification gate exactly (`:854`-region) — a resumed step
+                // whose tool call succeeded but whose outcome could not be
+                // verified must stop the plan here too, never continue into
+                // the remainder. Unreachable before M9: no M8 confirm-required
+                // type was ever also an M7-verified CREATE, so this branch
+                // never fired in practice until an automation step (verified,
+                // and confirm-required) could itself be the resumed step —
+                // caught by this milestone's own regression tests, not a
+                // theoretical concern.
+                val verification = lastStepVerification
+                if (verification != null && verification !is VerificationOutcome.Verified) {
+                    return outcome.copy(reply = prefixed(plan.completedReplies, outcome.reply))
+                }
+
                 val success = outcome.result as? ToolResult.Success
                 val lastEventStartMillis = if (outcome.intent.type == IntentType.CALENDAR_EVENT && success != null) {
                     success.data["start"]?.let(::parseLocalMillis) ?: plan.lastEventStartMillis
@@ -1248,7 +1286,29 @@ class SecretaryOrchestrator(
     private fun askConfirmationFor(intent: DpsIntent): ToolOrchestrator.Outcome = when (intent.type) {
         IntentType.CALL_CONTACT -> askCallConfirmation(intent)
         IntentType.FORGET_FACT -> askForgetFactConfirmation(intent)
+        IntentType.AUTOMATION -> askAutomationConfirmation(intent)
         else -> askDeleteConfirmation(intent)
+    }
+
+    /**
+     * Asks before performing the one bounded UI interaction (M9) — the
+     * exact same "ask before doing something to another app" boundary
+     * [askCallConfirmation] already enforces, extended here to a genuine
+     * accessibility-driven action rather than merely opening a dialer.
+     * [com.softwaremine.dps.data.android.tool.AndroidAutomationTool]
+     * itself performs the tap unconditionally once called; this is the
+     * only gate.
+     */
+    private fun askAutomationConfirmation(intent: DpsIntent): ToolOrchestrator.Outcome {
+        val appName = intent.parameters.value(IntentField.TITLE) ?: "that app"
+        val question = "Open $appName and tap the button?"
+
+        pendingConfirmation = PendingConfirmation(intent, now())
+        _state.value = transition(SecretaryEvent.ConfirmationRequested)
+        return ToolOrchestrator.Outcome.Clarify(
+            question,
+            IntentResolution.NeedsClarification(intent, question, emptySet(), intent.parameters),
+        )
     }
 
     /**
@@ -1909,6 +1969,21 @@ class SecretaryOrchestrator(
         )
     }
 
+    /**
+     * M9's exact mirror of [resolveOutstandingVerificationNotice] — see
+     * that function's own doc. [AutomationVerifier.resolvePendingAutomationIfAny]
+     * re-observes real UI state; it never re-taps.
+     */
+    private suspend fun resolveOutstandingAutomationNotice(): ToolOrchestrator.Outcome.Conversational? {
+        val outcome = automationVerifier.resolvePendingAutomationIfAny() ?: return null
+        if (outcome is VerificationOutcome.Verified) return null
+
+        return ToolOrchestrator.Outcome.Conversational(
+            reason = "surfacing an unresolved automation action from before this restarted",
+            replyText = "Before this restarted, ${responses.describeVerification(outcome).replaceFirstChar(Char::lowercase)}",
+        )
+    }
+
     private fun recoveryQuestionOutcome(restored: ExecutionRecoveryState): ToolOrchestrator.Outcome.Conversational {
         val what = when (val pending = restored.pending) {
             is PersistedPendingState.Clarification -> describeIntent(pending.intent)
@@ -2089,16 +2164,24 @@ class SecretaryOrchestrator(
                     episodicMemoryRecorder.record(toolId, outcome.result)
                 }
 
-                // M7: verification is independent of, and never gates,
+                // M7/M9: verification is independent of, and never gates,
                 // either memory write above — a mismatch does not undo the
                 // fact that a real tool call already happened and is
                 // already the most recent task/reminder/event in memory.
                 // Only WhatsApp/email/phone/notification/reminder and every
                 // non-CREATE task/calendar action are structurally excluded
-                // from verification (see ExecutionVerifier's own doc);
-                // every other Success return here is checked.
+                // from M7 verification (see ExecutionVerifier's own doc);
+                // every other Success return here is checked. M9's
+                // automationVerifier is consulted only when executionVerifier
+                // itself returned null (never applicable to the same
+                // intent — their scopes, TASK/CALENDAR_EVENT create versus
+                // AUTOMATION, are mutually exclusive) — see AutomationVerifier's
+                // own doc for why it is a separate class, not a new
+                // ExecutionVerifier branch.
                 val success = outcome.result as? ToolResult.Success
-                lastStepVerification = success?.let { executionVerifier.verify(outcome.intent, it) }
+                lastStepVerification = success?.let {
+                    executionVerifier.verify(outcome.intent, it) ?: automationVerifier.verify(outcome.intent, it)
+                }
 
                 _state.value = transition(
                     if (outcome.result.isSuccess) {

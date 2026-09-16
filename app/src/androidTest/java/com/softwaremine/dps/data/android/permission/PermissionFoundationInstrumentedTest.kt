@@ -14,6 +14,7 @@ import com.softwaremine.dps.domain.tool.ToolResult
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -58,11 +59,21 @@ class PermissionFoundationInstrumentedTest {
      */
     @Test
     fun everyDpsPermissionMapsToAnAndroidConstant() {
+        // M9: DpsPermission.AUTOMATION_ACCESSIBILITY is the one deliberate
+        // exception — accessibility-service enablement has no
+        // android.permission.* string at all, see AndroidPermissionMapping
+        // .androidName's own doc. Every other permission still must map to
+        // a real constant, exactly as before.
         DpsPermission.entries.forEach { permission ->
             val androidName = AndroidPermissionMapping.androidName(permission)
+            if (permission == DpsPermission.AUTOMATION_ACCESSIBILITY) {
+                assertNull("$permission must map to null, not a fabricated string", androidName)
+                return@forEach
+            }
+            assertNotNull("$permission mapped to null unexpectedly", androidName)
             assertTrue(
                 "$permission mapped to a suspicious value: '$androidName'",
-                androidName.startsWith("android.permission."),
+                androidName!!.startsWith("android.permission."),
             )
         }
     }
@@ -70,7 +81,7 @@ class PermissionFoundationInstrumentedTest {
     @Test
     fun androidNameMappingRoundTrips() {
         DpsPermission.entries.forEach { permission ->
-            val androidName = AndroidPermissionMapping.androidName(permission)
+            val androidName = AndroidPermissionMapping.androidName(permission) ?: return@forEach
             assertEquals(permission, AndroidPermissionMapping.fromAndroidName(androidName))
         }
     }

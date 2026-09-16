@@ -168,6 +168,7 @@ class SecretaryLiveWiringInstrumentedTest {
             persistentRecoveryStore = persistentRecoveryStore,
             episodicMemoryRecorder = container.episodicMemoryRecorder,
             executionVerifier = container.executionVerifier,
+            automationVerifier = container.automationVerifier,
             permissionManager = container.permissionManager,
             toolRegistry = container.toolRegistry,
             responses = ToolResponseGenerator(),
