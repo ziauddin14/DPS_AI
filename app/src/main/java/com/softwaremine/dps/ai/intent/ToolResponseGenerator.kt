@@ -3,6 +3,7 @@ package com.softwaremine.dps.ai.intent
 import com.softwaremine.dps.domain.intent.DpsIntent
 import com.softwaremine.dps.domain.intent.IntentType
 import com.softwaremine.dps.domain.permission.DpsPermission
+import com.softwaremine.dps.domain.secretary.VerificationOutcome
 import com.softwaremine.dps.domain.tool.ToolResult
 
 /**
@@ -69,6 +70,43 @@ class ToolResponseGenerator {
             // internals AI Rules 1 and 2 forbid showing.
             "Something went wrong on my side and I couldn't finish that. " +
                 "Could you try again?"
+    }
+
+    /**
+     * Phrases a post-action [VerificationOutcome] (M7) — replaces
+     * [describe]'s own unconditional success wording when a tool's claimed
+     * `ToolResult.Success` could not be independently confirmed.
+     *
+     * ## Why never "failed" and never silent
+     * [com.softwaremine.dps.data.android.secretary.ExecutionVerifier] only
+     * ever calls this for [VerificationOutcome.Mismatch]/[VerificationOutcome.NotFound]/
+     * [VerificationOutcome.ObservationFailed] — the tool itself already
+     * reported [ToolResult.Success], so the action was very likely carried
+     * out. Saying "that failed" here would be a **false claim of failure**;
+     * saying nothing, or repeating the ordinary success sentence, would be
+     * a **false claim of certainty**. Both are ruled out by M7's own locked
+     * contract — every sentence below states only what is actually known:
+     * an attempt happened, and it could not be confirmed.
+     *
+     * [VerificationOutcome.Verified] is never passed here — [describe]'s
+     * existing, unmodified success wording already covers it; a caller
+     * only reaches for this method once it already knows verification did
+     * not come back clean.
+     */
+    fun describeVerification(outcome: VerificationOutcome): String = when (outcome) {
+        VerificationOutcome.Verified -> "" // Unreachable in practice — see this method's own doc.
+
+        is VerificationOutcome.Mismatch ->
+            "I made that change, but what I can see afterward doesn't fully match what you asked for. " +
+                "Please double-check it."
+
+        VerificationOutcome.NotFound ->
+            "I attempted that, but I couldn't find it afterward to confirm it went through. " +
+                "Please check before assuming it didn't."
+
+        is VerificationOutcome.ObservationFailed ->
+            "I attempted that, but I couldn't check whether it went through. " +
+                "Please check when you get a chance."
     }
 
     /**

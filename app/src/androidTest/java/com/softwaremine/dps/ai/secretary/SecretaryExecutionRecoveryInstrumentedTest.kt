@@ -155,6 +155,10 @@ class SecretaryExecutionRecoveryInstrumentedTest {
             persistentPreferenceStore = PersistentPreferenceStore.create(context, silentLogger),
             persistentRecoveryStore = persistentRecoveryStore,
             episodicMemoryRecorder = container.episodicMemoryRecorder,
+            executionVerifier = container.executionVerifier,
+            permissionManager = container.permissionManager,
+            toolRegistry = container.toolRegistry,
+            responses = ToolResponseGenerator(),
             logger = silentLogger,
         )
     }

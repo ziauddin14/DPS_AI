@@ -29,6 +29,7 @@ import com.softwaremine.dps.data.android.memory.episodic.EpisodicMemoryEntity
 import com.softwaremine.dps.data.android.memory.semantic.SemanticFactDao
 import com.softwaremine.dps.data.android.memory.semantic.SemanticFactEntity
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.ExecutionVerifier
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.data.android.tool.AndroidMemoryTool
 import com.softwaremine.dps.domain.ai.AiCompletion
@@ -47,10 +48,15 @@ import com.softwaremine.dps.domain.model.ModelDescriptor
 import com.softwaremine.dps.domain.permission.DpsPermission
 import com.softwaremine.dps.domain.permission.PermissionManager
 import com.softwaremine.dps.domain.permission.PermissionState
+import com.softwaremine.dps.data.android.calendar.CalendarEventReader
+import com.softwaremine.dps.domain.productivity.Task
+import com.softwaremine.dps.domain.productivity.TaskRepository
 import com.softwaremine.dps.domain.secretary.OperationCheckpoint
 import com.softwaremine.dps.domain.secretary.OperationType
+import com.softwaremine.dps.domain.secretary.PendingVerification
 import com.softwaremine.dps.domain.secretary.PersistedPendingState
 import com.softwaremine.dps.domain.secretary.SecretaryState
+import com.softwaremine.dps.domain.secretary.VerificationOutcome
 import com.softwaremine.dps.domain.tool.AndroidTool
 import com.softwaremine.dps.domain.tool.ToolCall
 import com.softwaremine.dps.domain.tool.ToolId
@@ -257,6 +263,27 @@ class SecretaryOrchestratorTest {
         }
     }
 
+    /** M7: a genuinely functional in-memory TaskRepository, for tests that deliberately exercise verification. */
+    private class FakeTaskRepository : TaskRepository {
+        private val tasks = mutableMapOf<Int, Task>()
+        fun seed(task: Task) { tasks[task.id] = task }
+        override fun all(): List<Task> = tasks.values.toList()
+        override fun find(id: Int): Task? = tasks[id]
+        override fun save(task: Task): Task { tasks[task.id] = task; return task }
+        override fun delete(id: Int): Boolean = tasks.remove(id) != null
+        override fun nextId(): Int = (tasks.keys.maxOrNull() ?: 0) + 1
+    }
+
+    /** M7: a genuinely functional in-memory CalendarEventReader, for tests that deliberately exercise verification. */
+    private class FakeCalendarEventReader : CalendarEventReader {
+        private val events = mutableMapOf<Long, CalendarEventReader.EventSnapshot>()
+        fun seed(eventId: Long, snapshot: CalendarEventReader.EventSnapshot) { events[eventId] = snapshot }
+        override fun readEventSnapshot(eventId: Long): CalendarEventReader.EventSnapshotOutcome {
+            val snapshot = events[eventId] ?: return CalendarEventReader.EventSnapshotOutcome.NotFound
+            return CalendarEventReader.EventSnapshotOutcome.Found(snapshot)
+        }
+    }
+
     private val zone: ZoneId = ZoneId.of("Asia/Karachi")
 
     private fun secretary(
@@ -270,6 +297,21 @@ class SecretaryOrchestratorTest {
         persistentRecoveryStore: PersistentRecoveryStore = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger),
         episodicMemoryRecorder: EpisodicMemoryRecorder = EpisodicMemoryRecorder(
             LongTermMemoryStore(FakeSemanticFactDao(), FakeEpisodicMemoryDao(), silentLogger),
+        ),
+        // M7: this file tests classification/orchestration, not post-action
+        // verification — its own fake tools' Success.data occasionally
+        // happens to include a task_id/event_id with no backing repository
+        // behind it, so both are left unwired (null) here rather than
+        // hand-built to stay in sync with unrelated fakes. See
+        // ExecutionVerifier's own doc for why null means "not attempted,"
+        // never a guessed outcome.
+        executionVerifier: ExecutionVerifier = ExecutionVerifier(
+            taskRepository = null,
+            calendarEventReader = null,
+            persistentRecoveryStore = persistentRecoveryStore,
+            dispatchers = immediateDispatchers,
+            logger = silentLogger,
+            now = now,
         ),
     ): SecretaryOrchestrator {
         val registry = DefaultToolRegistry(silentLogger).apply { tools.forEach(::register) }
@@ -314,6 +356,10 @@ class SecretaryOrchestratorTest {
             persistentPreferenceStore = persistentPreferenceStore,
             persistentRecoveryStore = persistentRecoveryStore,
             episodicMemoryRecorder = episodicMemoryRecorder,
+            executionVerifier = executionVerifier,
+            permissionManager = permissions,
+            toolRegistry = registry,
+            responses = com.softwaremine.dps.ai.intent.ToolResponseGenerator(),
             logger = silentLogger,
             zone = zone,
             now = now,
@@ -2195,6 +2241,178 @@ class SecretaryOrchestratorTest {
     }
 
     // -----------------------------------------------------------------
+    // M8: risk, permission precheck & confirmation
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `a known missing permission blocks a call confirmation before it is ever asked`() = runTest {
+        val call = RecordingTool(ToolId.PHONE, setOf("place_call"), requiredPermissions = setOf(DpsPermission.READ_CONTACTS)) {
+            ToolResult.Success("The dialer is open.")
+        }
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"call_contact","parameters":{"phone":"+923001234567"}}"""),
+        )
+        val permissions = FakePermissions(states = mapOf(DpsPermission.READ_CONTACTS to PermissionState.DENIED))
+        val secretary = secretary(engine, listOf(call), permissions)
+
+        val outcome = secretary.handle("+923001234567 ko call karo")
+
+        assertTrue("Expected NeedsPermission, got $outcome", outcome is ToolOrchestrator.Outcome.NeedsPermission)
+        assertEquals(SecretaryState.WAITING_PERMISSION, secretary.state.value)
+        assertTrue("Nothing may dial before permission is granted", call.calls.isEmpty())
+    }
+
+    /**
+     * The critical safety assertion for this milestone: a permission granted
+     * for a confirm-required action must re-enter the whole gate, not the
+     * tool directly. Reusing [ToolOrchestrator]'s own permission-resume seam
+     * here would execute the call the instant the permission is granted,
+     * silently skipping the yes/no this action still needs.
+     */
+    @Test
+    fun `granting a previously-missing permission asks for confirmation rather than auto-executing`() = runTest {
+        var granted = false
+        val call = RecordingTool(ToolId.PHONE, setOf("place_call"), requiredPermissions = setOf(DpsPermission.READ_CONTACTS)) {
+            ToolResult.Success("The dialer is open.")
+        }
+        val permissions = object : PermissionManager {
+            override fun state(permission: DpsPermission) =
+                if (granted) PermissionState.GRANTED else PermissionState.DENIED
+
+            override fun states(permissions: Set<DpsPermission>) = permissions.associateWith(::state)
+            override fun missing(permissions: Set<DpsPermission>) =
+                permissions.filterNot { state(it).isUsable }.toSet()
+
+            override suspend fun request(permissions: Set<DpsPermission>) = states(permissions)
+        }
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"call_contact","parameters":{"phone":"+923001234567"}}"""),
+        )
+        val secretary = secretary(engine, listOf(call), permissions)
+
+        secretary.handle("+923001234567 ko call karo")
+        granted = true
+        val resumed = secretary.onPermissionResult()
+
+        assertTrue("Expected Clarify (a confirmation question), got $resumed", resumed is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((resumed as ToolOrchestrator.Outcome.Clarify).question.contains("+923001234567"))
+        assertTrue("Granting the permission must not itself dial anything", call.calls.isEmpty())
+
+        val confirmed = secretary.handle("haan")
+        assertTrue("Expected Handled, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
+        assertEquals(1, call.calls.size)
+    }
+
+    @Test
+    fun `a confirm-required action whose tool needs no permission skips the precheck entirely`() = runTest {
+        val task = RecordingTool(ToolId.TASK, setOf("cancel_task")) {
+            ToolResult.Success("Task cancelled.", mapOf("task_id" to "1"))
+        }
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"task","action_type":"cancel","parameters":{"title":"old task"}}"""),
+        )
+
+        val outcome = secretary(engine, listOf(task)).handle("old task cancel kar do")
+
+        assertTrue("Expected Clarify, got $outcome", outcome is ToolOrchestrator.Outcome.Clarify)
+        assertTrue("Nothing may be cancelled before confirmation", task.calls.isEmpty())
+    }
+
+    @Test
+    fun `a permission failure on a confirm-required step stops the plan and drops the remainder`() = runTest {
+        val task = taskTool()
+        val call = RecordingTool(ToolId.PHONE, setOf("place_call"), requiredPermissions = setOf(DpsPermission.READ_CONTACTS)) {
+            ToolResult.Success("The dialer is open.")
+        }
+        val reminder = reminderTool()
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"task","parameters":{"title":"draft"}},
+                    {"intent":"call_contact","parameters":{"phone":"+923001234567"}},
+                    {"intent":"reminder","parameters":{"title":"follow up","raw_when":"16:00"}}
+                ]}""",
+            ),
+        )
+        val permissions = FakePermissions(states = mapOf(DpsPermission.READ_CONTACTS to PermissionState.DENIED))
+
+        val outcome = secretary(engine, listOf(task, call, reminder), permissions)
+            .handle("draft ka task bana do, +923001234567 ko call karo, aur 16:00 par follow up ka reminder laga do")
+
+        assertTrue("Expected NeedsPermission, got $outcome", outcome is ToolOrchestrator.Outcome.NeedsPermission)
+        assertEquals("Step 1 must still have run", 1, task.calls.size)
+        assertTrue("The blocked step must not dial", call.calls.isEmpty())
+        assertTrue("A step after a permission block must never run unattended", reminder.calls.isEmpty())
+    }
+
+    @Test
+    fun `two confirm-required steps in one plan are each asked about in turn`() = runTest {
+        val task = RecordingTool(ToolId.TASK, setOf("cancel_task")) {
+            ToolResult.Success("Task cancelled.", mapOf("task_id" to "1"))
+        }
+        val memoryStore = LongTermMemoryStore(FakeSemanticFactDao(), FakeEpisodicMemoryDao(), silentLogger)
+        memoryStore.rememberFact("Bilal", "mera developer hai", sourceUtterance = null)
+        val memory = AndroidMemoryTool(memoryStore)
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"task","action_type":"cancel","parameters":{"title":"old task"}},
+                    {"intent":"forget_fact","parameters":{"title":"Bilal"}}
+                ]}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(task, memory))
+
+        val firstQuestion = secretary.handle("old task cancel kar do aur Bilal ke baare mein bhool jao")
+        assertTrue("Expected Clarify, got $firstQuestion", firstQuestion is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((firstQuestion as ToolOrchestrator.Outcome.Clarify).question.contains("old task"))
+
+        val secondQuestion = secretary.handle("haan")
+        assertTrue("Expected Clarify (the second confirmation), got $secondQuestion", secondQuestion is ToolOrchestrator.Outcome.Clarify)
+        assertTrue((secondQuestion as ToolOrchestrator.Outcome.Clarify).question.contains("Bilal"))
+        assertEquals(1, task.calls.size)
+        assertTrue(
+            "The fact must not be forgotten until its own question is answered",
+            memoryStore.recallFacts("Bilal").isNotEmpty(),
+        )
+
+        val done = secretary.handle("haan")
+        assertTrue("Expected Handled, got $done", done is ToolOrchestrator.Outcome.Handled)
+        assertTrue(memoryStore.recallFacts("Bilal").isEmpty())
+    }
+
+    @Test
+    fun `a confirmed step is followed by an unrelated create step, which runs normally`() = runTest {
+        val task = RecordingTool(ToolId.TASK, setOf("cancel_task", "create_task")) { call ->
+            when (call.operation) {
+                "cancel_task" -> ToolResult.Success("Task cancelled.", mapOf("task_id" to "1"))
+                else -> ToolResult.Success("Task created.", mapOf("task_id" to "2"))
+            }
+        }
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"task","action_type":"cancel","parameters":{"title":"old task"}},
+                    {"intent":"task","parameters":{"title":"new task"}}
+                ]}""",
+            ),
+        )
+        val secretary = secretary(engine, listOf(task))
+
+        secretary.handle("old task cancel kar do aur new task bana do")
+        val done = secretary.handle("haan")
+
+        assertTrue("Expected Handled, got $done", done is ToolOrchestrator.Outcome.Handled)
+        assertEquals(listOf("cancel_task", "create_task"), task.calls.map { it.operation })
+        // M7: create_task's own verification is independent of the
+        // confirmation that gated the step before it — see ExecutionVerifier's
+        // own doc; this file's null-wired verifier reports "not attempted"
+        // either way, so the reply carries the tool's own ordinary success
+        // wording, not a mismatch notice.
+        assertTrue((done as ToolOrchestrator.Outcome.Handled).reply.contains("Task created."))
+    }
+
+    // -----------------------------------------------------------------
     // Follow-up suggestions (Day 05 Phase E Stage 2)
     // -----------------------------------------------------------------
 
@@ -3108,7 +3326,7 @@ class SecretaryOrchestratorTest {
     }
 
     @Test
-    fun `remembering a fact, then recalling it, then forgetting it works end to end`() = runTest {
+    fun `remembering a fact, then recalling it, then forgetting it asks before deleting`() = runTest {
         val memoryStore = LongTermMemoryStore(FakeSemanticFactDao(), FakeEpisodicMemoryDao(), silentLogger)
         val memoryTool = AndroidMemoryTool(memoryStore)
         val engine = ScriptedEngine(
@@ -3128,9 +3346,32 @@ class SecretaryOrchestratorTest {
             recalled.reply.contains("mera developer hai"),
         )
 
-        val forgotten = orchestrator.handle("Bilal ke baare mein bhool jao")
-        assertTrue(forgotten is ToolOrchestrator.Outcome.Handled)
+        // M8: forget_fact is destructive and irreversible, so it now asks
+        // before doing anything — see RiskPolicy.
+        val asked = orchestrator.handle("Bilal ke baare mein bhool jao")
+        assertTrue("Expected Clarify, got $asked", asked is ToolOrchestrator.Outcome.Clarify)
+        assertTrue("Nothing may be forgotten before confirmation", memoryStore.recallFacts("Bilal").isNotEmpty())
+
+        val forgotten = orchestrator.handle("haan")
+        assertTrue("Expected Handled, got $forgotten", forgotten is ToolOrchestrator.Outcome.Handled)
         assertTrue(memoryStore.recallFacts("Bilal").isEmpty())
+    }
+
+    @Test
+    fun `declining to forget a fact leaves it remembered`() = runTest {
+        val memoryStore = LongTermMemoryStore(FakeSemanticFactDao(), FakeEpisodicMemoryDao(), silentLogger)
+        memoryStore.rememberFact("Bilal", "mera developer hai", sourceUtterance = null)
+        val memoryTool = AndroidMemoryTool(memoryStore)
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"forget_fact","parameters":{"title":"Bilal"}}"""),
+        )
+        val orchestrator = secretary(engine, listOf(memoryTool))
+
+        orchestrator.handle("Bilal ke baare mein bhool jao")
+        val declined = orchestrator.handle("nahi")
+
+        assertTrue("Expected Handled, got $declined", declined is ToolOrchestrator.Outcome.Handled)
+        assertTrue("Declining must leave the fact intact", memoryStore.recallFacts("Bilal").isNotEmpty())
     }
 
     @Test
@@ -3170,6 +3411,176 @@ class SecretaryOrchestratorTest {
         orchestrator.handle("remind me 15 minutes before at 16:00")
 
         assertNull(preferenceStore.load().defaultReminderLeadMinutes)
+    }
+
+    // -----------------------------------------------------------------
+    // M7: post-action observation, verification & safe decision gate
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `a verified task create keeps the ordinary success reply unchanged`() = runTest {
+        val task = taskTool()
+        val repository = FakeTaskRepository().apply {
+            seed(Task(id = 1, title = "call the bank", createdAtMillis = 1L, updatedAtMillis = 1L))
+        }
+        val verifier = ExecutionVerifier(repository, FakeCalendarEventReader(), PersistentRecoveryStore(FakeSharedPreferences(), silentLogger), immediateDispatchers, silentLogger)
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"task","parameters":{"title":"call the bank"}}"""))
+
+        val outcome = secretary(engine, listOf(task), executionVerifier = verifier).handle("call the bank ka task bana do")
+
+        assertTrue(outcome is ToolOrchestrator.Outcome.Handled)
+        assertEquals("Task \"call the bank\" added.", (outcome as ToolOrchestrator.Outcome.Handled).reply)
+    }
+
+    @Test
+    fun `a mismatched task create produces an honest reply — never a false success, never a false failure, and never a retry`() = runTest {
+        val task = taskTool()
+        // The repository holds a DIFFERENT title than the tool claims to
+        // have created — simulates the write having actually landed wrong.
+        val repository = FakeTaskRepository().apply {
+            seed(Task(id = 1, title = "something else entirely", createdAtMillis = 1L, updatedAtMillis = 1L))
+        }
+        val verifier = ExecutionVerifier(repository, FakeCalendarEventReader(), PersistentRecoveryStore(FakeSharedPreferences(), silentLogger), immediateDispatchers, silentLogger)
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"task","parameters":{"title":"call the bank"}}"""))
+
+        val outcome = secretary(engine, listOf(task), executionVerifier = verifier).handle("call the bank ka task bana do")
+
+        assertTrue(outcome is ToolOrchestrator.Outcome.Handled)
+        val reply = (outcome as ToolOrchestrator.Outcome.Handled).reply
+        assertTrue("Must never falsely claim success: $reply", !reply.contains("added"))
+        assertTrue("Must never falsely claim failure: $reply", !reply.contains("failed") && !reply.contains("couldn't do that"))
+        assertEquals("The tool must be called exactly once — a mismatch must never trigger a retry", 1, task.calls.size)
+    }
+
+    @Test
+    fun `a task create with nothing observable at all is reported as not found, honestly`() = runTest {
+        val task = taskTool()
+        val verifier = ExecutionVerifier(FakeTaskRepository(), FakeCalendarEventReader(), PersistentRecoveryStore(FakeSharedPreferences(), silentLogger), immediateDispatchers, silentLogger)
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"task","parameters":{"title":"call the bank"}}"""))
+
+        val outcome = secretary(engine, listOf(task), executionVerifier = verifier).handle("call the bank ka task bana do")
+
+        assertTrue(outcome is ToolOrchestrator.Outcome.Handled)
+        assertTrue((outcome as ToolOrchestrator.Outcome.Handled).reply.contains("couldn't find it afterward"))
+        assertEquals(1, task.calls.size)
+    }
+
+    @Test
+    fun `a verified first step allows a multi-step plan's second step to run`() = runTest {
+        val task = taskTool()
+        val reminder = reminderTool()
+        val repository = FakeTaskRepository().apply {
+            seed(Task(id = 1, title = "call the bank", createdAtMillis = 1L, updatedAtMillis = 1L))
+        }
+        val verifier = ExecutionVerifier(repository, FakeCalendarEventReader(), PersistentRecoveryStore(FakeSharedPreferences(), silentLogger), immediateDispatchers, silentLogger)
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"task","parameters":{"title":"call the bank"}},
+                    {"intent":"reminder","parameters":{"title":"pay rent","raw_when":"18:00"}}
+                ]}""",
+            ),
+        )
+
+        secretary(engine, listOf(task, reminder), executionVerifier = verifier)
+            .handle("call the bank ka task bana do aur pay rent ka reminder 18:00 par laga do")
+
+        assertEquals(1, task.calls.size)
+        assertEquals("A verified first step must not block the second", 1, reminder.calls.size)
+    }
+
+    @Test
+    fun `a mismatched first step stops the plan — the second step never runs, and the first step's own result stands`() = runTest {
+        val task = taskTool()
+        val reminder = reminderTool()
+        val repository = FakeTaskRepository().apply {
+            seed(Task(id = 1, title = "wrong title", createdAtMillis = 1L, updatedAtMillis = 1L))
+        }
+        val verifier = ExecutionVerifier(repository, FakeCalendarEventReader(), PersistentRecoveryStore(FakeSharedPreferences(), silentLogger), immediateDispatchers, silentLogger)
+        val engine = ScriptedEngine(
+            DpsResult.Success(
+                """{"steps":[
+                    {"intent":"task","parameters":{"title":"call the bank"}},
+                    {"intent":"reminder","parameters":{"title":"pay rent","raw_when":"18:00"}}
+                ]}""",
+            ),
+        )
+
+        val outcome = secretary(engine, listOf(task, reminder), executionVerifier = verifier)
+            .handle("call the bank ka task bana do aur pay rent ka reminder 18:00 par laga do")
+
+        assertEquals("The first step's tool still ran exactly once — no retry", 1, task.calls.size)
+        assertEquals("A mismatched first step must stop the plan before the second step runs", 0, reminder.calls.size)
+        assertTrue(outcome is ToolOrchestrator.Outcome.Handled)
+    }
+
+    @Test
+    fun `a mismatch on one turn never leaks into a later, unrelated conversational turn`() = runTest {
+        val task = taskTool()
+        val repository = FakeTaskRepository().apply {
+            seed(Task(id = 1, title = "wrong title", createdAtMillis = 1L, updatedAtMillis = 1L))
+        }
+        val verifier = ExecutionVerifier(repository, FakeCalendarEventReader(), PersistentRecoveryStore(FakeSharedPreferences(), silentLogger), immediateDispatchers, silentLogger)
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"task","parameters":{"title":"call the bank"}}"""),
+            DpsResult.Success("""{"intent":"conversation","parameters":{"reply":"Sure, happy to help."}}"""),
+        )
+        val secretaryInstance = secretary(engine, listOf(task), executionVerifier = verifier)
+
+        val mismatched = secretaryInstance.handle("call the bank ka task bana do")
+        assertTrue((mismatched as ToolOrchestrator.Outcome.Handled).reply.contains("doesn't fully match"))
+
+        val later = secretaryInstance.handle("thanks")
+        assertTrue(
+            "A later, unrelated conversational turn must never inherit an earlier mismatch",
+            later is ToolOrchestrator.Outcome.Conversational,
+        )
+    }
+
+    @Test
+    fun `a leftover pending verification that resolves as Verified after a restart is handled silently`() = runTest {
+        val recoveryPrefs = FakeSharedPreferences()
+        val recoveryStore = PersistentRecoveryStore(recoveryPrefs, silentLogger)
+        recoveryStore.saveVerification(
+            PendingVerification.Task(taskId = 1, expectedTitle = "call the bank", requestedAtMillis = 1_000L),
+        )
+        val repository = FakeTaskRepository().apply {
+            seed(Task(id = 1, title = "call the bank", createdAtMillis = 1L, updatedAtMillis = 1L))
+        }
+        val verifier = ExecutionVerifier(repository, FakeCalendarEventReader(), recoveryStore, immediateDispatchers, silentLogger)
+        val engine = ScriptedEngine(DpsResult.Success("""{"intent":"conversation","parameters":{"reply":"Hi there."}}"""))
+
+        val outcome = secretary(engine, emptyList(), persistentRecoveryStore = recoveryStore, executionVerifier = verifier)
+            .handle("hello")
+
+        assertTrue("A clean restart resolution must never intercept the user's real first message", outcome is ToolOrchestrator.Outcome.Conversational)
+        assertNull("The resolved pending verification must be cleared", recoveryStore.loadVerification())
+    }
+
+    @Test
+    fun `a leftover pending verification that resolves as Mismatch after a restart surfaces one honest notice, then normal messages resume`() = runTest {
+        val recoveryPrefs = FakeSharedPreferences()
+        val recoveryStore = PersistentRecoveryStore(recoveryPrefs, silentLogger)
+        recoveryStore.saveVerification(
+            PendingVerification.Task(taskId = 1, expectedTitle = "call the bank", requestedAtMillis = 1_000L),
+        )
+        // No task seeded at all -> resolves as NotFound.
+        val verifier = ExecutionVerifier(FakeTaskRepository(), FakeCalendarEventReader(), recoveryStore, immediateDispatchers, silentLogger)
+        val engine = ScriptedEngine(
+            DpsResult.Success("""{"intent":"conversation","parameters":{"reply":"Hi there."}}"""),
+        )
+        val secretaryInstance = secretary(engine, emptyList(), persistentRecoveryStore = recoveryStore, executionVerifier = verifier)
+
+        val notice = secretaryInstance.handle("hello")
+        assertTrue(notice is ToolOrchestrator.Outcome.Conversational)
+        assertTrue(
+            "The restart notice must be honest, mentioning neither false success nor false failure",
+            (notice as ToolOrchestrator.Outcome.Conversational).replyText?.contains("Before this restarted") == true,
+        )
+        assertNull(recoveryStore.loadVerification())
+
+        val next = secretaryInstance.handle("hello again")
+        assertTrue("The message right after the notice must be handled normally", next is ToolOrchestrator.Outcome.Conversational)
     }
 
     // -----------------------------------------------------------------

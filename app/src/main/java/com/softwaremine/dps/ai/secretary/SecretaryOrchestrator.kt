@@ -2,6 +2,7 @@ package com.softwaremine.dps.ai.secretary
 
 import com.softwaremine.dps.ai.intent.ClarificationEngine
 import com.softwaremine.dps.ai.intent.ToolOrchestrator
+import com.softwaremine.dps.ai.intent.ToolResponseGenerator
 import com.softwaremine.dps.ai.memory.ActionDetector
 import com.softwaremine.dps.ai.memory.ConversationMemoryUpdater
 import com.softwaremine.dps.ai.memory.EpisodicMemoryRecorder
@@ -18,6 +19,7 @@ import com.softwaremine.dps.ai.plan.contactCandidatesFrom
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.ExecutionVerifier
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.domain.contact.Contact
 import com.softwaremine.dps.domain.intent.DpsIntent
@@ -29,6 +31,8 @@ import com.softwaremine.dps.domain.intent.IntentType
 import com.softwaremine.dps.domain.intent.PendingPermissionAction
 import com.softwaremine.dps.domain.intent.toolId
 import com.softwaremine.dps.domain.memory.ConversationMemory
+import com.softwaremine.dps.domain.permission.DpsPermission
+import com.softwaremine.dps.domain.permission.PermissionManager
 import com.softwaremine.dps.domain.secretary.DisambiguationCandidate
 import com.softwaremine.dps.domain.secretary.ExecutionRecoveryState
 import com.softwaremine.dps.domain.secretary.OperationCheckpoint
@@ -36,14 +40,19 @@ import com.softwaremine.dps.domain.secretary.OperationType
 import com.softwaremine.dps.domain.secretary.PendingConfirmation
 import com.softwaremine.dps.domain.secretary.PendingContactSelection
 import com.softwaremine.dps.domain.secretary.PendingPlan
+import com.softwaremine.dps.domain.secretary.PendingVerification
 import com.softwaremine.dps.domain.secretary.PendingTypeDisambiguation
 import com.softwaremine.dps.domain.secretary.PersistedDisambiguationCandidate
 import com.softwaremine.dps.domain.secretary.PersistedPendingPlan
 import com.softwaremine.dps.domain.secretary.PersistedPendingState
+import com.softwaremine.dps.domain.secretary.RiskLevel
+import com.softwaremine.dps.domain.secretary.RiskPolicy
 import com.softwaremine.dps.domain.secretary.SecretaryEvent
 import com.softwaremine.dps.domain.secretary.SecretaryState
 import com.softwaremine.dps.domain.secretary.SecretaryStateMachine
+import com.softwaremine.dps.domain.secretary.VerificationOutcome
 import com.softwaremine.dps.domain.tool.ToolId
+import com.softwaremine.dps.domain.tool.ToolRegistry
 import com.softwaremine.dps.domain.tool.ToolResult
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -106,6 +115,10 @@ class SecretaryOrchestrator(
     private val persistentPreferenceStore: PersistentPreferenceStore,
     private val persistentRecoveryStore: PersistentRecoveryStore,
     private val episodicMemoryRecorder: EpisodicMemoryRecorder,
+    private val executionVerifier: ExecutionVerifier,
+    private val permissionManager: PermissionManager,
+    private val toolRegistry: ToolRegistry,
+    private val responses: ToolResponseGenerator,
     private val logger: DpsLogger,
     private val zone: ZoneId = ZoneId.systemDefault(),
     private val now: () -> Long = System::currentTimeMillis,
@@ -150,6 +163,37 @@ class SecretaryOrchestrator(
      * [resolveContactThenExecute] and [onPermissionResult].
      */
     private var pendingIntentAwaitingContactPermission: DpsIntent? = null
+
+    /**
+     * A [RiskLevel.CONFIRM_REQUIRED] intent (M8) whose own tool needs a
+     * permission it does not currently have — held only until that
+     * permission is resolved. See [blockOnActionPermission]'s own doc for
+     * why this cannot be [pendingIntentAwaitingContactPermission] itself,
+     * nor route through [ToolOrchestrator]'s own `pendingPermission`:
+     * resuming either of those two existing seams re-executes the original
+     * call directly, which for a confirm-required intent would silently
+     * skip asking for confirmation the moment the permission is granted —
+     * exactly the outcome M8's locked contract forbids. Resuming this field
+     * instead re-enters [proceedToExecution] from the top (see
+     * [onPermissionResult]), so confirmation is asked fresh, only once the
+     * permission is actually usable.
+     */
+    private var pendingIntentAwaitingActionPermission: DpsIntent? = null
+
+    /**
+     * The verification outcome for whichever step [recordOutcome] most
+     * recently ran, or `null` when the last outcome had nothing to verify
+     * (M7). Read once, immediately, by [continuePlan]'s own multi-step
+     * gate — never left to carry across turns: [recordOutcome] itself
+     * assigns this on *every* call it makes, including to `null`, so a
+     * step that never reaches verification (a different intent type, a
+     * failed tool call) cannot inherit a stale value from an earlier,
+     * unrelated step. See [ExecutionVerifier]'s own doc for why `null`
+     * ("never attempted") is kept distinct from
+     * [VerificationOutcome.ObservationFailed] ("attempted and
+     * inconclusive").
+     */
+    private var lastStepVerification: VerificationOutcome? = null
 
     /**
      * A durable recovery record restored from [persistentRecoveryStore] at
@@ -225,6 +269,27 @@ class SecretaryOrchestrator(
     private var pendingCheckpoint: OperationCheckpoint? = persistentRecoveryStore.loadCheckpoint()
 
     /**
+     * A [PendingVerification] restored from [persistentRecoveryStore] at
+     * construction (M7) — a create's [com.softwaremine.dps.domain.tool.ToolResult.Success]
+     * was already confirmed, but verification itself never ran because an
+     * earlier process died in the window between that confirmation and
+     * [ExecutionVerifier.verify] clearing the record. `null` once resolved,
+     * or from construction when nothing was left pending.
+     *
+     * ## Why only the *record* loads here, not the resolution
+     * Unlike [pendingCheckpoint] (a cheap `SharedPreferences` read either
+     * way), actually resolving this means reading back a real task or
+     * calendar record — for a calendar event, a genuine `ContentResolver`
+     * query. Running that inside a constructor would risk blocking
+     * whichever thread first touches this class (a real rule this
+     * project's own coding standards state explicitly: no blocking calls
+     * on the main thread). Only the durable *fact* that something is
+     * pending is loaded eagerly here; [handle]'s own first call resolves
+     * it, inside a suspend context, exactly once.
+     */
+    private var pendingVerification: PendingVerification? = persistentRecoveryStore.loadVerification()
+
+    /**
      * Handles one user message.
      *
      * Never throws — every path resolves to a [ToolOrchestrator.Outcome],
@@ -264,6 +329,16 @@ class SecretaryOrchestrator(
             pendingCheckpoint = null
             persistentRecoveryStore.clearCheckpoint()
             return outstandingCheckpointNotice(checkpoint)
+        }
+        // M7: unlike the checkpoint above, this is always fully resolvable
+        // by DPS itself — no question needs asking. When it resolves as
+        // Verified, nothing is shown and this turn's real message
+        // proceeds normally below; only a genuine mismatch/not-found/
+        // observation-failure interrupts the first message with a notice,
+        // exactly once. userMessage is never inspected for this decision.
+        if (pendingVerification != null) {
+            pendingVerification = null
+            resolveOutstandingVerificationNotice()?.let { return it }
         }
         restoredRecovery?.let { restored ->
             return if (recoveryPromptShown) {
@@ -482,9 +557,25 @@ class SecretaryOrchestrator(
      * [pendingConfirmation] (a follow-up suggestion after a successful
      * create), which *is* covered, so [syncRecoveryPersistence] runs here
      * too rather than only after [handle].
+     *
+     * ## M8: [pendingIntentAwaitingActionPermission] takes precedence
+     * Checked first, and handled entirely separately from
+     * [ToolOrchestrator]'s own resume path below — see that field's own
+     * doc for why. Nothing was ever dispatched to [toolOrchestrator] for
+     * this case, so there is nothing to resume there; [proceedToExecution]
+     * is re-entered from the top instead, which asks for confirmation
+     * fresh once the permission is actually usable.
      */
     suspend fun onPermissionResult(): ToolOrchestrator.Outcome? {
         _state.value = transition(SecretaryEvent.PermissionGranted)
+
+        pendingIntentAwaitingActionPermission?.let { intent ->
+            pendingIntentAwaitingActionPermission = null
+            val outcome = continueAfterResumedStep(proceedToExecution(intent))
+            syncRecoveryPersistence()
+            return outcome
+        }
+
         val outcome = toolOrchestrator.resumeAfterPermissionGrant()
             ?: run {
                 pendingIntentAwaitingContactPermission = null
@@ -511,6 +602,7 @@ class SecretaryOrchestrator(
         pendingConfirmation = null
         pendingPlan = null
         pendingIntentAwaitingContactPermission = null
+        pendingIntentAwaitingActionPermission = null
         restoredRecovery = null
         recoveryPromptShown = false
         // M5-C: pendingCheckpoint is deliberately NOT cleared here. It
@@ -746,6 +838,21 @@ class SecretaryOrchestrator(
                         // No PendingPlan is parked: per the existing, unchanged
                         // failure policy (no retry, no rollback), a failed step
                         // is not something a later message resumes.
+                        return ToolOrchestrator.Outcome.Handled(replies.joinToString(" "), lastIntent, lastResult)
+                    }
+
+                    // M7: a step whose tool call succeeded but whose outcome
+                    // could not be verified is treated the same way a failed
+                    // step already is — stop the plan, run no further steps,
+                    // park nothing to resume. lastStepVerification was set by
+                    // recordOutcome() inside the proceedToExecution() call
+                    // just above, for this exact step, in this same suspend
+                    // call chain — read immediately, before the next loop
+                    // iteration could run and overwrite it for a different
+                    // step. Previously completed steps are untouched: their
+                    // own replies are already folded into `replies` above.
+                    val verification = lastStepVerification
+                    if (verification != null && verification !is VerificationOutcome.Verified) {
                         return ToolOrchestrator.Outcome.Handled(replies.joinToString(" "), lastIntent, lastResult)
                     }
                 }
@@ -1020,14 +1127,35 @@ class SecretaryOrchestrator(
 
     /**
      * The seam between "this request is complete" and actually calling
-     * [ToolOrchestrator.executeIntent] — where contact grounding, a
-     * destructive-action confirmation, or a follow-up suggestion can each
-     * insert themselves without [ToolOrchestrator] ever needing to know any
-     * of them exist.
+     * [ToolOrchestrator.executeIntent] — where a risk/permission precheck
+     * (M8), contact grounding, a destructive-action confirmation, or a
+     * follow-up suggestion can each insert themselves without
+     * [ToolOrchestrator] ever needing to know any of them exist.
+     *
+     * ## M8: RISK → PERMISSION PRECHECK → CONFIRMATION, ahead of everything else
+     * [RiskPolicy.classify] is checked first, before contact grounding —
+     * deliberately, so a missing permission is discovered (and reported)
+     * before a `find_contact` lookup for [IntentType.CALL_CONTACT] is even
+     * attempted, and so a [RiskLevel.CONFIRM_REQUIRED] action is never
+     * asked to confirm when it is already known it cannot run. See
+     * [missingPermissionsFor]/[blockOnActionPermission]'s own docs.
+     *
+     * [IntentType.CALL_CONTACT] is the one confirm-required type asked
+     * about *later*, in [proceedAfterContactResolved] — its question needs
+     * a grounded phone number this function does not have yet. Every other
+     * confirm-required type ([askConfirmationFor]) has nothing left to
+     * resolve and is asked immediately, once permission is confirmed
+     * present.
      */
     private suspend fun proceedToExecution(intent: DpsIntent): ToolOrchestrator.Outcome {
-        if (intent.type in DELETE_CONFIRMATION_TYPES && intent.action == IntentAction.CANCEL) {
-            return askDeleteConfirmation(intent)
+        if (RiskPolicy.classify(intent) == RiskLevel.CONFIRM_REQUIRED) {
+            val missing = missingPermissionsFor(intent)
+            if (missing.isNotEmpty()) {
+                return blockOnActionPermission(intent, missing)
+            }
+            if (intent.type != IntentType.CALL_CONTACT) {
+                return askConfirmationFor(intent)
+            }
         }
 
         val personName = intent.parameters.value(IntentField.PERSON)
@@ -1048,17 +1176,80 @@ class SecretaryOrchestrator(
 
     /**
      * The seam every path that just finished — or skipped — contact
-     * resolution funnels through, so [CALL_CONFIRMATION_TYPES] is asked
-     * about exactly once, in exactly one place, regardless of which of the
-     * three routes (direct phone, single resolved match, or a disambiguation
-     * pick) got here.
+     * resolution funnels through, so [IntentType.CALL_CONTACT]'s
+     * confirmation is asked about exactly once, in exactly one place,
+     * regardless of which of the three routes (direct phone, single
+     * resolved match, or a disambiguation pick) got here. Permission for
+     * this type was already prechecked in [proceedToExecution], before
+     * contact grounding ever began.
      */
     private suspend fun proceedAfterContactResolved(intent: DpsIntent): ToolOrchestrator.Outcome =
-        if (intent.type in CALL_CONFIRMATION_TYPES && intent.parameters.value(IntentField.PHONE) != null) {
-            askCallConfirmation(intent)
+        if (intent.type == IntentType.CALL_CONTACT && intent.parameters.value(IntentField.PHONE) != null) {
+            askConfirmationFor(intent)
         } else {
             finishExecution(intent)
         }
+
+    /**
+     * The permissions [intent]'s own tool would need but does not currently
+     * have (M8) — a pure, synchronous read via the exact same
+     * [PermissionManager.missing] call
+     * [com.softwaremine.dps.ai.tool.DefaultToolExecutor] itself makes
+     * before dispatch, reached here through the already-existing
+     * [com.softwaremine.dps.domain.intent.toolId] mapping and [toolRegistry]
+     * rather than a second permission system. Empty for
+     * [IntentType.CONVERSATION] (no tool) and for any tool declaring no
+     * required permissions (e.g. `cancel_task`, `forget_fact`) — the
+     * precheck is then a correct no-op.
+     */
+    private fun missingPermissionsFor(intent: DpsIntent): Set<DpsPermission> {
+        val toolId = intent.type.toolId ?: return emptySet()
+        val required = toolRegistry.find(toolId)?.requiredPermissions ?: emptySet()
+        return permissionManager.missing(required)
+    }
+
+    /**
+     * Blocks [intent] on a permission its tool needs but does not have,
+     * before ever asking for confirmation (M8 locked decision 6). Mirrors
+     * [resolveContactThenExecute]'s own [pendingIntentAwaitingContactPermission]
+     * shape, generalized from "a find_contact pre-resolution step" to "any
+     * confirm-required intent whose own tool needs a permission it doesn't
+     * have yet" — see [pendingIntentAwaitingActionPermission]'s own doc for
+     * why a new field is needed rather than reusing an existing one.
+     *
+     * [ToolResult.PermissionRequired.rationale] is never read by
+     * [ToolResponseGenerator.describe] — that phrasing is derived entirely
+     * from `permissions` and the intent's own type — so no duplicate of
+     * [com.softwaremine.dps.ai.tool.DefaultToolExecutor]'s private
+     * rationale-building logic is needed here; a short, honest placeholder
+     * is sufficient.
+     */
+    private fun blockOnActionPermission(
+        intent: DpsIntent,
+        missing: Set<DpsPermission>,
+    ): ToolOrchestrator.Outcome.NeedsPermission {
+        pendingIntentAwaitingActionPermission = intent
+        _state.value = transition(SecretaryEvent.PermissionNeeded)
+        val result = ToolResult.PermissionRequired(
+            permissions = missing.toList(),
+            rationale = "DPS needs this permission before that action can be confirmed.",
+        )
+        return ToolOrchestrator.Outcome.NeedsPermission(responses.describe(result, intent), result)
+    }
+
+    /**
+     * Dispatches to the right confirmation question for a
+     * [RiskLevel.CONFIRM_REQUIRED] intent (M8) — the three shapes
+     * [RiskPolicy.classify] currently recognizes. Whichever type is added
+     * to [RiskPolicy] in the future must get a branch here too; there is no
+     * compiler-enforced link between the two, so this coupling is
+     * deliberate and documented, not silent.
+     */
+    private fun askConfirmationFor(intent: DpsIntent): ToolOrchestrator.Outcome = when (intent.type) {
+        IntentType.CALL_CONTACT -> askCallConfirmation(intent)
+        IntentType.FORGET_FACT -> askForgetFactConfirmation(intent)
+        else -> askDeleteConfirmation(intent)
+    }
 
     /**
      * Asks before opening the dialer — the confirmation boundary this
@@ -1117,6 +1308,28 @@ class SecretaryOrchestrator(
         )
     }
 
+    /**
+     * Asks before forgetting a remembered fact (M8) — the same "ask before
+     * doing something irreversible" boundary [askDeleteConfirmation]
+     * already enforces for calendar/task/reminder, extended to
+     * [IntentType.FORGET_FACT] per M8's own locked contract:
+     * `remember_fact`/`forget_fact` are otherwise reversible of each other,
+     * but a `forget_fact` DPS was never asked to reconsider is not.
+     * [com.softwaremine.dps.data.android.tool.AndroidMemoryTool] itself
+     * deletes unconditionally once called; this is the only gate.
+     */
+    private fun askForgetFactConfirmation(intent: DpsIntent): ToolOrchestrator.Outcome {
+        val subject = intent.parameters.value(IntentField.TITLE) ?: "that"
+        val question = "Forget what I remember about \"$subject\"? This can't be undone."
+
+        pendingConfirmation = PendingConfirmation(intent, now())
+        _state.value = transition(SecretaryEvent.ConfirmationRequested)
+        return ToolOrchestrator.Outcome.Clarify(
+            question,
+            IntentResolution.NeedsClarification(intent, question, emptySet(), intent.parameters),
+        )
+    }
+
     /** What to name in the confirmation question. See [askDeleteConfirmation]'s doc. */
     private fun describeDeletionTarget(intent: DpsIntent): String? = when (intent.type) {
         IntentType.CALENDAR_EVENT -> _memory.value.lastCalendarEvent
@@ -1144,6 +1357,11 @@ class SecretaryOrchestrator(
     private fun attachSuggestionIfApplicable(outcome: ToolOrchestrator.Outcome): ToolOrchestrator.Outcome {
         if (outcome !is ToolOrchestrator.Outcome.Handled) return outcome
         val success = outcome.result as? ToolResult.Success ?: return outcome
+        // M7: a step whose own outcome could not be confirmed must never
+        // offer a confident-sounding follow-up about it ("...a reminder
+        // for this too?") — see ExecutionVerifier's own doc.
+        val verification = lastStepVerification
+        if (verification != null && verification !is VerificationOutcome.Verified) return outcome
         val suggestion = followUpSuggestions.suggestionFor(outcome.intent, success) ?: return outcome
 
         pendingConfirmation = PendingConfirmation(suggestion.intent, now())
@@ -1674,6 +1892,23 @@ class SecretaryOrchestrator(
         )
     }
 
+    /**
+     * Resolves whatever [PendingVerification] survived a restart (M7),
+     * returning a one-time honest notice only when it did not come back
+     * [VerificationOutcome.Verified] — `null` means either nothing was
+     * pending or resolution came back clean, and [handle] falls through to
+     * the user's real message unchanged either way.
+     */
+    private suspend fun resolveOutstandingVerificationNotice(): ToolOrchestrator.Outcome.Conversational? {
+        val outcome = executionVerifier.resolvePendingVerificationIfAny() ?: return null
+        if (outcome is VerificationOutcome.Verified) return null
+
+        return ToolOrchestrator.Outcome.Conversational(
+            reason = "surfacing an unresolved verification from before this restarted",
+            replyText = "Before this restarted, ${responses.describeVerification(outcome).replaceFirstChar(Char::lowercase)}",
+        )
+    }
+
     private fun recoveryQuestionOutcome(restored: ExecutionRecoveryState): ToolOrchestrator.Outcome.Conversational {
         val what = when (val pending = restored.pending) {
             is PersistedPendingState.Clarification -> describeIntent(pending.intent)
@@ -1829,6 +2064,12 @@ class SecretaryOrchestrator(
 
     /** Applies memory and state consequences for an outcome produced by [ToolOrchestrator]. */
     private suspend fun recordOutcome(outcome: ToolOrchestrator.Outcome): ToolOrchestrator.Outcome {
+        // M7: reset on every call, unconditionally, before anything below
+        // might set it — see this field's own doc for why a step that
+        // never reaches verification must not inherit an earlier step's
+        // outcome (Section 11's own stale-state requirement).
+        lastStepVerification = null
+
         when (outcome) {
             is ToolOrchestrator.Outcome.Handled -> {
                 outcome.intent.type.toolId?.let { toolId ->
@@ -1847,6 +2088,18 @@ class SecretaryOrchestrator(
                     // cancelled outcome leaves no episodic trace either.
                     episodicMemoryRecorder.record(toolId, outcome.result)
                 }
+
+                // M7: verification is independent of, and never gates,
+                // either memory write above — a mismatch does not undo the
+                // fact that a real tool call already happened and is
+                // already the most recent task/reminder/event in memory.
+                // Only WhatsApp/email/phone/notification/reminder and every
+                // non-CREATE task/calendar action are structurally excluded
+                // from verification (see ExecutionVerifier's own doc);
+                // every other Success return here is checked.
+                val success = outcome.result as? ToolResult.Success
+                lastStepVerification = success?.let { executionVerifier.verify(outcome.intent, it) }
+
                 _state.value = transition(
                     if (outcome.result.isSuccess) {
                         SecretaryEvent.ExecutionSucceeded
@@ -1872,7 +2125,17 @@ class SecretaryOrchestrator(
                 _state.value = transition(SecretaryEvent.Reset)
             }
         }
-        return outcome
+
+        // M7: never claims success when verification came back anything
+        // but Verified, and never claims failure either — describeVerification's
+        // own wording states only what is actually known. The rewrite is
+        // the *only* change; result/intent/memory are all untouched.
+        val verification = lastStepVerification
+        return if (outcome is ToolOrchestrator.Outcome.Handled && verification != null && verification !is VerificationOutcome.Verified) {
+            outcome.copy(reply = responses.describeVerification(verification))
+        } else {
+            outcome
+        }
     }
 
     /** Parses a [com.softwaremine.dps.data.android.common.ToolArguments.describe] string back to epoch millis. */
@@ -1907,22 +2170,11 @@ class SecretaryOrchestrator(
         )
 
         /**
-         * Types that ask an explicit "yes" once their target is known, before
-         * their tool ever runs (Contacts + Calling milestone) — mirrors
-         * [DELETE_CONFIRMATION_TYPES]'s placement, but the trigger is "the
-         * phone number is now grounded", not an action verb.
+         * Fallback noun for [askDeleteConfirmation] when nothing more
+         * specific is known. Which types this applies to is now
+         * [RiskPolicy]'s concern (M8) — this map only supplies wording for
+         * whichever of them [askConfirmationFor] dispatches here.
          */
-        val CALL_CONFIRMATION_TYPES = setOf(IntentType.CALL_CONTACT)
-
-        /**
-         * Intent types whose CANCEL asks for confirmation before deleting
-         * (Day 06 adds TASK; Phase 5 — Reminder Cancel Confirmation — adds
-         * REMINDER, closing the one destructive action in this codebase that
-         * previously ran with no "are you sure").
-         */
-        val DELETE_CONFIRMATION_TYPES = setOf(IntentType.CALENDAR_EVENT, IntentType.TASK, IntentType.REMINDER)
-
-        /** Fallback noun for [askDeleteConfirmation] when nothing more specific is known. */
         val DELETE_TARGET_LABELS = mapOf(
             IntentType.CALENDAR_EVENT to "event",
             IntentType.TASK to "task",

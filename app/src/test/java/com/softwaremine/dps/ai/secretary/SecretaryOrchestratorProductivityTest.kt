@@ -29,6 +29,7 @@ import com.softwaremine.dps.data.android.memory.episodic.EpisodicMemoryEntity
 import com.softwaremine.dps.data.android.memory.semantic.SemanticFactDao
 import com.softwaremine.dps.data.android.memory.semantic.SemanticFactEntity
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.ExecutionVerifier
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.domain.ai.AiCompletion
 import com.softwaremine.dps.domain.ai.AiEngine
@@ -276,6 +277,21 @@ class SecretaryOrchestratorProductivityTest {
             episodicMemoryRecorder = EpisodicMemoryRecorder(
                 LongTermMemoryStore(FakeSemanticFactDao(), FakeEpisodicMemoryDao(), silentLogger),
             ),
+            // M7: this file tests the productivity flow, not verification —
+            // InMemoryTaskTool's own Success.data includes a task_id with
+            // no backing TaskRepository behind it, so verification is left
+            // unwired (null) rather than hand-built to stay in sync with
+            // that fake. See ExecutionVerifier's own doc.
+            executionVerifier = ExecutionVerifier(
+                taskRepository = null,
+                calendarEventReader = null,
+                persistentRecoveryStore = PersistentRecoveryStore(NoOpSharedPreferences(), silentLogger),
+                dispatchers = immediateDispatchers,
+                logger = silentLogger,
+            ),
+            permissionManager = FakePermissions(),
+            toolRegistry = registry,
+            responses = ToolResponseGenerator(),
             logger = silentLogger,
             zone = zone,
         )

@@ -116,6 +116,10 @@ class CalendarClassificationInvestigationTest {
             persistentPreferenceStore = PersistentPreferenceStore.create(context, silentLogger),
             persistentRecoveryStore = PersistentRecoveryStore.create(context, silentLogger),
             episodicMemoryRecorder = container.episodicMemoryRecorder,
+            executionVerifier = container.executionVerifier,
+            permissionManager = container.permissionManager,
+            toolRegistry = container.toolRegistry,
+            responses = ToolResponseGenerator(),
             logger = silentLogger,
         )
     }

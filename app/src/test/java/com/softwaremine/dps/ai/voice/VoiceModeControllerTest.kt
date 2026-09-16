@@ -36,6 +36,7 @@ import com.softwaremine.dps.data.android.memory.episodic.EpisodicMemoryEntity
 import com.softwaremine.dps.data.android.memory.semantic.SemanticFactDao
 import com.softwaremine.dps.data.android.memory.semantic.SemanticFactEntity
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.ExecutionVerifier
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.data.model.ModelCatalog
 import com.softwaremine.dps.domain.ai.AiCompletion
@@ -337,6 +338,18 @@ class VoiceModeControllerTest {
             episodicMemoryRecorder = EpisodicMemoryRecorder(
                 LongTermMemoryStore(FakeSemanticFactDao(), FakeEpisodicMemoryDao(), silentLogger),
             ),
+            // M7: this file tests voice mode, not verification — left
+            // unwired (null); see ExecutionVerifier's own doc.
+            executionVerifier = ExecutionVerifier(
+                taskRepository = null,
+                calendarEventReader = null,
+                persistentRecoveryStore = PersistentRecoveryStore(NoOpSharedPreferences(), silentLogger),
+                dispatchers = immediateDispatchers,
+                logger = silentLogger,
+            ),
+            permissionManager = FakePermissions(),
+            toolRegistry = DefaultToolRegistry(silentLogger),
+            responses = ToolResponseGenerator(),
             logger = silentLogger,
             zone = zone,
         )

@@ -48,6 +48,22 @@ import kotlinx.coroutines.withContext
  * leaves the record for [resolvePendingVerificationIfAny] to find and
  * resolve on the next construction.
  *
+ * ## Why [taskRepository]/[calendarEventReader] are nullable
+ * In production ([com.softwaremine.dps.di.AiContainer]) both are always
+ * real, non-null instances — the same ones
+ * [com.softwaremine.dps.data.android.tool.AndroidTaskTool]/
+ * [com.softwaremine.dps.data.android.tool.AndroidCalendarTool] themselves
+ * write through. Nullability exists solely so a test harness built for a
+ * different milestone's own concern — one that constructs a hand-rolled
+ * fake tool whose `ToolResult.Success.data` happens to include a
+ * `task_id`/`event_id` key, with no backing repository behind it at all —
+ * can pass `null` to opt this class out cleanly, rather than needing to
+ * hand-build a repository fake whose state would have no way to stay in
+ * sync with an unrelated fake tool's own canned responses. A `null`
+ * dependency here means exactly what a call outside M7's locked (type,
+ * action) scope already means: verification is not attempted, `null` is
+ * returned, never a fifth [VerificationOutcome].
+ *
  * ## Dependencies
  * [TaskRepository] (interface, JVM-fakeable), [CalendarEventReader]
  * (interface, JVM-fakeable — [com.softwaremine.dps.data.android.calendar.CalendarWriter]
@@ -59,8 +75,8 @@ import kotlinx.coroutines.withContext
  * every tool call).
  */
 class ExecutionVerifier(
-    private val taskRepository: TaskRepository,
-    private val calendarEventReader: CalendarEventReader,
+    private val taskRepository: TaskRepository?,
+    private val calendarEventReader: CalendarEventReader?,
     private val persistentRecoveryStore: PersistentRecoveryStore,
     private val dispatchers: DispatcherProvider,
     private val logger: DpsLogger,
@@ -100,6 +116,7 @@ class ExecutionVerifier(
 
         return when (intent.type) {
             IntentType.TASK -> {
+                if (taskRepository == null) return null
                 val taskId = result.data["task_id"]?.toIntOrNull() ?: return null
                 val expectedTitle = intent.parameters.value(IntentField.TITLE) ?: return null
                 PendingVerification.Task(
@@ -113,6 +130,7 @@ class ExecutionVerifier(
             }
 
             IntentType.CALENDAR_EVENT -> {
+                if (calendarEventReader == null) return null
                 val eventId = result.data["event_id"]?.toLongOrNull() ?: return null
                 val expectedTitle = intent.parameters.value(IntentField.TITLE) ?: return null
                 val startMillis = result.data["start_millis"]?.toLongOrNull() ?: return null
@@ -153,8 +171,15 @@ class ExecutionVerifier(
      * spoken reference).
      */
     private suspend fun resolveTask(pending: PendingVerification.Task): VerificationOutcome {
+        val repository = taskRepository
+            // Only reachable if this instance's taskRepository somehow
+            // changed between constructing the pending record and
+            // resolving it — never true in production, where AiContainer
+            // wires one fixed instance for this class's whole lifetime.
+            ?: return VerificationOutcome.ObservationFailed("Task verification is not available.")
+
         val observed = try {
-            withContext(dispatchers.io) { taskRepository.find(pending.taskId) }
+            withContext(dispatchers.io) { repository.find(pending.taskId) }
         } catch (throwable: Throwable) {
             logger.w(TAG, "Task observation failed for id=${pending.taskId}", throwable)
             return VerificationOutcome.ObservationFailed(throwable.message ?: "Could not read the task.")
@@ -187,7 +212,10 @@ class ExecutionVerifier(
      * precision on `DTSTART`/`DTEND` exactly; no tolerance was invented.
      */
     private suspend fun resolveCalendarEvent(pending: PendingVerification.CalendarEvent): VerificationOutcome {
-        val outcome = withContext(dispatchers.io) { calendarEventReader.readEventSnapshot(pending.eventId) }
+        val reader = calendarEventReader
+            ?: return VerificationOutcome.ObservationFailed("Calendar verification is not available.")
+
+        val outcome = withContext(dispatchers.io) { reader.readEventSnapshot(pending.eventId) }
 
         return when (outcome) {
             is CalendarEventReader.EventSnapshotOutcome.Found -> {

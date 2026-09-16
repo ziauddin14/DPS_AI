@@ -138,6 +138,10 @@ class SecretaryLiveWiringProductivityInstrumentedTest {
             persistentPreferenceStore = PersistentPreferenceStore(FakeSharedPreferences(), silentLogger),
             persistentRecoveryStore = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger),
             episodicMemoryRecorder = container.episodicMemoryRecorder,
+            executionVerifier = container.executionVerifier,
+            permissionManager = container.permissionManager,
+            toolRegistry = container.toolRegistry,
+            responses = ToolResponseGenerator(),
             logger = silentLogger,
         )
     }

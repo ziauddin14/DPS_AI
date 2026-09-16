@@ -40,6 +40,7 @@ import com.softwaremine.dps.data.android.memory.PersistentMemoryStore
 import com.softwaremine.dps.data.android.notification.NotificationPresenter
 import com.softwaremine.dps.data.android.permission.AndroidPermissionManager
 import com.softwaremine.dps.data.android.preferences.PersistentPreferenceStore
+import com.softwaremine.dps.data.android.secretary.ExecutionVerifier
 import com.softwaremine.dps.data.android.secretary.PersistentRecoveryStore
 import com.softwaremine.dps.data.android.productivity.AndroidActionItemStore
 import com.softwaremine.dps.data.android.productivity.AndroidMeetingNoteStore
@@ -357,6 +358,26 @@ class AiContainer(private val applicationContext: Context) {
     private val actionItemStore by lazy { AndroidActionItemStore(applicationContext, logger) }
 
     /**
+     * M7: independently observes and compares a create's claimed outcome
+     * against real state, reusing [taskStore]/[calendarWriter] — the same
+     * instances [AndroidTaskTool]/[AndroidCalendarTool] already write
+     * through — rather than opening a second connection to either. Public
+     * like [toolExecutor]/[toolRegistry]/[episodicMemoryRecorder]:
+     * instrumented tests that construct their own [SecretaryOrchestrator]
+     * against a scripted engine reuse this real, on-device instance rather
+     * than a second one.
+     */
+    val executionVerifier by lazy {
+        ExecutionVerifier(
+            taskRepository = taskStore,
+            calendarEventReader = calendarWriter,
+            persistentRecoveryStore = persistentRecoveryStore,
+            dispatchers = dispatchers,
+            logger = logger,
+        )
+    }
+
+    /**
      * The tool catalogue.
      *
      * Phase B implementations are passed in and take precedence; everything
@@ -463,6 +484,10 @@ class AiContainer(private val applicationContext: Context) {
             persistentPreferenceStore = persistentPreferenceStore,
             persistentRecoveryStore = persistentRecoveryStore,
             episodicMemoryRecorder = episodicMemoryRecorder,
+            executionVerifier = executionVerifier,
+            permissionManager = permissionManager,
+            toolRegistry = toolRegistry,
+            responses = ToolResponseGenerator(),
             logger = logger,
         )
     }
