@@ -33,6 +33,25 @@ import org.junit.runner.RunWith
  * enabled_accessibility_services ...`) before this class runs — see
  * `AndroidPermissionManager`'s own `specialAccessState()` doc for why no
  * dialog can grant this.
+ *
+ * ## Known, disclosed limitation: cannot currently pass via `am instrument`
+ * Real-device diagnosis (M9) found that force-stopping the app that owns an
+ * enabled `AccessibilityService` — `adb shell am force-stop
+ * com.softwaremine.dps`, confirmed via `dumpsys accessibility` — clears
+ * both `enabled_accessibility_services` and, if it was the sole enabled
+ * service, `accessibility_enabled` itself. This is genuine OS behavior
+ * (a force-stop revokes the app's active accessibility binding), not a
+ * DPS defect. Standard instrumented-test execution (`connectedAndroidTest`
+ * / `am instrument`) force-stops the target app as part of its own,
+ * unavoidable setup — before this class's own `@Before` ever runs — so
+ * the accessibility service is never enabled by the time any test body
+ * executes, regardless of what `resetTargetAppAndEnsureDpsIsForeground`
+ * itself does. This was previously misdiagnosed as "`am instrument`
+ * processes never receive the bind"; the real cause is this force-stop
+ * side effect. The underlying pipeline this class exercises was instead
+ * proven correct via a temporary, disclosed diagnostic driven by a normal
+ * `adb shell am start` launch (which does not force-stop DPS) — see the
+ * M9 completion report for the full, itemized real-device evidence.
  */
 @RunWith(AndroidJUnit4::class)
 class AutomationPipelineInstrumentedTest {
@@ -49,17 +68,17 @@ class AutomationPipelineInstrumentedTest {
 
     /**
      * Resets the target app to its own deterministic "Tap me" state before
-     * every test — see its own doc — and ensures a real, live DPS
-     * foreground presence exists for the system to bind the accessibility
-     * service to.
+     * every test — see its own doc — and launches a real, live DPS
+     * foreground Activity, mirroring the normal (non-instrumentation)
+     * launch path a genuine accessibility bind was proven against.
      *
-     * ## Why MainActivity is launched explicitly, every test
-     * A bare `am instrument` process, with no Activity of its own, was
-     * found (real-device evidence) to never receive the accessibility
-     * service bind at all — the system only bound it once this exact
-     * class's own manual `adb shell am start` real-device check launched a
-     * genuine foreground Activity. This mirrors that finding rather than
-     * assuming instrumentation alone is enough.
+     * ## Why this still cannot bind — see the class-level doc
+     * This launch alone is not sufficient in an instrumented run: the test
+     * runner's own force-stop of `com.softwaremine.dps`, which happens
+     * before this method ever executes, has already cleared the
+     * accessibility service's enabled state for the OS. The `withTimeout`
+     * below will time out in a standard `am instrument` run for that
+     * reason, not because launching `MainActivity` here is itself wrong.
      */
     @Before
     fun resetTargetAppAndEnsureDpsIsForeground() = runBlocking {

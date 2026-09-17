@@ -11,10 +11,16 @@
     canPerformGestures is false: Phase 1's one action (tap) uses
     performAction(ACTION_CLICK), never dispatchGesture — turned on only
     when a locked, later-phase action vocabulary entry actually needs it.
+
+    flagReportViewIds is required for AccessibilityNodeInfo.getViewIdResourceName()
+    to ever return a non-null value — without it, every node's resource id
+    reads as null and ElementMatcher's resourceId-based matching (the
+    locked, primary targeting strategy) can never find anything, regardless
+    of the tree's real content. Found via real-device diagnosis (M9).
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
-    android:accessibilityFlags="flagRetrieveInteractiveWindows"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:canRetrieveWindowContent="true"
     android:canPerformGestures="false"
