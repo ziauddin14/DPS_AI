@@ -129,7 +129,9 @@ class AndroidAutomationEngine(
         val root = DpsAutomationService.instance?.rootInActiveWindow
             ?: return VerificationOutcome.ObservationFailed("Accessibility access is not currently available.")
 
-        return when (val match = ElementMatcher.find(root.toAutomationNode(), descriptor)) {
+        // findFresh, not find: this read must not come from the node cache
+        // the pre-tap findElement() just filled — see ElementMatcher.findFresh.
+        return when (val match = ElementMatcher.findFresh(root.toAutomationNode(), descriptor)) {
             is ElementMatch.Found -> {
                 val observedText = match.node.text.orEmpty()
                 if (observedText == expectedText) {
@@ -163,6 +165,11 @@ class AndroidAutomationEngine(
             get() = (0 until raw.childCount).mapNotNull { index ->
                 raw.getChild(index)?.let(::AccessibilityNodeInfoNode)
             }
+
+        // Unlike getChild(), this is answered by the target app on every
+        // call rather than from the service-side node cache.
+        override fun findByResourceId(resourceId: String): List<AutomationNode> =
+            raw.findAccessibilityNodeInfosByViewId(resourceId).orEmpty().map(::AccessibilityNodeInfoNode)
     }
 
     private fun AccessibilityNodeInfo.toAutomationNode(): AutomationNode = AccessibilityNodeInfoNode(this)

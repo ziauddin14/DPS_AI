@@ -12,7 +12,17 @@ class ElementMatcherTest {
         override val text: String? = null,
         override val isPassword: Boolean = false,
         override val children: List<AutomationNode> = emptyList(),
-    ) : AutomationNode
+        /** What the app itself would answer right now — deliberately separate from the cached [children]. */
+        private val live: List<AutomationNode> = emptyList(),
+    ) : AutomationNode {
+        var liveLookups = 0
+            private set
+
+        override fun findByResourceId(resourceId: String): List<AutomationNode> {
+            liveLookups++
+            return live.filter { it.resourceId == resourceId }
+        }
+    }
 
     @Test
     fun `finds a unique node by resource id`() {
@@ -99,5 +109,77 @@ class ElementMatcherTest {
         val match = ElementMatcher.find(root, ElementDescriptor(resourceId = "app:id/deep"))
 
         assertEquals(ElementMatch.Found(target), match)
+    }
+
+    // -----------------------------------------------------------------
+    // findFresh — the verification read
+    // -----------------------------------------------------------------
+
+    private val buttonId = ElementDescriptor(resourceId = "app:id/button")
+
+    /** The device state right after a real tap: the cache still holds the pre-tap node, the app already shows the new text. */
+    private fun rootWithStaleCache(live: List<AutomationNode>) = FakeNode(
+        children = listOf(FakeNode(resourceId = "app:id/button", text = "Tap me")),
+        live = live,
+    )
+
+    @Test
+    fun `findFresh reads the app's current state, not the pre-tap snapshot the cached tree still holds`() {
+        val current = FakeNode(resourceId = "app:id/button", text = "Tapped")
+        val root = rootWithStaleCache(live = listOf(current))
+
+        // The defect, pinned: the cached walk still answers with the old text.
+        assertEquals("Tap me", (ElementMatcher.find(root, buttonId) as ElementMatch.Found).node.text)
+
+        val fresh = ElementMatcher.findFresh(root, buttonId)
+
+        assertEquals(ElementMatch.Found(current), fresh)
+        assertEquals("Tapped", (fresh as ElementMatch.Found).node.text)
+    }
+
+    @Test
+    fun `findFresh asks the app exactly once - no second attempt, no polling`() {
+        val root = rootWithStaleCache(live = listOf(FakeNode(resourceId = "app:id/button", text = "Tap me")))
+
+        ElementMatcher.findFresh(root, buttonId)
+
+        assertEquals(1, root.liveLookups)
+    }
+
+    @Test
+    fun `findFresh is NotFound when the element is really gone, even though the cached tree still lists it`() {
+        val root = rootWithStaleCache(live = emptyList())
+
+        assertEquals(ElementMatch.NotFound, ElementMatcher.findFresh(root, buttonId))
+    }
+
+    @Test
+    fun `findFresh keeps the unique-match rule - two live matches are Ambiguous, never auto-picked`() {
+        val root = rootWithStaleCache(
+            live = listOf(
+                FakeNode(resourceId = "app:id/button", text = "Tapped"),
+                FakeNode(resourceId = "app:id/button", text = "Tapped"),
+            ),
+        )
+
+        assertEquals(ElementMatch.Ambiguous(2), ElementMatcher.findFresh(root, buttonId))
+    }
+
+    @Test
+    fun `findFresh matches the resource id exactly`() {
+        val root = rootWithStaleCache(live = listOf(FakeNode(resourceId = "app:id/other_button", text = "Tapped")))
+
+        assertEquals(ElementMatch.NotFound, ElementMatcher.findFresh(root, buttonId))
+    }
+
+    @Test
+    fun `findFresh falls back to the tree walk for a descriptor with no resource id`() {
+        val target = FakeNode(contentDescription = "Submit")
+        val root = FakeNode(children = listOf(target))
+
+        val match = ElementMatcher.findFresh(root, ElementDescriptor(contentDescription = "Submit"))
+
+        assertEquals(ElementMatch.Found(target), match)
+        assertEquals("No live lookup exists for a content description", 0, root.liveLookups)
     }
 }

@@ -2447,8 +2447,13 @@ class SecretaryOrchestratorTest {
             return tapOutcome
         }
 
-        override suspend fun observeAndVerify(descriptor: ElementDescriptor, expectedText: String): VerificationOutcome =
-            verifyOutcome
+        var observeCalls = 0
+            private set
+
+        override suspend fun observeAndVerify(descriptor: ElementDescriptor, expectedText: String): VerificationOutcome {
+            observeCalls++
+            return verifyOutcome
+        }
     }
 
     /** Wires the real [AndroidAutomationTool]/[AutomationVerifier] against one shared fake engine and store. */
@@ -2486,7 +2491,7 @@ class SecretaryOrchestratorTest {
 
     @Test
     fun `confirming automation taps and reports success once verified`() = runTest {
-        val (tool, verifier, store) = automationSetup(verifyOutcome = VerificationOutcome.Verified)
+        val (tool, verifier, store, fakeEngine) = automationSetup(verifyOutcome = VerificationOutcome.Verified)
         val engine = ScriptedEngine(
             DpsResult.Success("""{"intent":"automation","parameters":{"title":"test app"}}"""),
         )
@@ -2497,6 +2502,8 @@ class SecretaryOrchestratorTest {
 
         assertTrue("Expected Handled, got $confirmed", confirmed is ToolOrchestrator.Outcome.Handled)
         assertNull("Verified — the pending automation action must be cleared", store.loadAutomation())
+        assertEquals("One confirmed request is exactly one tap", 1, fakeEngine.tapCalls.size)
+        assertEquals("...and exactly one observation", 1, fakeEngine.observeCalls)
     }
 
     @Test
@@ -2517,7 +2524,7 @@ class SecretaryOrchestratorTest {
 
     @Test
     fun `ACTION EXECUTED is not confused with ACTION VERIFIED - a mismatch is reported honestly, not as success`() = runTest {
-        val (tool, verifier, store) = automationSetup(verifyOutcome = VerificationOutcome.NotFound)
+        val (tool, verifier, store, fakeEngine) = automationSetup(verifyOutcome = VerificationOutcome.NotFound)
         val engine = ScriptedEngine(
             DpsResult.Success("""{"intent":"automation","parameters":{"title":"test app"}}"""),
         )
@@ -2533,6 +2540,8 @@ class SecretaryOrchestratorTest {
                 confirmed.reply.contains("confirm", ignoreCase = true),
         )
         assertNull("Resolved (even as NotFound) — the pending record must still clear", store.loadAutomation())
+        assertEquals("A failed verification must never be answered with a second tap", 1, fakeEngine.tapCalls.size)
+        assertEquals("...or a second observation", 1, fakeEngine.observeCalls)
     }
 
     @Test

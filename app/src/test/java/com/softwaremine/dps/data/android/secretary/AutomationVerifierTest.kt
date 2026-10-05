@@ -4,6 +4,7 @@ import android.content.SharedPreferences
 import com.softwaremine.dps.core.concurrency.DispatcherProvider
 import com.softwaremine.dps.core.logging.DpsLogger
 import com.softwaremine.dps.domain.automation.AutomationEngine
+import com.softwaremine.dps.domain.automation.AutomationOutcome
 import com.softwaremine.dps.domain.automation.ElementDescriptor
 import com.softwaremine.dps.domain.intent.DpsIntent
 import com.softwaremine.dps.domain.intent.IntentType
@@ -37,18 +38,53 @@ class AutomationVerifierTest {
         override val inference = Dispatchers.Unconfined
     }
 
-    private class FakeAutomationEngine(private val outcome: VerificationOutcome) : AutomationEngine {
-        var observeCalls = 0
+    /**
+     * Counts every call rather than throwing from the ones the verifier
+     * must not make: [AutomationVerifier] wraps its engine call in a
+     * catch-all, so a thrown "not used" would be swallowed into
+     * `ObservationFailed` and prove nothing.
+     */
+    private open class FakeAutomationEngine(private val outcome: VerificationOutcome) : AutomationEngine {
+        var openCalls = 0
             private set
+        var findCalls = 0
+            private set
+        var tapCalls = 0
+            private set
+        val observed = mutableListOf<ElementDescriptor>()
+        val observeCalls get() = observed.size
 
-        override suspend fun openApp(packageName: String) = throw UnsupportedOperationException("not used by AutomationVerifier")
-        override suspend fun findElement(descriptor: ElementDescriptor) = throw UnsupportedOperationException("not used by AutomationVerifier")
-        override suspend fun tap(descriptor: ElementDescriptor) = throw UnsupportedOperationException("not used by AutomationVerifier")
+        override suspend fun openApp(packageName: String): AutomationOutcome.OpenApp {
+            openCalls++
+            return AutomationOutcome.OpenApp.Opened
+        }
+
+        override suspend fun findElement(descriptor: ElementDescriptor): AutomationOutcome.Find {
+            findCalls++
+            return AutomationOutcome.Find.Found(descriptor)
+        }
+
+        override suspend fun tap(descriptor: ElementDescriptor): AutomationOutcome.Action {
+            tapCalls++
+            return AutomationOutcome.Action.Performed
+        }
 
         override suspend fun observeAndVerify(descriptor: ElementDescriptor, expectedText: String): VerificationOutcome {
-            observeCalls++
-            return outcome
+            observed += descriptor
+            return outcomeFor(expectedText)
         }
+
+        protected open fun outcomeFor(expectedText: String): VerificationOutcome = outcome
+    }
+
+    /** An app whose button currently shows [currentText] — verification is whatever a live read of it says. */
+    private class LiveAppEngine(var currentText: String) : FakeAutomationEngine(VerificationOutcome.NotFound) {
+        override fun outcomeFor(expectedText: String): VerificationOutcome =
+            if (currentText == expectedText) {
+                VerificationOutcome.Verified
+            } else {
+                VerificationOutcome.Mismatch(mapOf("text" to expectedText), mapOf("text" to currentText))
+            }
     }
 
     /** Mirrors every other store test's own minimal fake exactly. */
@@ -198,14 +234,68 @@ class AutomationVerifierTest {
     }
 
     @Test
-    fun `never calls tap - only observeAndVerify - regardless of outcome`() = runTest {
-        // AutomationEngine.tap()/openApp()/findElement() all throw in this
-        // fake; if AutomationVerifier ever called them, this test would fail
-        // with that exception rather than a normal assertion failure.
+    fun `verification reports the app's state after the action, looked up by the persisted resource id`() = runTest {
+        val store = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger)
+        val app = LiveAppEngine(currentText = "Tap me")
+        val v = verifier(app, store)
+
+        // The tool's own sequence: checkpoint written, then the tap lands.
+        store.saveAutomation(pending)
+        app.currentText = "Tapped"
+
+        assertEquals(VerificationOutcome.Verified, v.verify(automationIntent, success))
+        // The resource id is what lets the engine ask the app directly
+        // instead of walking a cached tree — it must arrive intact.
+        assertEquals(listOf(ElementDescriptor(resourceId = "app:id/button")), app.observed)
+    }
+
+    @Test
+    fun `a tap that changed nothing is still a mismatch - the fix does not turn failures into passes`() = runTest {
         val store = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger)
         store.saveAutomation(pending)
-        val v = verifier(FakeAutomationEngine(VerificationOutcome.NotFound), store)
+        val app = LiveAppEngine(currentText = "Tap me")
 
-        v.verify(automationIntent, success)
+        val outcome = verifier(app, store).verify(automationIntent, success)
+
+        assertEquals(
+            VerificationOutcome.Mismatch(mapOf("text" to "Tapped"), mapOf("text" to "Tap me")),
+            outcome,
+        )
+    }
+
+    @Test
+    fun `verify observes exactly once and never taps, opens or searches - whatever it finds`() = runTest {
+        val outcomes = listOf(
+            VerificationOutcome.Verified,
+            VerificationOutcome.Mismatch(mapOf("text" to "Tapped"), mapOf("text" to "Tap me")),
+            VerificationOutcome.NotFound,
+            VerificationOutcome.ObservationFailed("unreadable"),
+        )
+
+        for (outcome in outcomes) {
+            val store = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger)
+            store.saveAutomation(pending)
+            val engine = FakeAutomationEngine(outcome)
+
+            assertEquals(outcome, verifier(engine, store).verify(automationIntent, success))
+
+            assertEquals("One observation, no retry, for $outcome", 1, engine.observeCalls)
+            assertEquals("A non-Verified outcome must never trigger another tap ($outcome)", 0, engine.tapCalls)
+            assertEquals(0, engine.openCalls)
+            assertEquals(0, engine.findCalls)
+        }
+    }
+
+    @Test
+    fun `recovering a leftover record observes exactly once and never taps`() = runTest {
+        val store = PersistentRecoveryStore(FakeSharedPreferences(), silentLogger)
+        store.saveAutomation(pending)
+        val app = LiveAppEngine(currentText = "Tapped")
+
+        assertEquals(VerificationOutcome.Verified, verifier(app, store).resolvePendingAutomationIfAny())
+
+        assertEquals(1, app.observeCalls)
+        assertEquals("Recovery re-observes; it must never re-tap", 0, app.tapCalls)
+        assertEquals(0, app.openCalls)
     }
 }
